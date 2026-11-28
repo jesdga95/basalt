@@ -71,6 +71,7 @@ inline size_t pair_slot(uint64_t key, uint64_t mask) { return (size_t) (((key * 
 bool Tokenizer::load(std::string_view vocab_json, std::string_view merges_txt, std::string_view types_json,
                      std::string& err) {
     raw_.clear();
+    special_.clear();
     whole_.clear();
     merges_.clear();
     memo_.clear();
@@ -112,6 +113,7 @@ bool Tokenizer::load(std::string_view vocab_json, std::string_view merges_txt, s
     }
     if (max_id < 0) { err = "vocab.json: empty"; return false; }
     raw_.assign((size_t) max_id + 1, std::string());
+    special_.assign((size_t) max_id + 1, 0);
     std::vector<uint8_t> have((size_t) max_id + 1, 0);   // 1: an entry outside the byte alphabet, 2: a pure one
     std::unordered_map<std::string_view, int32_t> by_bytes;   // raw bytes -> id, load only
     by_bytes.reserve(entries.size() * 2);
@@ -123,6 +125,7 @@ bool Tokenizer::load(std::string_view vocab_json, std::string_view merges_txt, s
         if (ty == 3 || ty == 4) {
             bytes = key;   // an added token keeps its literal text
             literals_all.push_back({key, (int32_t) id, ty == 3});
+            special_[(size_t) id] = 1;
         }
         raw_[(size_t) id] = bytes;
         have[(size_t) id] = pure ? 2 : 1;

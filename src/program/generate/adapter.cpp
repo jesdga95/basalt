@@ -95,6 +95,7 @@ bool adapter_prompt(basalt::model::ModelSession& sess, const std::vector<int32_t
                     const std::vector<AdapterImage>& images, int32_t& next, int64_t& pos, AdapterTimes& tm,
                     std::string& err, float* logits = nullptr, size_t reuse = 0, bool report = false,
                     const basalt::kernels::SamplerParams* sampling = nullptr) {
+    if (toks.empty()) { err = "empty prompt"; return false; }
     const auto t0 = Clock::now();
     pos = (int64_t) reuse;
     int64_t total = (int64_t) toks.size();
@@ -201,6 +202,10 @@ int adapter_generate(basalt::model::ModelSession* sess, const std::vector<int64_
                             const std::vector<int64_t>& stop_ids, const std::vector<std::string>& images,
                             const std::vector<int64_t>& image_at, const std::vector<int64_t>& oracle, bool teacher,
                      const basalt::kernels::SamplerParams& sampling) {
+    if (prompt.empty()) {
+        basalt::log::error("basalt generate", "empty prompt: supply --tokens or --tokens-file");
+        return 2;
+    }
     if (images.size() != image_at.size()) {
         basalt::log::error("basalt generate", "every --image needs an --image-at");
         return 2;
@@ -214,10 +219,17 @@ int adapter_generate(basalt::model::ModelSession* sess, const std::vector<int64_
             return 2;
         }
         blocks[i].at = image_at[i];
-        std::ifstream f(images[i], std::ios::binary);
-        const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        std::vector<uint8_t> bytes;
+        if (std::FILE* fi = basalt::platform::open_file_utf8(images[i], "rb")) {
+            uint8_t buf[16384];
+            for (size_t got = 0; (got = std::fread(buf, 1, sizeof buf, fi)) > 0;)
+                bytes.insert(bytes.end(), buf, buf + got);
+            std::fclose(fi);
+        }
         const auto te = Clock::now();
-        const basalt::model::Result er = sess->encode_image(bytes.data(), bytes.size(), blocks[i].rows, blocks[i].n_rows, blocks[i].grid);
+        const basalt::model::Result er = bytes.empty()
+            ? basalt::model::Result{basalt::model::Status::Error, "cannot read the image"}
+            : sess->encode_image(bytes.data(), bytes.size(), blocks[i].rows, blocks[i].n_rows, blocks[i].grid);
         if (!er.ok()) {
             basalt::log::error("basalt generate", "%s: %s", images[i].c_str(), er.message.c_str());
             return 1;
@@ -251,9 +263,11 @@ int adapter_generate(basalt::model::ModelSession* sess, const std::vector<int64_
         ++made;
         for (int64_t s : stop_ids) stop = stop || s == tok;
     };
-    emit(next);
-    std::fflush(stdout);
-    if (teacher) next = (int32_t) oracle[0];
+    if (max_new > 0) {
+        emit(next);
+        std::fflush(stdout);
+    }
+    if (teacher && !oracle.empty()) next = (int32_t) oracle[0];
     while (!stop && made < max_new) {
         const auto w0 = Clock::now();
         int n_draft = 0;
@@ -266,7 +280,7 @@ int adapter_generate(basalt::model::ModelSession* sess, const std::vector<int64_
             basalt::model::Result dres = sess->draft_begin(next, pos, cap - 1);
             if (dres.ok()) dres = sess->draft_end(drafts.data(), conf.data(), cap - 1, n_draft, {});   // a fixed window verifies every draft
             if (dres.ok() && !basalt::core::diagnostics().draft_log.empty()) {   // --draft-log: the position, the anchor and the drafts of each window
-                if (std::FILE* f = std::fopen(basalt::core::diagnostics().draft_log.c_str(), "a")) {
+                if (std::FILE* f = basalt::platform::open_file_utf8(basalt::core::diagnostics().draft_log, "a")) {
                     std::fprintf(f, "D %lld %d", (long long) pos, next);
                     for (int i = 0; i < n_draft; ++i) std::fprintf(f, " %d/%.3f", drafts[(size_t) i], (double) conf[(size_t) i]);
                     std::fputc('\n', f);
@@ -289,8 +303,8 @@ int adapter_generate(basalt::model::ModelSession* sess, const std::vector<int64_
         dr.sampling = &window_sp;
         window_sp.counter = (uint64_t) made;   // row 0 draws token number `made`, so a seed gives one text at any window
         (T > 1 ? dr.row_tokens : dr.next_token) = rows.data();
-        if (g_diag_logits) {
-            diag_rows.resize((size_t) cap * (size_t) g_n_vocab);
+        if (g_diag_logits && T == 1) {
+            diag_rows.resize((size_t) g_n_vocab);
             dr.logits = diag_rows.data();
         }
         const basalt::model::Result r = sess->decode_window(dr);
@@ -310,7 +324,20 @@ int adapter_generate(basalt::model::ModelSession* sess, const std::vector<int64_
             ++offered_at[(size_t) k];
             accepted_at[(size_t) k] += k < a;
         }
-        if (g_diag_logits) std::fwrite(diag_rows.data(), sizeof(float), (size_t) (teacher ? T : a + 1) * (size_t) g_n_vocab, g_diag_logits);
+        if (g_diag_logits) {
+            const int n_write = teacher ? T : a + 1;
+            if (T > 1) {
+                diag_rows.resize((size_t) n_write * (size_t) g_n_vocab);
+                for (int i = 0; i < n_write; ++i) {
+                    const basalt::model::Result cr = sess->copy_logits(i, diag_rows.data() + (size_t) i * (size_t) g_n_vocab);
+                    if (!cr.ok()) {
+                        basalt::log::error("basalt generate", "diag-logits: %s", cr.message.c_str());
+                        return 1;
+                    }
+                }
+            }
+            std::fwrite(diag_rows.data(), sizeof(float), (size_t) n_write * (size_t) g_n_vocab, g_diag_logits);
+        }
         if (teacher) {
             // the expected text goes on whatever the picks: every row runs, and each pick that differs is counted
             for (int i = 0; i < T && !stop && made < max_new; ++i) {
@@ -356,7 +383,18 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
     }
     o.native_shards = {o.model};
     g_diag_serial_prompt = o.diag_serial_prompt;
-    if (!o.diag_logits.empty()) g_diag_logits = std::fopen(o.diag_logits.c_str(), "wb");
+    struct DiagLogitsGuard {
+        ~DiagLogitsGuard() {
+            if (g_diag_logits != nullptr) {
+                std::fclose(g_diag_logits);
+                g_diag_logits = nullptr;
+            }
+        }
+    } diag_logits_guard;
+    if (!o.diag_logits.empty()) {
+        g_diag_logits = basalt::platform::open_file_utf8(o.diag_logits, "wb");
+        if (g_diag_logits == nullptr) return fatal_start_error("cannot open --diag-logits " + o.diag_logits);
+    }
     try {
         const basalt::GgufFile model_gguf(o.native_shards.front());
         std::string err = adapter->validate(model_gguf);
@@ -423,6 +461,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         if (started.model->context() != 0) o.max_context = started.model->context();
         if (o.serve) return basalt::program::serve::run_session(o, model_file, *adapter, started);
         if (o.diag_batch_check) {   // every session's windows alone against the same windows batched, bitwise
+            if (o.tokens.empty()) return fatal_start_error("empty prompt: supply --tokens or --tokens-file");
             std::vector<basalt::model::ModelSession*> ss;
             for (auto& s : started.sessions) ss.push_back(s.get());
             const std::vector<int32_t> prompt(o.tokens.begin(), o.tokens.end());
@@ -436,6 +475,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         }
         if (o.diag_gpu_same) return fatal_start_error("--diag-gpu-same: this model does not run a layer split with both stages on one GPU");
         if (o.diag_gpu_check) {   // the prompt and its greedy steps recorded, and compared with a reference run's trace
+            if (o.tokens.empty()) return fatal_start_error("empty prompt: supply --tokens or --tokens-file");
             const std::vector<int32_t> prompt(o.tokens.begin(), o.tokens.end());
             std::string err;
             basalt::model::GpuTrace ref;   // a comparing run feeds the reference's picks, so each step sees the reference's context

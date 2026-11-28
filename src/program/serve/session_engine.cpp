@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <limits>
 #include <sstream>
 
 namespace basalt::program::serve {
@@ -639,7 +640,7 @@ public:
     std::optional<basalt::spec::SuffixDrafter> sfx;
     /// --draft-log FILE, opened once.
     FILE* draft_log() {
-        static FILE* const f = std::fopen(basalt::core::diagnostics().draft_log.c_str(), "a");
+        static FILE* const f = basalt::platform::open_file_utf8(basalt::core::diagnostics().draft_log, "a");
         return f;
     }
 
@@ -1061,24 +1062,34 @@ Flow SessionRequest::prepare_image() {
     if (const Flow flow = begin_quality_gate(runtime_.o.ppl_base, runtime_.o.ppl_out, max_verify_window()); flow != Flow::proceed) return flow;
     if (!geni) return Flow::proceed;
     std::string bad;
-    std::ifstream ef(emb_path, std::ios::binary);
-    if (!ef) bad = "cannot open " + emb_path;
+    if (n <= 0) bad = "empty prompt";
+    std::FILE* ef = bad.empty() ? basalt::platform::open_file_utf8(emb_path, "rb") : nullptr;
+    if (bad.empty() && ef == nullptr) bad = "cannot open " + emb_path;
     const int64_t vpad = runtime_.o.video_pad_id;
+    const int64_t expected_embd = rt_.desc().n_embd;
     const auto is_pad = [&](int64_t id) { return id == runtime_.o.image_pad_id || (vpad >= 0 && id == vpad); };
     for (int64_t i = 0; bad.empty() && i < n;) {
         if (!is_pad(ids[(size_t) i])) { ++i; continue; }
         int32_t hdr[5];
-        if (!ef.read((char*) hdr, sizeof hdr) || hdr[0] != kEmbeddingsMagic) { bad = "bad embeddings file"; break; }
+        if (std::fread(hdr, sizeof(int32_t), 5, ef) != 5 || hdr[0] != kEmbeddingsMagic || hdr[1] < 1 || hdr[4] < 1 ||
+            (expected_embd > 0 && (int64_t) hdr[4] != expected_embd)) {
+            bad = "bad embeddings file";
+            break;
+        }
         // a run is one record's rows: a picture, or one two-frame group of a video (groups sit between their times)
         int64_t run = 0;
         while (i + run < n && run < hdr[1] && ids[(size_t) (i + run)] == ids[(size_t) i]) ++run;
         if (hdr[1] != run || (i + run < n && ids[(size_t) (i + run)] == ids[(size_t) i])) { bad = "the prompt and its images do not match"; break; }
+        if ((uint64_t) hdr[1] > (std::numeric_limits<size_t>::max)() / sizeof(float) / (uint64_t) hdr[4]) {
+            bad = "bad embeddings file";
+            break;
+        }
         Block b;
         b.at = i;
         b.n_rows = hdr[1];
         if (hdr[2] > 0 && hdr[3] > 0 && (int64_t) hdr[2] * hdr[3] == hdr[1]) b.grid = {hdr[2], hdr[3]};
         b.rows.resize((size_t) hdr[1] * (size_t) hdr[4]);
-        if (!ef.read((char*) b.rows.data(), (std::streamsize) (b.rows.size() * sizeof(float)))) { bad = "short embeddings file"; break; }
+        if (std::fread(b.rows.data(), sizeof(float), b.rows.size(), ef) != b.rows.size()) { bad = "short embeddings file"; break; }
         const int64_t grid[3] = {hdr[1], hdr[2], hdr[3]};
         uint64_t h = fnv1a(grid, sizeof grid);
         h = fnv1a(b.rows.data(), b.rows.size() * sizeof(float), h);
@@ -1086,6 +1097,7 @@ Flow SessionRequest::prepare_image() {
         blocks_.push_back(std::move(b));
         i += run;
     }
+    if (ef != nullptr) std::fclose(ef);
     if (bad.empty() && is_pad(ids[(size_t) (n - 1)])) bad = "the prompt must end with text";
     if (!bad.empty()) {
         std::printf("ERR %s\n", bad.c_str());
@@ -1222,20 +1234,24 @@ void SessionRuntime::enc_command(const std::string& cmd) {
             std::vector<float> patches, rows;
             basalt::vision::patchify_video(v.frames, (int) v.indices.size(), v.canvas, geo, patches);
             const int groups = v.groups(), nx = v.canvas.w / 32, ny = v.canvas.h / 32;
-            const size_t per = patches.size() / (size_t) groups;
-            std::FILE* fo = std::fopen(opath.c_str(), "wb");
-            if (!fo) fail = "cannot write " + opath;
-            for (int gi = 0; fail.empty() && gi < groups; ++gi) {
-                const std::vector<float> part(patches.begin() + (ptrdiff_t) (gi * per), patches.begin() + (ptrdiff_t) ((gi + 1) * per));
-                const basalt::model::Result er = session().encode_patches(part, v.canvas.w, v.canvas.h, rows);
-                if (!er.ok()) fail = er.message;
-                else if (!write_record(fo, rows, nx * ny, {nx, ny})) fail = "short write to " + opath;
+            if (groups <= 0) {
+                fail = "video has no frames";
+            } else {
+                const size_t per = patches.size() / (size_t) groups;
+                std::FILE* fo = basalt::platform::open_file_utf8(opath, "wb");
+                if (!fo) fail = "cannot write " + opath;
+                for (int gi = 0; fail.empty() && gi < groups; ++gi) {
+                    const std::vector<float> part(patches.begin() + (ptrdiff_t) (gi * per), patches.begin() + (ptrdiff_t) ((gi + 1) * per));
+                    const basalt::model::Result er = session().encode_patches(part, v.canvas.w, v.canvas.h, rows);
+                    if (!er.ok()) fail = er.message;
+                    else if (!write_record(fo, rows, nx * ny, {nx, ny})) fail = "short write to " + opath;
+                }
+                if (fo) std::fclose(fo);
+                if (fail.empty())
+                    replies.push_back("ENC OK " + std::to_string(groups) + " " + std::to_string(nx) + " " + std::to_string(ny) + " " +
+                                      std::to_string(ms_since(te)) + " " +
+                                      basalt::vision::times_text(basalt::vision::group_times(v.indices, v.fps)));
             }
-            if (fo) std::fclose(fo);
-            if (fail.empty())
-                replies.push_back("ENC OK " + std::to_string(groups) + " " + std::to_string(nx) + " " + std::to_string(ny) + " " +
-                                  std::to_string(ms_since(te)) + " " +
-                                  basalt::vision::times_text(basalt::vision::group_times(v.indices, v.fps)));
         }
     } else {
         std::istringstream in(cmd);
@@ -1243,9 +1259,15 @@ void SessionRuntime::enc_command(const std::string& cmd) {
         in >> word;
         std::vector<std::string> words;
         while (in >> word) words.push_back(word);
+        if (words.empty() || words.size() % 2 != 0) fail = "expected: ENC <image> <out> ...";
         for (size_t i = 0; i + 1 < words.size() && fail.empty(); i += 2) {
-            std::ifstream f(words[i], std::ios::binary);
-            const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            std::vector<uint8_t> bytes;
+            if (std::FILE* fi = basalt::platform::open_file_utf8(words[i], "rb")) {
+                uint8_t buf[16384];
+                for (size_t got = 0; (got = std::fread(buf, 1, sizeof buf, fi)) > 0;)
+                    bytes.insert(bytes.end(), buf, buf + got);
+                std::fclose(fi);
+            }
             std::vector<float> rows;
             int rows_n = 0;
             basalt::model::ImageGrid grid;
@@ -1253,7 +1275,7 @@ void SessionRuntime::enc_command(const std::string& cmd) {
             const basalt::model::Result er = bytes.empty() ? basalt::model::Result{basalt::model::Status::Error, "cannot read the image " + words[i]}
                                                            : session().encode_image(bytes.data(), bytes.size(), rows, rows_n, grid);
             if (!er.ok()) { fail = er.message; break; }
-            std::FILE* fo = std::fopen(words[i + 1].c_str(), "wb");
+            std::FILE* fo = basalt::platform::open_file_utf8(words[i + 1], "wb");
             const bool ok = fo && write_record(fo, rows, rows_n, grid);
             if (fo) std::fclose(fo);
             if (!ok) { fail = "cannot write " + words[i + 1]; break; }

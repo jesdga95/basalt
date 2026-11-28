@@ -43,16 +43,20 @@ public:
 
     // chunk K's tokens; the request's prompt must be the chunk's first n_ctx/2 + 1 tokens
     bool begin(int chunk, const int64_t* ids, int64_t n, int64_t n_vocab, std::string& err) {
+        // Drain any abandoned async scoring task before touching stream_, tok_, or chunk_.
+        if (pending_.valid()) (void) pending_.get();
         stream_ = false;
         if (!available()) { err = "ppl: --ppl-base / --ppl-out not set or not readable"; return false; }
         if (n_vocab != n_vocab_) { err = "ppl: the base has another vocabulary size"; return false; }
         if (chunk < 0 || chunk >= n_chunk_) { err = "ppl: chunk out of range"; return false; }
         if (n != first() + 1) { err = "ppl: the prompt must be the chunk's first n_ctx/2 + 1 tokens"; return false; }
         tok_.resize((size_t) n_ctx_);
-        if (!read_at(tok_.data(), tok_.size() * 4, 20 + (uint64_t) chunk * n_ctx_ * 4)) {
+        if (!read_at(tok_.data(), tok_.size() * 4, 20 + (uint64_t) chunk * (uint64_t) n_ctx_ * 4)) {
             err = "ppl: reading the chunk tokens failed";
             return false;
         }
+        for (int32_t t : tok_)
+            if (t < 0 || t >= n_vocab_) { err = "ppl: a chunk token is outside the vocabulary"; return false; }
         for (int64_t i = 0; i < n; ++i)
             if (ids[i] != tok_[(size_t) i]) { err = "ppl: the prompt differs from the chunk tokens"; return false; }
         chunk_ = chunk;
@@ -61,6 +65,8 @@ public:
 
     // the request's own stream: ids[0..n), rows first .. n-2 scored, `top` likeliest per row (0: the whole row)
     bool begin_stream(const int64_t* ids, int64_t n, int64_t first, int top, int64_t n_vocab, std::string& err) {
+        // Drain any abandoned async scoring task before touching stream_ or tok_.
+        if (pending_.valid()) (void) pending_.get();
         if (out_ == nullptr) { err = "score: --ppl-out not set or not writable"; return false; }
         if (first < 0 || first >= n - 1) { err = "score: the scored position is not inside the stream"; return false; }
         if (top < 0 || top > 256) { err = "score: score_top is 0 (the whole row) to 256"; return false; }
@@ -88,7 +94,7 @@ public:
     // the chunk is done: flush its lines and let the page cache drop the base rows it read
     bool finish(std::string& err) {
         const bool ok = wait(err);
-        std::fflush(out_);
+        if (out_ != nullptr) std::fflush(out_);
         if (fd_ >= 0) basalt::platform::advise_dontneed(fd_, 0, 0);   // the rows this chunk read need not stay cached
         return ok;
     }
@@ -124,6 +130,7 @@ private:
         row_u16_ = 2 * ((n_vocab_ + 1) / 2) + 4;
     }
     ~PplGate() {
+        if (pending_.valid()) pending_.wait();
         if (out_ != nullptr) std::fclose(out_);
         close_fd();
     }
@@ -146,12 +153,15 @@ private:
     // a stream row: its log probabilities, as score=N says
     bool stream_row(int64_t pos, const std::vector<float>& lg) {
         const int64_t V = n_vocab_;
+        if (out_ == nullptr || V <= 0 || pos < 0 || (size_t) (pos + 1) >= tok_.size() || (int64_t) lg.size() < V)
+            return false;
+        const int32_t tgt = tok_[(size_t) pos + 1];
+        if (tgt < 0 || tgt >= V) return false;
         float maxv = lg[0];
         for (int64_t i = 1; i < V; ++i) maxv = std::max(maxv, lg[(size_t) i]);
         double sum = 0.0;
         for (int64_t i = 0; i < V; ++i) sum += std::exp(lg[(size_t) i] - maxv);
         const float lse = maxv + (float) std::log(sum);
-        const int32_t tgt = tok_[(size_t) pos + 1];
         if (s_top_ == 0) {
             std::vector<float> lp((size_t) V);
             for (int64_t i = 0; i < V; ++i) lp[(size_t) i] = lg[(size_t) i] - lse;
@@ -175,8 +185,12 @@ private:
     bool row(int64_t pos, const std::vector<float>& lg) {
         if (stream_) return stream_row(pos, lg);
         const int64_t r = pos - first(), rows = n_ctx_ - 1 - first();
-        const uint64_t off = 20 + (uint64_t) n_chunk_ * n_ctx_ * 4 +
-                             ((uint64_t) chunk_ * rows + (uint64_t) r) * (uint64_t) row_u16_ * 2;
+        if (chunk_ < 0 || r < 0 || r >= rows || (size_t) (pos + 1) >= tok_.size() || (int64_t) lg.size() < n_vocab_)
+            return false;
+        const int32_t tgt = tok_[(size_t) pos + 1];
+        if (tgt < 0 || tgt >= n_vocab_) return false;
+        const uint64_t off = 20 + (uint64_t) n_chunk_ * (uint64_t) n_ctx_ * 4 +
+                             ((uint64_t) chunk_ * (uint64_t) rows + (uint64_t) r) * (uint64_t) row_u16_ * 2;
         base_.resize((size_t) row_u16_);
         if (!read_at(base_.data(), base_.size() * 2, off)) return false;
         float scale, min_lp;
@@ -191,7 +205,6 @@ private:
         double sum = 0.0;
         for (int64_t i = 0; i < V; ++i) sum += std::exp(lg[(size_t) i] - maxv);
         const float lse = maxv + (float) std::log(sum);
-        const int32_t tgt = tok_[(size_t) pos + 1];
         const double nll = lse - lg[(size_t) tgt];
         const double nll_base = -(scale * b[tgt] + min_lp);
         double kld = 0.0;

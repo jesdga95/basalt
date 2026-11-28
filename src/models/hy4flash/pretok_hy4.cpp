@@ -4,8 +4,7 @@
 //   \p{N}{1,3}
 //   [CJK ideographs, hiragana, katakana]+
 //   [ASCII punctuation][A-Za-z]+ | [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+ | ?[\p{P}\p{S}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
-// The shared Unicode table has letters, numbers, marks and whitespace; punctuation and symbols are taken as the code points
-// that are none of those, nor controls.
+// Punctuation and symbol flags come directly from the shared Unicode category table (0x20, 0x40).
 #include "models/hy4flash/adapter.hpp"
 
 #include "unicode_flags.hpp"
@@ -23,6 +22,9 @@ using program::tokenizer::kWhitespace;
 
 namespace {
 
+constexpr uint16_t kPunctuation = 0x0020;   // \p{P}
+constexpr uint16_t kSymbol = 0x0040;        // \p{S}
+
 struct Text {
     std::vector<uint32_t> cp;
     std::vector<uint16_t> fl;
@@ -32,8 +34,7 @@ struct Text {
     bool number(size_t i) const { return (fl[i] & kNumber) != 0; }
     bool space(size_t i) const { return (fl[i] & kWhitespace) != 0; }
     bool newline(size_t i) const { return cp[i] == '\r' || cp[i] == '\n'; }
-    bool control(size_t i) const { return cp[i] < 0x20 || (cp[i] >= 0x7f && cp[i] < 0xa0); }
-    bool punct_symbol(size_t i) const { return !letter(i) && !number(i) && !mark(i) && !space(i) && !control(i); }
+    bool punct_symbol(size_t i) const { return (fl[i] & (kPunctuation | kSymbol)) != 0; }
     bool ascii_punct(size_t i) const {
         const uint32_t c = cp[i];
         return (c >= '!' && c <= '/') || (c >= ':' && c <= '@') || (c >= '[' && c <= '`') || (c >= '{' && c <= '~');
@@ -125,6 +126,7 @@ std::vector<std::pair<size_t, size_t>> split(const Text& t, const std::vector<st
 
 void pretok_hy4(const char* text, size_t size, std::vector<size_t>& ends) {
     ends.clear();
+    if (size == 0) return;
     const uint8_t* s = (const uint8_t*) text;
     const uint16_t* table = cpt_flag_table();
     Text t;

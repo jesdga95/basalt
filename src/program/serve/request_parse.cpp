@@ -124,7 +124,7 @@ Flow Request::parse() {
             const auto it = runtime_.gent_ids.find(std::strtoull(endp + 1, nullptr, 10));
             if (it != runtime_.gent_ids.end()) {
                 ids.assign(it->second.begin(), it->second.end());
-                runtime_.gent_ids.erase(it);
+                runtime_.gent_ids.erase(runtime_.gent_ids.begin(), std::next(it));
                 ids_ok = from_text = true;
             } else {
                 pe = "the tokenized prompt is gone";
@@ -146,8 +146,9 @@ Flow Request::parse() {
             ids_ok = cli::parse_i64_list(endp, ids, pe);
         }
     }
-    if (max_new < 1 || endp == nullptr || (geni && emb_path.empty()) || !ids_ok) {
-        std::printf("ERR bad request: %s\n", pe.empty() ? "max_new" : pe.c_str());
+    if (max_new < 1 || endp == nullptr || (geni && emb_path.empty()) || !ids_ok || ids.empty()) {
+        const char* why = !pe.empty() ? pe.c_str() : (max_new >= 1 && ids_ok && ids.empty() ? "prompt is empty" : "max_new");
+        std::printf("ERR bad request: %s\n", why);
         return Flow::next;
     }
     n = (int64_t) ids.size();

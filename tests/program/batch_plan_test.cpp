@@ -35,8 +35,14 @@ int main() {
     using basalt::program::serve::batch_groups;
     using basalt::program::serve::batch_fair_shares;
     using basalt::program::serve::batch_shares;
+    using basalt::program::serve::drafts_ahead;
     using Joint = std::vector<std::vector<double>>;
     using Rows = std::vector<int>;
+
+    check(drafts_ahead(1, 0) == 0 && drafts_ahead(1, 1) == 0 && drafts_ahead(4, 1) == 0,
+          "drafts_ahead returns 0 when max_window <= 1 without clamp UB");
+    check(drafts_ahead(1, 2) == 1 && drafts_ahead(1, 8) == 2 && drafts_ahead(5, 8) == 5 && drafts_ahead(10, 8) == 7,
+          "drafts_ahead clamps to [max(T, 2), most - 1]");
 
     check(batch_shares({{0.9, 0.8, 0.7}}, 8) == Rows{8}, "one slot: its drafts' rows, then the rest of the cap");
     check(batch_shares({{0.9, 0.8, 0.7}, {0.3, 0.1}}, 8) == Rows{5, 3},
@@ -99,6 +105,25 @@ int main() {
     check(batch_groups({10, 8, 6}, 16) == Groups{{0, 2}, {1}}, "first fit: a later window fills the first group");
     check(batch_groups({1, 16, 1}, 16) == Groups{{0, 2}, {1}}, "first fit skips a window that does not fit");
     check(batch_groups({}, 16).empty(), "no windows, no groups");
+    {
+        // More than kWindowSegsMax windows with room in `cap` must split so no group exceeds kWindowSegsMax segments.
+        const size_t kMax = (size_t) basalt::kernels::kWindowSegsMax;
+        const Rows many(kMax + 4, 1);
+        const int cap = (int) (kMax + 16);
+        const Groups g = batch_groups(many, cap);
+        const bool seg_ok = sound(many, g, cap) && g.size() == 2 && g[0].size() == kMax && g[1].size() == 4;
+        check(seg_ok, "batch_groups caps segments per group at kWindowSegsMax");
+        const Rows custom(20, 1);
+        const Groups gc = batch_groups(custom, 32, 16);
+        const bool custom_ok = sound(custom, gc, 32) && gc.size() == 2 && gc[0].size() == 16 && gc[1].size() == 4;
+        check(custom_ok, "batch_groups honors an explicit max_segs cap");
+    }
+    {
+        // Oversized windows (rows[i] > cap) run alone rather than being dropped or producing empty groups.
+        const Rows big = {20, 4, 20, 4};
+        const Groups g = batch_groups(big, 16);
+        check(g == Groups({{0}, {1, 3}, {2}}), "oversized windows run alone and are never dropped");
+    }
 
     bool all = true;
     for (int cap : {4, 9, 16})

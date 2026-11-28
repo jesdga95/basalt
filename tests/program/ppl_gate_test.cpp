@@ -15,7 +15,8 @@ static int g_fail = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); ++g_fail; } } while (0)
 
 // Odd vocabulary, so a row carries its padding. Each row's log-probs are a normalized ramp that depends on the chunk and the row.
-constexpr int kCtx = 8, kVocab = 7, kChunks = 2;
+// Chunk 2 intentionally carries an out-of-range target token in its scored half to verify bounds validation.
+constexpr int kCtx = 8, kVocab = 7, kChunks = 3;
 constexpr int kRows = kCtx - 1 - kCtx / 2;
 
 static float base_lp(int chunk, int row, int i) {
@@ -34,7 +35,7 @@ static void write_base(const std::string& path) {
     f.write((const char*) &c, 4);
     for (int k = 0; k < kChunks; ++k)
         for (int i = 0; i < kCtx; ++i) {
-            const int32_t t = (k * 3 + i) % kVocab;
+            const int32_t t = (k == 2 && i == kCtx - 1) ? kVocab : (k * 3 + i) % kVocab;
             f.write((const char*) &t, 4);
         }
     const float scale = 0.001f, lo = -20.0f;
@@ -67,6 +68,11 @@ int main() {
     CHECK(!g.begin(kChunks, prompt.data(), (int64_t) prompt.size(), kVocab, err));        // no such chunk
     CHECK(!g.begin(1, prompt.data(), (int64_t) prompt.size() - 1, kVocab, err));          // a short prompt
     CHECK(!g.begin(0, prompt.data(), (int64_t) prompt.size(), kVocab, err));              // another chunk's tokens
+    {
+        std::vector<int64_t> bad_chunk_prompt;
+        for (int i = 0; i <= kCtx / 2; ++i) bad_chunk_prompt.push_back((6 + i) % kVocab);
+        CHECK(!g.begin(2, bad_chunk_prompt.data(), (int64_t) bad_chunk_prompt.size(), kVocab, err));   // out-of-range target token
+    }
     CHECK(g.begin(1, prompt.data(), (int64_t) prompt.size(), kVocab, err));
     CHECK(g.token(kCtx - 1) == (3 + kCtx - 1) % kVocab);
 
@@ -78,6 +84,11 @@ int main() {
     }
     CHECK(g.score(g.first() + 2, std::vector<float>(own), err));
     CHECK(g.score(g.first() + 2, std::vector<float>(other), err));
+    // Re-calling begin() while an async score() is still pending must drain pending_ safely before touching tok_.
+    CHECK(g.begin(1, prompt.data(), (int64_t) prompt.size(), kVocab, err));
+    // Out-of-range pos fails cleanly in wait().
+    CHECK(g.score(g.first() - 1, std::vector<float>(own), err));
+    CHECK(!g.wait(err));
     CHECK(g.finish(err));
 
     std::ifstream rows(out);

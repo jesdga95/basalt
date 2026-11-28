@@ -43,6 +43,8 @@ public:
 
     /// The raw bytes one token stands for (empty for an id without a token).
     const std::string& token_bytes(int32_t id) const { return raw_[(size_t) id]; }
+    /// Whether `id` is a special/control token (token_type 3 or 4).
+    bool is_special(int32_t id) const { return id >= 0 && (size_t) id < special_.size() && special_[(size_t) id] != 0; }
 
 private:
     struct Merge {
@@ -81,6 +83,7 @@ private:
     static void build_literals(LiteralSet& set, const std::vector<Literal>& all);
 
     std::vector<std::string> raw_;          // token id -> bytes
+    std::vector<uint8_t> special_;          // 1 for control/user-defined special tokens (type 3 or 4)
     int32_t byte_id_[256];                  // byte -> its single-byte token, or -1
     std::vector<Merge> merges_;             // open addressing, power-of-two size
     uint64_t merge_mask_ = 0;

@@ -1,6 +1,8 @@
 // src/program/serve/batch_plan.hpp - how a round's windows share a batch's rows (header-only, no GPU).
 #pragma once
 
+#include "basalt/kernels/window_segs.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -13,7 +15,10 @@ namespace basalt::program::serve {
 /// The drafts to ask for the next window: up to one more than the window just verified used (at least 2), so a chained
 /// drafter's long window grows a row at a time where its drafts pay.  A block drafter makes its whole block in one pass and
 /// offers every draft of it; the drafts read back are as many as the session made.
-inline int drafts_ahead(int T, int most) { return std::clamp(std::max(T, 2), 1, most - 1); }
+inline int drafts_ahead(int T, int most) {
+    if (most <= 1) return 0;
+    return std::clamp(std::max(T, 2), 1, most - 1);
+}
 
 /// The most rows each active slot's window may take in a batch of `cap` rows. joint[i][k] is the chance slot i's drafts
 /// 0..k are all kept. With no more slots than rows, one pass serves them all: each slot takes one row, then each further
@@ -103,16 +108,25 @@ inline std::vector<int> batch_fair_shares(const std::vector<int>& want, int cap)
     return rows;
 }
 
-/// The windows of `rows` packed into groups of at most `cap` rows, first fit in slot order: each group starts at the
-/// first window not yet taken and takes every later one that still fits.
-inline std::vector<std::vector<size_t>> batch_groups(const std::vector<int>& rows, int cap) {
+/// The windows of `rows` packed into groups of at most `cap` rows and at most `max_segs` segments, first fit in slot
+/// order: each group starts at the first window not yet taken and takes every later one that still fits. Any window
+/// larger than `cap` runs alone in its own group rather than being dropped.
+inline std::vector<std::vector<size_t>> batch_groups(const std::vector<int>& rows, int cap,
+                                                     size_t max_segs = basalt::kernels::kWindowSegsMax) {
     std::vector<std::vector<size_t>> out;
+    const size_t seg_cap = std::max<size_t>(1, max_segs);
     std::vector<bool> taken(rows.size(), false);
     for (size_t first = 0; first < rows.size(); ++first) {
         if (taken[first]) continue;
         std::vector<size_t> group;
+        if (rows[first] > cap) {
+            group.push_back(first);
+            taken[first] = true;
+            out.push_back(std::move(group));
+            continue;
+        }
         int n = 0;
-        for (size_t i = first; i < rows.size(); ++i)
+        for (size_t i = first; i < rows.size() && group.size() < seg_cap; ++i)
             if (!taken[i] && n + rows[i] <= cap) {
                 group.push_back(i);
                 taken[i] = true;
