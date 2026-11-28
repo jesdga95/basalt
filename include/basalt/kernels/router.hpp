@@ -39,6 +39,8 @@ struct RouterMixedArgs {
     const uint8_t* alternate_mask = nullptr;  ///< device [T]; nonzero dynamic rows use alternate_bias
     const float* bias = nullptr;              ///< device [n_expert]; null means zero bias for ordinary dynamic rows
     const float* alternate_bias = nullptr;    ///< device [n_expert]; optional selection bias for alternate rows
+    float prior = 0.0f;
+    ResidentTabs held;
 };
 
 /// logits = gate . x (fp32, gate row-major [n_expert][n_embd]); s = the gate function of the logit; the top-k of s + bias

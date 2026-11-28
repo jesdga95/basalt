@@ -30,11 +30,17 @@ size_t indexer_project_workspace_bytes(int max_tokens);
 void indexer_project_q8_0(const void* w_q, const uint16_t* w_proj, const float* qr, const float* x,
                           const float* rope_angle, int n_tokens, float* q_out, float* head_weights,
                           void* workspace, size_t workspace_bytes, void* stream);
+void indexer_project_q8_0_pos(const void* w_q, const uint16_t* w_proj, const float* qr, const float* x,
+                              const int32_t* pos, const float* rope_freq, int n_tokens, float* q_out,
+                              float* head_weights, void* workspace, size_t workspace_bytes, void* stream);
 
 void indexer_round_bf16(const float* qr, int n_tokens, float* qr_bf16, void* stream);
 void indexer_project_post(const uint16_t* w_proj, const float* q_raw, const float* x,
                           const float* rope_angle, int n_tokens, float* w_raw, float* q_out,
                           float* head_weights, void* stream);
+void indexer_project_post_pos(const uint16_t* w_proj, const float* q_raw, const float* x,
+                              const int32_t* pos, const float* rope_freq, int n_tokens, float* w_raw,
+                              float* q_out, float* head_weights, void* stream);
 
 /// Scores compressed indexer keys and writes each query's top rows in descending score order, with lower row ids first
 /// on ties. q is [n_tokens][64][128], head_weights is [n_tokens][64] and already includes the source scale
@@ -47,5 +53,12 @@ void indexer_project_post(const uint16_t* w_proj, const float* q_raw, const floa
 void indexer_select(const float* q, const float* head_weights, const void* keys, int n_comp, int start_pos,
                     int n_tokens, int32_t* out_ids, int32_t* n_selected, void* workspace, size_t workspace_bytes,
                     CacheFormat fmt, void* stream);
+
+/// Graph-capturable decode window selection: reads `pos[t]` on-device (`eff_rows = (pos + 1) / 4`), fixed grid
+/// over `max_comp`. Outputs top-512 indices sorted ascending per token.
+size_t indexer_select_window_workspace_bytes(int max_comp);
+void indexer_select_window(const float* q, const float* head_weights, const void* keys, int max_comp,
+                           const int32_t* pos, int n_tokens, int32_t* out_ids, int32_t* n_selected,
+                           void* workspace, size_t workspace_bytes, CacheFormat fmt, void* stream);
 
 }  // namespace basalt::models::deepseek4

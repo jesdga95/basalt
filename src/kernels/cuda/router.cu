@@ -260,12 +260,14 @@ __global__ void router_select_kernel(const float* __restrict__ logits, const flo
                                 weights + (size_t) t * k, sh, held, prior);
 }
 
+template <bool kPrior>
 __global__ void router_select_mixed_kernel(const float* __restrict__ logits, const int32_t* __restrict__ fixed_ids,
                                             const int32_t* __restrict__ fixed_table, const int32_t* __restrict__ fixed_rows,
                                             const uint8_t* __restrict__ fixed_mask, const uint8_t* __restrict__ alternate_mask,
                                             const float* __restrict__ bias, const float* __restrict__ alternate_bias,
                                             int n_expert, int k, float scale, int gate,
-                                            int32_t* __restrict__ ids, float* __restrict__ weights) {
+                                            int32_t* __restrict__ ids, float* __restrict__ weights,
+                                            ResidentTabs held, float prior) {
     pdl_wait();
     pdl_launch_dependents();
     __shared__ SelectScratch sh;
@@ -305,8 +307,8 @@ __global__ void router_select_mixed_kernel(const float* __restrict__ logits, con
         }
     } else {
         const float* row_bias = alternate_mask && alternate_mask[t] ? alternate_bias : bias;
-        router_select_token<false>(row, row_bias, n_expert, k, scale, gate, ids + (size_t) t * k,
-                                   weights + (size_t) t * k, sh, ResidentTabs{}, 0.f);
+        router_select_token<kPrior>(row, row_bias, n_expert, k, scale, gate, ids + (size_t) t * k,
+                                    weights + (size_t) t * k, sh, held, prior);
     }
 }
 
@@ -532,9 +534,15 @@ void router_select_mixed(const float* logits, int n_tokens, const RouterMixedArg
         (a.alternate_mask && !a.alternate_bias))
         throw std::invalid_argument("router_select_mixed: invalid pointers or unsupported geometry");
     cudaStream_t st = (cudaStream_t) stream;
-    launch_pdl(router_select_mixed_kernel, dim3(n_tokens), dim3(a.n_expert), 0, st, logits, a.fixed_ids, a.fixed_table,
-               a.fixed_rows, a.fixed_mask, a.alternate_mask, a.bias, a.alternate_bias, a.n_expert, a.k, a.weight_scale,
-               (int) a.gate, ids, weights);
+    if (a.prior > 0.f) {
+        launch_pdl(router_select_mixed_kernel<true>, dim3(n_tokens), dim3(a.n_expert), 0, st, logits, a.fixed_ids,
+                   a.fixed_table, a.fixed_rows, a.fixed_mask, a.alternate_mask, a.bias, a.alternate_bias, a.n_expert,
+                   a.k, a.weight_scale, (int) a.gate, ids, weights, a.held, a.prior);
+    } else {
+        launch_pdl(router_select_mixed_kernel<false>, dim3(n_tokens), dim3(a.n_expert), 0, st, logits, a.fixed_ids,
+                   a.fixed_table, a.fixed_rows, a.fixed_mask, a.alternate_mask, a.bias, a.alternate_bias, a.n_expert,
+                   a.k, a.weight_scale, (int) a.gate, ids, weights, ResidentTabs{}, 0.f);
+    }
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 

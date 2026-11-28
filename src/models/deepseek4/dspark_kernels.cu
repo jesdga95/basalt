@@ -386,4 +386,36 @@ void dspark_commit_rows(const float* staged, int stage_slots, float* ring0, floa
     check_dspark("commit rows");
 }
 
+__global__ void stage_inputs_kernel(const float* __restrict__ anchor_row, const float* __restrict__ noise_row,
+                                    int n_embd, int B, const int32_t* __restrict__ m_meta, float* __restrict__ streams,
+                                    int32_t* __restrict__ d_pos, int32_t* __restrict__ d_wstart,
+                                    int32_t* __restrict__ d_wn, int32_t* __restrict__ d_tok,
+                                    int32_t* __restrict__ d_live) {
+    const int tid = (int) blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < B) {
+        d_pos[tid] = m_meta[tid];
+        d_wstart[tid] = m_meta[8 + tid];
+        d_wn[tid] = m_meta[16 + tid];
+    }
+    if (tid == 0) {
+        *d_tok = m_meta[24];
+        *d_live = m_meta[25];
+    }
+    const int total = B * 4 * n_embd;
+    for (int i = tid; i < total; i += (int) (gridDim.x * blockDim.x)) {
+        const int r = i / (4 * n_embd);
+        const int col = i % n_embd;
+        streams[i] = (r == 0) ? anchor_row[col] : noise_row[col];
+    }
+}
+
+void dspark_stage_inputs(const float* anchor_row, const float* noise_row, int n_embd, int B, const int32_t* m_meta,
+                         float* streams, int32_t* d_pos, int32_t* d_wstart, int32_t* d_wn, int32_t* d_tok,
+                         int32_t* d_live, void* stream) {
+    stage_inputs_kernel<<<64, 256, 0, (cudaStream_t) stream>>>(anchor_row, noise_row, n_embd, B, m_meta, streams,
+                                                                d_pos, d_wstart, d_wn, d_tok, d_live);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) throw std::runtime_error(std::string("deepseek4 dspark stage inputs: ") + cudaGetErrorString(e));
+}
+
 }  // namespace basalt::models::deepseek4

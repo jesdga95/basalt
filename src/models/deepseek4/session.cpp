@@ -86,9 +86,13 @@ public:
     ~Session() override {
         images_done();
         for (void* p : device_) if (p) cudaFree(p);
+        for (cudaGraphExec_t& e : head_g_) if (e) cudaGraphExecDestroy(e);
+        for (cudaGraphExec_t& e : tail_g_) if (e) cudaGraphExecDestroy(e);
         if (stream_) cudaStreamDestroy(stream_);
         if (row_st_) cudaStreamDestroy(row_st_);
+        for (cudaStream_t s : br_) if (s) cudaStreamDestroy(s);
         for (cudaEvent_t ev : row_ev_) if (ev) cudaEventDestroy(ev);
+        for (cudaEvent_t ev : br_ev_) if (ev) cudaEventDestroy(ev);
         if (h_expert_input_) cudaFreeHost(h_expert_input_);
         if (h_expert_rows_) cudaFreeHost(h_expert_rows_);
         if (h_expert_ids_) cudaFreeHost(h_expert_ids_);
@@ -104,16 +108,25 @@ public:
         format_ = model_.cache_format();
         if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess ||
             cudaStreamCreateWithFlags(&row_st_, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&br_[0], cudaStreamNonBlocking) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&br_[1], cudaStreamNonBlocking) != cudaSuccess ||
             cudaEventCreateWithFlags(&row_ev_[0], cudaEventDisableTiming) != cudaSuccess ||
             cudaEventCreateWithFlags(&row_ev_[1], cudaEventDisableTiming) != cudaSuccess) {
             err = "cannot create CUDA streams";
             return false;
         }
+        for (cudaEvent_t& ev : br_ev_) {
+            if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
+                err = "cannot create CUDA events";
+                return false;
+            }
+        }
         const size_t n = (size_t) geo_.n_embd;
         const size_t nf = (size_t) geo_.n_ff_exp;
         const int max_index_rows = (int) ((model_.context() + 3) / 4);
         const int max_hca_rows = (int) ((model_.context() + 127) / 128);
-        const int max_selected = std::max(kernels::kSparseMqaTopK, max_hca_rows);
+        const int max_hca_cap = ((max_hca_rows + 63) / 64) * 64;
+        const int max_selected = std::max(kernels::kSparseMqaTopK, max_hca_cap);
         const auto dev = [&](auto*& p, size_t count) { return allocate(p, count, err); };
         const size_t rows = kExpertWindow;
         bool ok = dev(streams_, 4 * n * rows) && dev(next_streams_, 4 * n * rows) && dev(attention_output_, n * rows) &&
@@ -141,9 +154,9 @@ public:
                    dev(indexer_head_weights_, 64 * rows) && dev(indexer_kv_, 256 * rows) && dev(indexer_score_, 256 * rows) &&
                    dev(attn_comp_kv_, 1024 * rows) && dev(attn_comp_score_, 1024 * rows) &&
                    dev(indexer_project_workspace_, indexer_project_workspace_bytes(kExpertWindow)) &&
-                   dev(indexer_select_workspace_, indexer_select_workspace_bytes(std::max(max_index_rows, 1))) &&
+                   dev(indexer_select_workspace_, indexer_select_window_workspace_bytes(std::max(max_index_rows, 1))) &&
                     dev(indexer_select_count_, rows) && dev(comp_limit_csa_, rows) && dev(comp_limit_hca_, rows) &&
-                    dev(hca_iota_, (size_t) max_hca_rows * rows) && dev(indexer_rope_angles_, 32 * rows) &&
+                    dev(hca_iota_, (size_t) max_hca_cap * rows) && dev(indexer_rope_angles_, 32 * rows) &&
                     dev(compress_rope_freq_, 32) &&
                   dev(sampled_, 1) && dev(expert_input_q8_, kernels::native_q8_1_bytes(geo_.n_embd, kExpertWindow)) &&
                   dev(expert_scratch_, kernels::native_expert_scratch_bytes(kExpertWindowRoutes, geo_.n_ff_exp)) &&
@@ -290,6 +303,9 @@ public:
             err = "deepseek4: " + err;
             return false;
         }
+        head_g_.assign((size_t) 2 * kExpertWindow * (size_t) geo_.n_layers * 2, nullptr);
+        tail_g_.assign((size_t) kExpertWindow * (size_t) geo_.n_layers, nullptr);
+        hca_iota_chunks_ = -1;
         err.clear();
         return true;
     }
@@ -324,6 +340,7 @@ public:
         const int want = std::clamp(n, 1, lim);
         if (!drafter_->draft_begin(dwin_, anchor, pos, want, stream_, err_))
             return {model::Status::Error, err_};
+        prepare_row0(anchor, pos);
         return {};
     }
 
@@ -951,6 +968,50 @@ private:
         return sync();
     }
 
+    void prepare_row0(int32_t token, int64_t pos) {
+        row0_ = false;
+        const size_t n = (size_t) geo_.n_embd;
+        std::vector<float> emb;
+        if (token < 0 || token >= geo_.n_vocab || !model_.weights().embedding_row(token, emb, err_)) return;
+        for (int s = 0; s < 4; ++s) std::copy(emb.data(), emb.data() + n, h_initial_ + (size_t) s * n);
+        row0_token_ = token;
+        row0_pos_ = pos;
+        row0_ = true;
+    }
+
+    bool take_row0(int32_t token, int64_t pos) {
+        if (row0_ && token == row0_token_ && pos == row0_pos_) {
+            row0_ = false;
+            return true;
+        }
+        row0_ = false;
+        return false;
+    }
+
+    template <class F>
+    bool run_graph(cudaGraphExec_t& exec, F&& body) {
+        if (!exec) {
+            if (cudaStreamBeginCapture(stream_, cudaStreamCaptureModeRelaxed) != cudaSuccess)
+                return fail_cuda("cannot begin a graph capture");
+            const bool ok = body();
+            cudaGraph_t g = nullptr;
+            const cudaError_t ce = cudaStreamEndCapture(stream_, &g);
+            if (!ok || ce != cudaSuccess) {
+                if (g) cudaGraphDestroy(g);
+                if (ok) return fail_cuda("graph capture");
+                return false;
+            }
+            const cudaError_t ci = cudaGraphInstantiateWithFlags(&exec, g, cudaGraphInstantiateFlagUseNodePriority);
+            cudaGraphDestroy(g);
+            if (ci != cudaSuccess) {
+                err_ = std::string("graph instantiate: ") + cudaGetErrorString(ci);
+                return false;
+            }
+        }
+        if (cudaGraphLaunch(exec, stream_) != cudaSuccess) return fail_cuda("graph launch");
+        return true;
+    }
+
     bool forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, const float* supplied_embeddings = nullptr,
                       bool attention_only = false, int layer_only = -1, bool begin_tier = true);
     bool prefill_rows(const int32_t* tokens, int n_tokens, int64_t pos, const float* supplied_embeddings = nullptr,
@@ -973,8 +1034,13 @@ private:
     };
     std::vector<ResolvedLayer> layers_;
     HeadWeights head_weights_{};
-    cudaStream_t stream_ = nullptr, row_st_ = nullptr;
-    cudaEvent_t row_ev_[2]{};
+    cudaStream_t stream_ = nullptr, row_st_ = nullptr, br_[2]{};
+    cudaEvent_t row_ev_[2]{}, br_ev_[6]{};
+    std::vector<cudaGraphExec_t> head_g_, tail_g_;
+    int hca_iota_chunks_ = -1;
+    int32_t row0_token_ = -1;
+    int64_t row0_pos_ = -1;
+    bool row0_ = false;
     std::vector<void*> device_;
     std::vector<RopeTables> ropes_;
     std::vector<LayerCache> layer_cache_;
@@ -1050,7 +1116,8 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
     }
     const size_t n = (size_t) geo_.n_embd;
     std::vector<float> embedding;
-    for (int t = 0; !attention_only && t < n_tokens; ++t) {
+    const int emb_from = (!attention_only && !supplied_embeddings && take_row0(tokens[0], pos)) ? 1 : 0;
+    for (int t = emb_from; !attention_only && t < n_tokens; ++t) {
         const int32_t token = tokens[t];
         const float* source = supplied_embeddings ? supplied_embeddings + (size_t) t * n : nullptr;
         if (token < 0 || (token >= geo_.n_vocab && !source)) {
@@ -1111,197 +1178,291 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
     }
     const int first_layer = layer_only >= 0 ? layer_only : 0;
     const int end_layer = layer_only >= 0 ? layer_only + 1 : geo_.n_layers;
+    const int max_index_rows = (int) ((model_.context() + 3) / 4);
+    const uint64_t keep_free = model_.tier() ? model_.tier()->free_floor() : 0;
+    const auto ensure_cache = [&](core::ElasticArray& array, uint64_t bytes) {
+        std::string cache_error;
+        if (array.ensure(bytes, keep_free, cache_error)) return true;
+        if (model_.tier()) {
+            model_.tier()->shrink();
+            if (array.ensure(bytes, keep_free, cache_error)) return true;
+        }
+        err_ = "deepseek4: cannot grow compressed cache at position " + std::to_string(pos) + ": " + cache_error;
+        return false;
+    };
+    for (int layer = first_layer; layer < end_layer; ++layer) {
+        const int ratio = geo_.compress_ratio[(size_t) layer];
+        if (!ratio) continue;
+        const int visible = (int) ((pos + n_tokens) / ratio);
+        LayerCache& cache = layer_cache_[(size_t) layer];
+        if (!ensure_cache(*cache.attention, (uint64_t) visible * comp_row_bytes(format_))) return false;
+        if (ratio == 4 && !ensure_cache(*cache.indexer, (uint64_t) visible * idx_row_bytes(format_))) return false;
+    }
+
+    core::ExpertTier* tier = model_.tier();
+    const bool use_graphs = !attention_only && layer_only < 0 && pos >= 4;
+    const size_t lossy_off = (tier && tier->route_lossy()) ? (size_t) kExpertWindow * (size_t) geo_.n_layers * 2 : 0;
+
+    const int visible_hca = (int) ((pos + n_tokens) / 128);
+    const int hca_chunks = visible_hca > 0 ? (visible_hca + 63) / 64 : 0;
+    if (hca_chunks > 0 && hca_chunks != hca_iota_chunks_) {
+        const int stride = hca_chunks * 64;
+        std::vector<int32_t> h_iota((size_t) kExpertWindow * (size_t) stride);
+        for (int t = 0; t < kExpertWindow; ++t)
+            for (int i = 0; i < stride; ++i) h_iota[(size_t) t * (size_t) stride + (size_t) i] = i;
+        if (cudaMemcpyAsync(hca_iota_, h_iota.data(), h_iota.size() * sizeof(int32_t),
+                            cudaMemcpyHostToDevice, stream_) != cudaSuccess)
+            return fail_cuda("HCA iota upload");
+        hca_iota_chunks_ = hca_chunks;
+        for (int l = 0; l < geo_.n_layers; ++l) {
+            if (geo_.compress_ratio[(size_t) l] != 128) continue;
+            for (int lo = 0; lo < 2; ++lo) {
+                for (int t = 0; t < kExpertWindow; ++t) {
+                    for (int p = 0; p < 2; ++p) {
+                        const size_t idx = (size_t) lo * kExpertWindow * (size_t) geo_.n_layers * 2 +
+                                           (((size_t) t * geo_.n_layers) + (size_t) l) * 2 + (size_t) p;
+                        if (head_g_[idx]) {
+                            cudaGraphExecDestroy(head_g_[idx]);
+                            head_g_[idx] = nullptr;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     for (int layer = first_layer; layer < end_layer; ++layer) {
         const ResolvedLayer& rl = layers_[(size_t) layer];
         const AttentionLayerWeights& attention = rl.attention;
         FfnRouteWeights route = rl.route;
         const SharedExpertWeights& shared = rl.shared;
-        AttentionLayerScratch attention_scratch;
-        attention_scratch.hc_workspace = hc_workspace_;
-        attention_scratch.coefficients = attn_coef_;
-        attention_scratch.collapsed = collapsed_;
-        attention_scratch.normalized = attn_normed_;
-        attention_scratch.attention = {attn_q8_, q_latent_, q_latent_q8_, q_heads_, kv_projected_, kv_row_,
-                                       mqa_output_, mqa_workspace_, attn_out_q8_, attn_out_latent_, attention_output_};
+        const int ratio = geo_.compress_ratio[(size_t) layer];
+        const int visible = ratio ? (int) ((pos + n_tokens) / ratio) : 0;
 
-        kernels::SparseMqaArgs selection;
-        selection.n_tokens = n_tokens;
-        selection.win = window_rings_ + (size_t) layer * kBootstrapWindow * win_row_bytes(format_);
-        selection.win_type = format_ == CacheFormat::Fp8 ? kernels::MqaRowType::Fp8 : kernels::MqaRowType::F16;
-        selection.win_cap = kBootstrapWindow;
-        selection.win_start = win_start_;
-        selection.win_n = win_n_;
-        selection.pos = positions_;
-        selection.rope = ropes_[(size_t) layer].attention;
+        const bool with_prev_tail = use_graphs && layer > first_layer;
+        const auto enqueue_head = [&]() -> bool {
+            if (with_prev_tail) {
+                try {
+                    kernels::hc_post(ffn_output_, next_streams_, ffn_coef_, kernels::kHcCoef, n_tokens, geo_.n_embd,
+                                     streams_, stream_);
+                } catch (const std::exception& e) {
+                    err_ = std::string("deepseek4 FFN finish ") + std::to_string(layer - 1) + ": " + e.what();
+                    return false;
+                }
+            }
 
-        try {
-            prepare_attention_layer(streams_, n_tokens, attention, attention_scratch, stream_);
-            kernels::native_quantize_q8_1(attn_normed_, attn_q8_, geo_.n_embd, n_tokens, stream_);
-            kernels::sparse_mqa_q_latent(attn_q8_, attention.attention.q, n_tokens, q_latent_, q_latent_q8_, stream_);
+            AttentionLayerScratch attention_scratch;
+            attention_scratch.hc_workspace = hc_workspace_;
+            attention_scratch.coefficients = attn_coef_;
+            attention_scratch.collapsed = collapsed_;
+            attention_scratch.normalized = attn_normed_;
+            attention_scratch.attention = {attn_q8_, q_latent_, q_latent_q8_, q_heads_, kv_projected_, kv_row_,
+                                           mqa_output_, mqa_workspace_, attn_out_q8_, attn_out_latent_, attention_output_};
 
-            const int ratio = geo_.compress_ratio[(size_t) layer];
-            const int visible = ratio ? (int) ((pos + n_tokens) / ratio) : 0;
+            kernels::SparseMqaArgs selection;
+            selection.n_tokens = n_tokens;
+            selection.win = window_rings_ + (size_t) layer * kBootstrapWindow * win_row_bytes(format_);
+            selection.win_type = format_ == CacheFormat::Fp8 ? kernels::MqaRowType::Fp8 : kernels::MqaRowType::F16;
+            selection.win_cap = kBootstrapWindow;
+            selection.win_start = win_start_;
+            selection.win_n = win_n_;
+            selection.pos = positions_;
+            selection.rope = ropes_[(size_t) layer].attention;
             selection.n_sel = 0;
             selection.comp = nullptr;
             selection.sel = nullptr;
             selection.comp_limit = nullptr;
-            if (ratio) {
-                LayerCache& cache = layer_cache_[(size_t) layer];
-                const uint64_t cache_bytes = (uint64_t) visible * comp_row_bytes(format_);
-                const uint64_t keep_free = model_.tier() ? model_.tier()->free_floor() : 0;
-                std::string cache_error;
-                const auto ensure_cache = [&](core::ElasticArray& array, uint64_t bytes) {
-                    if (array.ensure(bytes, keep_free, cache_error)) return true;
-                    if (model_.tier()) {
-                        model_.tier()->shrink();
-                        if (array.ensure(bytes, keep_free, cache_error)) return true;
+
+            try {
+                prepare_attention_layer(streams_, n_tokens, attention, attention_scratch, stream_);
+                kernels::native_quantize_q8_1(attn_normed_, attn_q8_, geo_.n_embd, n_tokens, stream_);
+
+                // Fork br_[0] for KV window projection/caching
+                if (cudaEventRecord(br_ev_[0], stream_) != cudaSuccess ||
+                    cudaStreamWaitEvent(br_[0], br_ev_[0], 0) != cudaSuccess)
+                    return fail_cuda("attention br0 fork");
+                project_attention_kv_q8(attn_q8_, attention.attention.kv_type, attention.attention.kv,
+                    attention.attention.kv_norm, geo_.rms_eps, positions_, ropes_[(size_t) layer].attention, n_tokens,
+                    kv_projected_, kv_row_, br_[0]);
+                cache_attention_window(window_rings_ + (size_t) layer * kBootstrapWindow * win_row_bytes(format_),
+                                       kv_row_, positions_, n_tokens, format_, br_[0]);
+                if (cudaEventRecord(br_ev_[1], br_[0]) != cudaSuccess) return fail_cuda("attention br0 done");
+
+                // Fork br_[1] for compressor + indexer key compression
+                if (ratio) {
+                    LayerCache& cache = layer_cache_[(size_t) layer];
+                    if (cudaEventRecord(br_ev_[2], stream_) != cudaSuccess ||
+                        cudaStreamWaitEvent(br_[1], br_ev_[2], 0) != cudaSuccess)
+                        return fail_cuda("attention br1 fork");
+                    if (ratio == 4) {
+                        kernels::bf16_gemv_fp32_mmvf_multi(attn_normed_, geo_.n_embd,
+                                                           static_cast<const uint16_t*>(rl.index_kv->ptr), indexer_kv_,
+                                                           256, geo_.n_embd, 256, n_tokens, br_[1]);
+                        kernels::bf16_gemv_fp32_mmvf_multi(attn_normed_, geo_.n_embd,
+                                                           static_cast<const uint16_t*>(rl.index_gate->ptr), indexer_score_,
+                                                           256, geo_.n_embd, 256, n_tokens, br_[1]);
+                        indexer_compress_projected(n_tokens, indexer_kv_, indexer_score_,
+                            static_cast<const float*>(rl.index_ape->ptr), positions_,
+                            static_cast<const float*>(rl.index_norm->ptr), geo_.rms_eps, compress_rope_freq_,
+                            cache.indexer_state_kv, cache.indexer_state_score,
+                            cache.indexer->data(), comp_row_, format_, br_[1]);
                     }
-                    err_ = "deepseek4: cannot grow compressed cache at position " + std::to_string(pos) + ": " + cache_error;
-                    return false;
-                };
+                    const CompressKind kind = ratio == 4 ? CompressKind::Csa : CompressKind::Hca;
+                    project_and_compress(kind, ratio, geo_.n_embd, n_tokens, attn_normed_,
+                        static_cast<const uint16_t*>(rl.attn_kv->ptr), static_cast<const uint16_t*>(rl.attn_gate->ptr),
+                        static_cast<const float*>(rl.attn_ape->ptr), positions_,
+                        static_cast<const float*>(rl.attn_norm->ptr), geo_.rms_eps, compress_rope_freq_,
+                        attn_comp_kv_, attn_comp_score_, cache.attention_state_kv, cache.attention_state_score,
+                        cache.attention->data(), comp_row_, format_, br_[1]);
+                    if (cudaEventRecord(br_ev_[3], br_[1]) != cudaSuccess) return fail_cuda("attention br1 done");
+                }
 
-                const DeviceTensor* attn_ape = rl.attn_ape;
-                const DeviceTensor* attn_norm = rl.attn_norm;
-                const DeviceTensor* attn_gate = rl.attn_gate;
-                const DeviceTensor* attn_kv = rl.attn_kv;
-                if (!ensure_cache(*cache.attention, cache_bytes)) return false;
+                // Main stream: Q latent
+                kernels::sparse_mqa_q_latent(attn_q8_, attention.attention.q, n_tokens, q_latent_, q_latent_q8_, stream_);
 
-                if (ratio == 4) {
-                    const DeviceTensor* index_ape = rl.index_ape;
-                    const DeviceTensor* index_norm = rl.index_norm;
-                    const DeviceTensor* index_gate = rl.index_gate;
-                    const DeviceTensor* index_kv = rl.index_kv;
-                    const DeviceTensor* index_q = rl.index_q;
-                    const DeviceTensor* index_proj = rl.index_proj;
-                    if (!ensure_cache(*cache.indexer, (uint64_t) visible * idx_row_bytes(format_))) return false;
-
-                    kernels::bf16_gemv_fp32_mmvf_multi(attn_normed_, geo_.n_embd,
-                                                       static_cast<const uint16_t*>(index_kv->ptr), indexer_kv_,
-                                                       256, geo_.n_embd, 256, n_tokens, stream_);
-                    kernels::bf16_gemv_fp32_mmvf_multi(attn_normed_, geo_.n_embd,
-                                                       static_cast<const uint16_t*>(index_gate->ptr), indexer_score_,
-                                                       256, geo_.n_embd, 256, n_tokens, stream_);
-                    indexer_compress_projected(n_tokens, indexer_kv_, indexer_score_, static_cast<const float*>(index_ape->ptr),
-                        positions_, static_cast<const float*>(index_norm->ptr), geo_.rms_eps, compress_rope_freq_,
-                        cache.indexer_state_kv, cache.indexer_state_score,
-                        cache.indexer->data(), comp_row_, format_, stream_);
-
-                    indexer_project_q8_0(index_q->ptr, static_cast<const uint16_t*>(index_proj->ptr), q_latent_,
-                        attn_normed_, indexer_rope_angles_, n_tokens, indexer_q_, indexer_head_weights_,
-                        indexer_project_workspace_, indexer_project_workspace_bytes(n_tokens), stream_);
-                    if (visible > 0) {
+                if (ratio == 4 && visible > 0) {
+                    // Run indexer Q + selection on br_[1] concurrently with q_heads on stream_
+                    if (cudaEventRecord(br_ev_[4], stream_) != cudaSuccess ||
+                        cudaStreamWaitEvent(br_[1], br_ev_[4], 0) != cudaSuccess)
+                        return fail_cuda("indexer wait ql");
+                    indexer_project_q8_0_pos(rl.index_q->ptr, static_cast<const uint16_t*>(rl.index_proj->ptr), q_latent_,
+                        attn_normed_, positions_, compress_rope_freq_, n_tokens, indexer_q_, indexer_head_weights_,
+                        indexer_project_workspace_, indexer_project_workspace_bytes(n_tokens), br_[1]);
+                    LayerCache& cache = layer_cache_[(size_t) layer];
+                    if (use_graphs) {
+                        indexer_select_window(indexer_q_, indexer_head_weights_, cache.indexer->data(),
+                            max_index_rows, positions_, n_tokens, selected_ids_, indexer_select_count_,
+                            indexer_select_workspace_, indexer_select_window_workspace_bytes(max_index_rows), format_, br_[1]);
+                    } else {
                         indexer_select(indexer_q_, indexer_head_weights_, cache.indexer->data(),
-                            visible, (int) pos, n_tokens, selected_ids_, indexer_select_count_, indexer_select_workspace_,
-                            indexer_select_workspace_bytes(visible), format_, stream_);
-                        selection.n_sel = kernels::kSparseMqaTopK;
-                        selection.sel = selected_ids_;
-                        selection.comp = cache.attention->data();
-                        selection.comp_type = format_ == CacheFormat::Fp8 ? kernels::MqaRowType::Fp4 : kernels::MqaRowType::F16;
-                        selection.comp_limit = comp_limit_csa_;
+                            visible, (int) pos, n_tokens, selected_ids_, indexer_select_count_,
+                            indexer_select_workspace_, indexer_select_workspace_bytes(visible), format_, br_[1]);
                     }
-                } else {
-                    selection.n_sel = visible;
+                    if (cudaEventRecord(br_ev_[5], br_[1]) != cudaSuccess) return fail_cuda("indexer done");
+                    selection.n_sel = kernels::kSparseMqaTopK;
+                    selection.sel = selected_ids_;
                     selection.comp = cache.attention->data();
                     selection.comp_type = format_ == CacheFormat::Fp8 ? kernels::MqaRowType::Fp4 : kernels::MqaRowType::F16;
-                    if (visible > 0) {
-                        if (visible != hca_iota_stride_) {
-                            std::vector<int32_t> h_iota((size_t) kExpertWindow * visible);
-                            for (int t = 0; t < kExpertWindow; ++t)
-                                for (int i = 0; i < visible; ++i) h_iota[(size_t) t * visible + i] = i;
-                            if (cudaMemcpyAsync(hca_iota_, h_iota.data(), h_iota.size() * sizeof(int32_t),
-                                                cudaMemcpyHostToDevice, stream_) != cudaSuccess)
-                                return fail_cuda("HCA iota upload");
-                            hca_iota_stride_ = visible;
-                        }
-                        selection.sel = hca_iota_;
-                        selection.comp_limit = comp_limit_hca_;
-                    }
+                    selection.comp_limit = comp_limit_csa_;
+                } else if (ratio == 128 && visible > 0) {
+                    selection.n_sel = hca_chunks * 64;
+                    selection.comp = layer_cache_[(size_t) layer].attention->data();
+                    selection.comp_type = format_ == CacheFormat::Fp8 ? kernels::MqaRowType::Fp4 : kernels::MqaRowType::F16;
+                    selection.sel = hca_iota_;
+                    selection.comp_limit = comp_limit_hca_;
                 }
-                const CompressKind kind = ratio == 4 ? CompressKind::Csa : CompressKind::Hca;
-                project_and_compress(kind, ratio, geo_.n_embd, n_tokens, attn_normed_,
-                    static_cast<const uint16_t*>(attn_kv->ptr), static_cast<const uint16_t*>(attn_gate->ptr),
-                    static_cast<const float*>(attn_ape->ptr), positions_, static_cast<const float*>(attn_norm->ptr),
-                    geo_.rms_eps, compress_rope_freq_, attn_comp_kv_, attn_comp_score_,
-                    cache.attention_state_kv, cache.attention_state_score,
-                    cache.attention->data(), comp_row_, format_, stream_);
+
+                kernels::sparse_mqa_q_heads(attention.attention.q, n_tokens, positions_, ropes_[(size_t) layer].attention,
+                                            q_latent_q8_, q_heads_, stream_);
+
+                if (cudaStreamWaitEvent(stream_, br_ev_[1], 0) != cudaSuccess) return fail_cuda("wait br0");
+                if (ratio) {
+                    if (cudaStreamWaitEvent(stream_, br_ev_[3], 0) != cudaSuccess) return fail_cuda("wait br1");
+                    if (ratio == 4 && visible > 0 && cudaStreamWaitEvent(stream_, br_ev_[5], 0) != cudaSuccess)
+                        return fail_cuda("wait indexer");
+                }
+
+                selection.q = q_heads_;
+                selection.sinks = attention.attention.sinks;
+                selection.round_output_bf16 = true;
+                selection.out = mqa_output_;
+                kernels::sparse_mqa(selection, mqa_workspace_, stream_);
+                kernels::sparse_mqa_output(mqa_output_, attention.attention.output_a_type, attention.attention.output_a,
+                    attention.attention.output_b_type, attention.attention.output_b, geo_.n_embd, n_tokens,
+                    attn_out_q8_, attn_out_latent_, attention_output_, stream_);
+                finish_attention_layer(streams_, attn_coef_, attention_output_, n_tokens, geo_.n_embd, next_streams_, stream_);
+            } catch (const std::exception& e) {
+                err_ = std::string("deepseek4 attention layer ") + std::to_string(layer) + ": " + e.what();
+                return false;
             }
 
-            kernels::sparse_mqa_q_heads(attention.attention.q, n_tokens, positions_, ropes_[(size_t) layer].attention,
-                                        q_latent_q8_, q_heads_, stream_);
-            project_attention_kv(attn_normed_, attention.attention.kv_type, attention.attention.kv,
-                attention.attention.kv_norm, geo_.rms_eps, positions_, ropes_[(size_t) layer].attention, n_tokens,
-                attn_q8_, kv_projected_, kv_row_, stream_);
-            cache_attention_window(window_rings_ + (size_t) layer * kBootstrapWindow * win_row_bytes(format_),
-                                   kv_row_, positions_, n_tokens, format_, stream_);
-            selection.q = q_heads_;
-            selection.sinks = attention.attention.sinks;
-            selection.round_output_bf16 = true;
-            selection.out = mqa_output_;
-            kernels::sparse_mqa(selection, mqa_workspace_, stream_);
-            kernels::sparse_mqa_output(mqa_output_, attention.attention.output_a_type, attention.attention.output_a,
-                attention.attention.output_b_type, attention.attention.output_b, geo_.n_embd, n_tokens,
-                attn_out_q8_, attn_out_latent_, attention_output_, stream_);
-            finish_attention_layer(streams_, attn_coef_, attention_output_, n_tokens, geo_.n_embd, next_streams_, stream_);
-        } catch (const std::exception& e) {
-            err_ = std::string("deepseek4 attention layer ") + std::to_string(layer) + ": " + e.what();
-            return false;
-        }
+            if (attention_only) return true;
 
-        if (attention_only) return true;
+            const RouteMeta* rm = layer < geo_.hash_layers ? d_route_meta_ : d_route_meta_dyn_;
+            route.routing = router_mixed_args(geo_.n_expert, geo_.n_vocab,
+                layer < geo_.hash_layers ? hash_routes_ + (size_t) layer * geo_.n_vocab * 6 : nullptr,
+                rm->fixed_row, rm->fixed_mask, rm->alternate_mask, route.routing.bias, route.routing.alternate_bias);
+            if (!attention_only && layer_only < 0 && tier && tier->route_lossy() && layer >= geo_.hash_layers) {
+                route.routing.held = tier->held_tabs(layer);
+                route.routing.prior = tier->route_prior();
+            }
 
-        const RouteMeta* rm = layer < geo_.hash_layers ? d_route_meta_ : d_route_meta_dyn_;
-        route.routing = router_mixed_args(geo_.n_expert, geo_.n_vocab,
-            layer < geo_.hash_layers ? hash_routes_ + (size_t) layer * geo_.n_vocab * 6 : nullptr,
-            rm->fixed_row, rm->fixed_mask, rm->alternate_mask, route.routing.bias, route.routing.alternate_bias);
-
-        const int n_ids = n_tokens * geo_.n_used;
-        try {
-            kernels::hc_mixes(next_streams_, route.hc_fn, route.hc_scale, route.hc_base, n_tokens, route.hc,
-                              hc_workspace_, ffn_coef_, stream_);
-            kernels::hc_pre_rms_norm(next_streams_, ffn_coef_, kernels::kHcCoef, route.norm, n_tokens, geo_.n_embd,
-                                     route.hc.rms_eps, collapsed_, ffn_normed_, stream_);
-            if (cudaEventRecord(row_ev_[0], stream_) != cudaSuccess ||
-                cudaStreamWaitEvent(row_st_, row_ev_[0], 0) != cudaSuccess ||
-                cudaMemcpyAsync(d_expert_input_, ffn_normed_, (size_t) n_tokens * geo_.n_embd * sizeof(float),
-                                cudaMemcpyDeviceToDevice, row_st_) != cudaSuccess ||
-                cudaEventRecord(row_ev_[1], row_st_) != cudaSuccess)
-                return fail_cuda("expert input stage");
-            router_step(ffn_normed_, route.gate, n_tokens, geo_.n_embd, route.routing, router_logits_,
-                        route_ids_, route_weights_, stream_);
-            if (cudaStreamWaitEvent(stream_, row_ev_[1], 0) != cudaSuccess)
-                return fail_cuda("expert input wait");
-            kernels::doorbell_publish(nullptr, route_ids_, nullptr, 0, n_ids, nullptr, d_expert_ids_, nullptr,
-                                      d_expert_seq_, stream_);
-            SharedExpertScratch shared_scratch{shared_in_q8_, shared_hidden_q8_, shared_gate_, shared_up_, shared_hidden_};
-            shared_expert_step(ffn_normed_, n_tokens, shared, shared_scratch, shared_output_, stream_);
-        } catch (const std::exception& e) {
-            err_ = std::string("deepseek4 FFN layer ") + std::to_string(layer) + ": " + e.what();
-            return false;
-        }
-        if (!routed_step(layer, ffn_normed_, n_tokens, route, route_weights_, ffn_output_)) return false;
-        try {
-            kernels::hc_post(ffn_output_, next_streams_, ffn_coef_, kernels::kHcCoef, n_tokens, geo_.n_embd,
-                             streams_, stream_);
-        } catch (const std::exception& e) {
-            err_ = std::string("deepseek4 FFN finish ") + std::to_string(layer) + ": " + e.what();
-            return false;
-        }
-        if (drafter_) {
-            const int slot = drafter_->feature_slot(layer);
-            if (slot >= 0) {
-                const size_t fstride = (size_t) drafter_->feature_floats();
-                for (int t = 0; t < n_tokens; ++t) {
-                    if (cudaMemcpyAsync(d_feat_ + (size_t) t * fstride + (size_t) slot * n,
-                                        collapsed_ + (size_t) t * n, n * sizeof(float),
-                                        cudaMemcpyDeviceToDevice, stream_) != cudaSuccess)
-                        return fail_cuda("dspark feature tap");
+            const int n_ids = n_tokens * geo_.n_used;
+            try {
+                kernels::hc_mixes(next_streams_, route.hc_fn, route.hc_scale, route.hc_base, n_tokens, route.hc,
+                                  hc_workspace_, ffn_coef_, stream_);
+                kernels::hc_pre_rms_norm(next_streams_, ffn_coef_, kernels::kHcCoef, route.norm, n_tokens, geo_.n_embd,
+                                         route.hc.rms_eps, collapsed_, ffn_normed_, stream_);
+                if (drafter_) {
+                    const int slot = drafter_->feature_slot(layer);
+                    if (slot >= 0) {
+                        const size_t fstride = (size_t) drafter_->feature_floats();
+                        for (int t = 0; t < n_tokens; ++t) {
+                            if (cudaMemcpyAsync(d_feat_ + (size_t) t * fstride + (size_t) slot * n,
+                                                collapsed_ + (size_t) t * n, n * sizeof(float),
+                                                cudaMemcpyDeviceToDevice, stream_) != cudaSuccess)
+                                return fail_cuda("dspark feature tap");
+                        }
+                    }
                 }
-                feat_pos0_ = pos;
-                feat_rows_ = n_tokens;
+                if (cudaEventRecord(row_ev_[0], stream_) != cudaSuccess ||
+                    cudaStreamWaitEvent(row_st_, row_ev_[0], 0) != cudaSuccess ||
+                    cudaMemcpyAsync(d_expert_input_, ffn_normed_, (size_t) n_tokens * geo_.n_embd * sizeof(float),
+                                    cudaMemcpyDeviceToDevice, row_st_) != cudaSuccess ||
+                    cudaEventRecord(row_ev_[1], row_st_) != cudaSuccess)
+                    return fail_cuda("expert input stage");
+                router_step(ffn_normed_, route.gate, n_tokens, geo_.n_embd, route.routing, router_logits_,
+                            route_ids_, route_weights_, stream_);
+                if (!attention_only && layer_only < 0 && tier && tier->route_tail_skip() > 0 && layer >= geo_.hash_layers) {
+                    kernels::route_tail_skip(route_ids_, route_weights_, route.routing.held, n_ids, geo_.n_used,
+                                             tier->route_tail_skip(), geo_.n_expert, tier->route_counts(), stream_);
+                }
+                if (cudaStreamWaitEvent(stream_, row_ev_[1], 0) != cudaSuccess)
+                    return fail_cuda("expert input wait");
+                kernels::doorbell_publish(nullptr, route_ids_, nullptr, 0, n_ids, nullptr, d_expert_ids_, nullptr,
+                                          d_expert_seq_, stream_);
+                SharedExpertScratch shared_scratch{shared_in_q8_, shared_hidden_q8_, shared_gate_, shared_up_, shared_hidden_};
+                shared_expert_step(ffn_normed_, n_tokens, shared, shared_scratch, shared_output_, stream_);
+            } catch (const std::exception& e) {
+                err_ = std::string("deepseek4 FFN layer ") + std::to_string(layer) + ": " + e.what();
+                return false;
+            }
+            return true;
+        };
+
+        if (use_graphs) {
+            const size_t gidx = lossy_off + (((size_t) (n_tokens - 1) * (size_t) geo_.n_layers) + (size_t) layer) * 2 +
+                                (with_prev_tail ? 1 : 0);
+            if (!run_graph(head_g_[gidx], enqueue_head)) return false;
+        } else {
+            if (!enqueue_head()) return false;
+        }
+        if (attention_only) return true;
+        if (!routed_step(layer, ffn_normed_, n_tokens, route, route_weights_, ffn_output_)) return false;
+        if (!use_graphs || layer + 1 == end_layer) {
+            const auto enqueue_tail = [&]() -> bool {
+                try {
+                    kernels::hc_post(ffn_output_, next_streams_, ffn_coef_, kernels::kHcCoef, n_tokens, geo_.n_embd,
+                                     streams_, stream_);
+                } catch (const std::exception& e) {
+                    err_ = std::string("deepseek4 FFN finish ") + std::to_string(layer) + ": " + e.what();
+                    return false;
+                }
+                return true;
+            };
+            if (use_graphs) {
+                const size_t tidx = (size_t) (n_tokens - 1) * (size_t) geo_.n_layers + (size_t) layer;
+                if (!run_graph(tail_g_[tidx], enqueue_tail)) return false;
+            } else {
+                if (!enqueue_tail()) return false;
             }
         }
     }
 
+    if (drafter_ && !attention_only && layer_only < 0) {
+        feat_pos0_ = pos;
+        feat_rows_ = n_tokens;
+    }
     if (drafter_ && feat_rows_ > 0 && feat_pos0_ >= 0) {
         // the stages' latents of this window are made beside the head, from the features the layer taps left
         if (cudaEventRecord(feat_ev_, stream_) != cudaSuccess ||

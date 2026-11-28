@@ -136,13 +136,14 @@ struct DsparkDrafter::Impl {
     float *d_head_hc_ws = nullptr, *d_head_coef = nullptr, *d_head_col = nullptr, *d_head_norm = nullptr;
     float *d_base_logits = nullptr, *d_me = nullptr, *d_mbias = nullptr, *d_amax_v = nullptr, *d_conf = nullptr;
     void* d_me_q8 = nullptr;
-    int32_t *d_amax_i = nullptr, *d_tok = nullptr, *d_stage_pos = nullptr;
-    float *d_moe_h = nullptr, *d_moe_d = nullptr;
+    int32_t *d_amax_i = nullptr, *d_tok = nullptr, *d_stage_pos = nullptr, *d_live = nullptr;
+    float *d_moe_h = nullptr, *d_moe_d = nullptr, *d_noise = nullptr;
     void *d_moe_hq = nullptr;
     float* d_staged = nullptr;   // [stages][8][512], the verify window's latents before commit
 
     // host staging
-    float* h_init = nullptr;
+    float *h_init = nullptr, *d_m_anchor = nullptr;
+    int32_t *h_meta = nullptr, *d_m_meta = nullptr;
     float* h_conf = nullptr;
     int32_t* h_tok = nullptr;
 
@@ -172,6 +173,7 @@ struct DsparkDrafter::Impl {
         if (d_markov_w1) cudaFree(d_markov_w1);
         for (void* p : dev_allocs) cudaFree(p);
         if (h_init) cudaFreeHost(h_init);
+        if (h_meta) cudaFreeHost(h_meta);
         if (h_conf) cudaFreeHost(h_conf);
         if (h_tok) cudaFreeHost(h_tok);
         if (ready_ev) cudaEventDestroy(ready_ev);
@@ -265,33 +267,25 @@ struct DsparkDrafter::Impl {
     }
 
     // The block's inputs: the anchor's row and the noise rows in all four streams, the positions and window bounds.
-    bool upload_inputs(int32_t anchor, int64_t pos, int B, std::string& err) {
+    bool upload_inputs(int32_t anchor, int64_t pos, int B, int n, std::string& err) {
         const size_t H = (size_t) g.n_embd;
         std::vector<float> emb;
+        if (!main->weights().embedding_row(anchor, emb, err)) return false;
+        std::copy_n(emb.data(), H, h_init);
         for (int r = 0; r < B; ++r) {
-            const int32_t tok = (r == 0) ? anchor : dp.noise_token_id;
-            if (!main->weights().embedding_row(tok, emb, err)) return false;
-            for (int s = 0; s < 4; ++s)
-                std::copy_n(emb.data(), H, h_init + ((size_t) r * 4 + s) * H);
+            h_meta[r] = (int32_t) (pos + r);
+            h_meta[8 + r] = (int32_t) std::max<int64_t>(0, pos + r - kDsparkWindow + 1);
+            h_meta[16 + r] = h_meta[r] - h_meta[8 + r] + 1;
         }
-        if (!ck(cudaMemcpyAsync(d_streams, h_init, (size_t) B * 4 * H * sizeof(float), cudaMemcpyHostToDevice, stream),
-                "embed H2D", err))
-            return false;
-        int32_t hp[kDsparkBlock]{}, hws[kDsparkBlock]{}, hwn[kDsparkBlock]{};
-        for (int r = 0; r < B; ++r) {
-            hp[r] = (int32_t) (pos + r);
-            hws[r] = (int32_t) std::max<int64_t>(0, pos + r - kDsparkWindow + 1);
-            hwn[r] = hp[r] - hws[r] + 1;
-        }
-        if (!ck(cudaMemcpyAsync(d_pos, hp, (size_t) B * sizeof(int32_t), cudaMemcpyHostToDevice, stream), "pos", err) ||
-            !ck(cudaMemcpyAsync(d_wstart, hws, (size_t) B * sizeof(int32_t), cudaMemcpyHostToDevice, stream), "ws", err) ||
-            !ck(cudaMemcpyAsync(d_wn, hwn, (size_t) B * sizeof(int32_t), cudaMemcpyHostToDevice, stream), "wn", err))
-            return false;
+        h_meta[24] = anchor;
+        h_meta[25] = n;
         return true;
     }
 
-    // The block's stages over the B rows already uploaded.
+    // The block's stages over the B rows already staged.
     void run_body(int w, int B) {
+        dspark_stage_inputs(d_m_anchor, d_noise, g.n_embd, B, d_m_meta, d_streams, d_pos, d_wstart, d_wn, d_tok, d_live,
+                            stream);
         WindowState& ws = windows[(size_t) w];
         float* streams = d_streams;
         float* next = d_next_streams;
@@ -326,10 +320,11 @@ struct DsparkDrafter::Impl {
             void* gate_s = gate[(size_t) s];
             void* up_s = up[(size_t) s];
             void* down_s = down[(size_t) s];
-            dspark_moe_gate_up(gate_s, up_s, H, g.n_ff_exp, d_q8, d_route_ids, B, K, g.swiglu_limit, nullptr, d_moe_h,
+            const int32_t* live = (s + 1 == dp.num_stages) ? d_live : nullptr;
+            dspark_moe_gate_up(gate_s, up_s, H, g.n_ff_exp, d_q8, d_route_ids, B, K, g.swiglu_limit, live, d_moe_h,
                                stream);
             kernels::native_quantize_q8_1(d_moe_h, d_moe_hq, g.n_ff_exp, B * K, stream);
-            dspark_moe_down(down_s, g.n_ff_exp, H, d_moe_hq, d_route_ids, B, K, nullptr, d_moe_d, stream);
+            dspark_moe_down(down_s, g.n_ff_exp, H, d_moe_hq, d_route_ids, B, K, live, d_moe_d, stream);
             weighted_route_sum(d_moe_d, d_route_w, B, H, d_routed_rows_, stream);
             finish_ffn_layer(streams, d_coef, d_shared, d_routed_rows_, B, H, next, stream);
             std::swap(streams, next);
@@ -611,17 +606,29 @@ std::unique_ptr<DsparkDrafter> DsparkDrafter::plan_load(const DsModel& main, int
     p->d_amax_v = static_cast<float*>(p->alloc_dev(kArgmaxBlocks * sizeof(float)));
     p->d_amax_i = static_cast<int32_t*>(p->alloc_dev(kArgmaxBlocks * sizeof(int32_t)));
     p->d_tok = static_cast<int32_t*>(p->alloc_dev((B + 1) * sizeof(int32_t)));
+    p->d_live = static_cast<int32_t*>(p->alloc_dev(sizeof(int32_t)));
+    p->d_noise = static_cast<float*>(p->alloc_dev(H * sizeof(float)));
     p->d_conf = static_cast<float*>(p->alloc_dev(B * sizeof(float)));
     p->d_moe_h = static_cast<float*>(p->alloc_dev((size_t) B * p->g.n_used * p->g.n_ff_exp * sizeof(float)));
     p->d_moe_d = static_cast<float*>(p->alloc_dev((size_t) B * p->g.n_used * H * sizeof(float)));
     p->d_moe_hq = p->alloc_dev(kernels::native_q8_1_bytes(p->g.n_ff_exp, B * p->g.n_used));
     p->d_staged = static_cast<float*>(p->alloc_dev((size_t) p->dp.num_stages * 8 * 512 * sizeof(float)));
     if (!p->d_streams || !p->d_base_logits || !p->d_conf || !p->d_moe_h || !p->d_moe_d || !p->d_staged ||
-        !ck(cudaHostAlloc(&p->h_init, (size_t) B * 4 * H * sizeof(float), cudaHostAllocDefault), "h_init", err) ||
+        !p->d_live || !p->d_noise ||
+        !ck(cudaHostAlloc(&p->h_init, H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "h_init", err) ||
+        !ck(cudaHostAlloc(&p->h_meta, 32 * sizeof(int32_t), cudaHostAllocPortable | cudaHostAllocMapped), "h_meta", err) ||
+        !ck(cudaHostGetDevicePointer(&p->d_m_anchor, p->h_init, 0), "d_m_anchor", err) ||
+        !ck(cudaHostGetDevicePointer(&p->d_m_meta, p->h_meta, 0), "d_m_meta", err) ||
         !ck(cudaHostAlloc(&p->h_tok, (B + 1) * sizeof(int32_t), cudaHostAllocDefault), "h_tok", err) ||
         !ck(cudaHostAlloc(&p->h_conf, B * sizeof(float), cudaHostAllocDefault), "h_conf", err)) {
         if (err.empty()) err = "deepseek4 dspark: out of device memory for drafter scratch";
         return nullptr;
+    }
+    {
+        std::vector<float> noise_emb;
+        if (!main.weights().embedding_row(p->dp.noise_token_id, noise_emb, err) ||
+            !ck(cudaMemcpy(p->d_noise, noise_emb.data(), H * sizeof(float), cudaMemcpyHostToDevice), "noise embed", err))
+            return nullptr;
     }
     basalt::log::info("basalt deepseek4",
                       "dspark drafter on GPU %d: %.2f GiB, %s, block %d, windows of at most %d tokens (--spec 0: off)",
@@ -762,12 +769,7 @@ bool DsparkDrafter::draft_begin(int w, int32_t anchor, int64_t pos, int n_out, v
         if (err.empty()) err = "deepseek4 dspark: cannot build the stage weights";
         return false;
     }
-    if (!p_->upload_inputs(anchor, pos, B, err)) return false;
-    if (n_out >= 0) {
-        const int32_t hp[1] = {anchor};
-        if (!ck(cudaMemcpyAsync(p_->d_tok, hp, sizeof(int32_t), cudaMemcpyHostToDevice, p_->stream), "anchor", err))
-            return false;
-    }
+    if (!p_->upload_inputs(anchor, pos, B, n, err)) return false;
     if (caller_stream) {
         if (!ck(cudaEventRecord(p_->ready_ev, (cudaStream_t) caller_stream), "record caller", err) ||
             !ck(cudaStreamWaitEvent(p_->stream, p_->ready_ev, 0), "wait caller", err))

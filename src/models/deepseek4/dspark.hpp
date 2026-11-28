@@ -85,5 +85,8 @@ void dspark_markov_gather(const uint16_t* w1, const int32_t* tok, float* out, vo
 void dspark_markov_bias(const uint16_t* w2, const float* w1p, int n_vocab, float* col, void* stream);
 void dspark_commit_rows(const float* staged, int stage_slots, float* ring0, float* ring1, float* ring2,
                         int ring_slots, int64_t pos0, int n, void* stream);
+void dspark_stage_inputs(const float* anchor_row, const float* noise_row, int n_embd, int B, const int32_t* m_meta,
+                         float* streams, int32_t* d_pos, int32_t* d_wstart, int32_t* d_wn, int32_t* d_tok,
+                         int32_t* d_live, void* stream);
 
 }  // namespace basalt::models::deepseek4

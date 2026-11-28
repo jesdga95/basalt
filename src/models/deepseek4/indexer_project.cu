@@ -104,6 +104,7 @@ __device__ __forceinline__ void rotate_pair(float& x0, float& x1, float frequenc
 }
 
 __global__ void indexer_query_post_kernel(const float* __restrict__ raw, const float* __restrict__ rope_angle,
+                                          const int32_t* __restrict__ pos, const float* __restrict__ rope_freq,
                                           int n_tokens, float* __restrict__ q_out) {
     __shared__ float values[D];
     __shared__ float hadamard_a[D];
@@ -115,13 +116,14 @@ __global__ void indexer_query_post_kernel(const float* __restrict__ raw, const f
     const int c = (int) threadIdx.x;
     if (token >= n_tokens) return;
     const float* q = raw + ((size_t) token * H + head) * D;
-    const float* angle = rope_angle + (size_t) token * (R / 2);
+    const float* angle = rope_angle ? rope_angle + (size_t) token * (R / 2) : nullptr;
     float value = bf16_rn(q[c]);
     if (c >= D - R) {
         const int pair = (c - (D - R)) >> 1;
         float x0 = bf16_rn(q[D - R + pair * 2]);
         float x1 = bf16_rn(q[D - R + pair * 2 + 1]);
-        rotate_pair(x0, x1, angle[pair]);
+        const float theta = angle ? angle[pair] : (float) pos[token] * rope_freq[pair];
+        rotate_pair(x0, x1, theta);
         value = bf16_rn((c & 1) ? x1 : x0);
     }
     values[c] = value;
@@ -202,7 +204,7 @@ void indexer_project_q8_0(const void* w_q, const uint16_t* w_proj, const float* 
     gemv_bf16_kernel<<<dim3((H + GemvWarps - 1) / GemvWarps, n_tokens), 32 * GemvWarps, 0, s>>>(
         w_proj, x, n_tokens, Embd, H, w_raw);
     check(cudaGetLastError(), "head-weight projection launch");
-    indexer_query_post_kernel<<<n_tokens * H, D, 0, s>>>(q_raw, rope_angle, n_tokens, q_out);
+    indexer_query_post_kernel<<<n_tokens * H, D, 0, s>>>(q_raw, rope_angle, nullptr, nullptr, n_tokens, q_out);
     check(cudaGetLastError(), "query transform launch");
     scale_head_weights_kernel<<<(n_tokens * H + 127) / 128, 128, 0, s>>>(w_raw, n_tokens, head_weights);
     check(cudaGetLastError(), "head-weight scaling launch");
@@ -225,10 +227,47 @@ void indexer_project_post(const uint16_t* w_proj, const float* q_raw, const floa
     gemv_bf16_kernel<<<dim3((H + GemvWarps - 1) / GemvWarps, n_tokens), 32 * GemvWarps, 0, s>>>(
         w_proj, x, n_tokens, Embd, H, w_raw);
     check(cudaGetLastError(), "head-weight projection launch");
-    indexer_query_post_kernel<<<n_tokens * H, D, 0, s>>>(q_raw, rope_angle, n_tokens, q_out);
+    indexer_query_post_kernel<<<n_tokens * H, D, 0, s>>>(q_raw, rope_angle, nullptr, nullptr, n_tokens, q_out);
     check(cudaGetLastError(), "query transform launch");
     scale_head_weights_kernel<<<(n_tokens * H + 127) / 128, 128, 0, s>>>(w_raw, n_tokens, head_weights);
     check(cudaGetLastError(), "head-weight scaling launch");
+}
+
+void indexer_project_post_pos(const uint16_t* w_proj, const float* q_raw, const float* x,
+                              const int32_t* pos, const float* rope_freq, int n_tokens, float* w_raw,
+                              float* q_out, float* head_weights, void* stream) {
+    if (!w_proj || !q_raw || !x || !pos || !rope_freq || !w_raw || !q_out || !head_weights || !stream || n_tokens < 1)
+        throw std::invalid_argument("deepseek4 indexer_project_post_pos: invalid arguments");
+    const cudaStream_t s = (cudaStream_t) stream;
+    gemv_bf16_kernel<<<dim3((H + GemvWarps - 1) / GemvWarps, n_tokens), 32 * GemvWarps, 0, s>>>(
+        w_proj, x, n_tokens, Embd, H, w_raw);
+    check(cudaGetLastError(), "head-weight projection launch");
+    indexer_query_post_kernel<<<n_tokens * H, D, 0, s>>>(q_raw, nullptr, pos, rope_freq, n_tokens, q_out);
+    check(cudaGetLastError(), "query transform launch");
+    scale_head_weights_kernel<<<(n_tokens * H + 127) / 128, 128, 0, s>>>(w_raw, n_tokens, head_weights);
+    check(cudaGetLastError(), "head-weight scaling launch");
+}
+
+void indexer_project_q8_0_pos(const void* w_q, const uint16_t* w_proj, const float* qr, const float* x,
+                              const int32_t* pos, const float* rope_freq, int n_tokens, float* q_out,
+                              float* head_weights, void* workspace, size_t workspace_bytes, void* stream) {
+    if (!w_q || !w_proj || !qr || !x || !pos || !rope_freq || !q_out || !head_weights || !workspace || !stream ||
+        n_tokens < 1 || n_tokens > TMax || workspace_bytes < indexer_project_workspace_bytes(n_tokens))
+        throw std::invalid_argument("deepseek4 indexer Q8_0 pos projection: invalid arguments");
+    auto* base = static_cast<unsigned char*>(workspace);
+    float* q_raw = reinterpret_cast<float*>(base);
+    float* w_raw = reinterpret_cast<float*>(base + align256((size_t) n_tokens * H * D * sizeof(float)));
+    float* qr_bf16 = reinterpret_cast<float*>(base + align256((size_t) n_tokens * H * D * sizeof(float)) +
+                                             align256((size_t) n_tokens * H * sizeof(float)));
+    void* qr_q8_1 = base + align256((size_t) n_tokens * H * D * sizeof(float)) +
+                    align256((size_t) n_tokens * H * sizeof(float)) +
+                    align256((size_t) n_tokens * QRank * sizeof(float));
+    const cudaStream_t s = (cudaStream_t) stream;
+    round_bf16_kernel<<<((size_t) n_tokens * QRank + 255) / 256, 256, 0, s>>>(qr, n_tokens * QRank, qr_bf16);
+    check(cudaGetLastError(), "Q8_0 query activation boundary launch");
+    kernels::native_quantize_q8_1(qr_bf16, qr_q8_1, QRank, n_tokens, stream);
+    kernels::native_q8_0_mmvq(w_q, qr_q8_1, q_raw, QRank, H * D, n_tokens, stream);
+    indexer_project_post_pos(w_proj, q_raw, x, pos, rope_freq, n_tokens, w_raw, q_out, head_weights, stream);
 }
 
 }  // namespace basalt::models::deepseek4
