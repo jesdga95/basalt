@@ -272,7 +272,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
                         cpu::cpu_avx512_ok() ? "AVX-512" : "AVX-2", rel(alt, got_c));
         }
         if (f.d_type == 20 && cpu::cpu_avx2_ok()) {
-            // (b3) the IQ4_NL multi-token AVX-2 kernel the pool now uses for IQ4_NL down projections,
+            // (b3) the IQ4_NL multi-token AVX-2 kernel the pool uses for IQ4_NL down projections,
             // against ggml-cpu's single-token vec_dot on the SAME Q8_0 activations (h), plus timing.
             std::vector<float> alt((size_t) NT * H), refd((size_t) NT * H);
             float* altp[NT];
@@ -519,7 +519,7 @@ int check_nvfp4_multi(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob,
         a[t] = act[t].data();
         hp[t] = hq[t].data();
     }
-    // the old path: one ggml dot per row and token
+    // the reference path: one ggml dot per row and token
     auto old_gu = [&](int nt, float* const* ff, int r0, int r1) {
         for (int r = r0; r < r1; ++r)
             for (int t = 0; t < nt; ++t) {

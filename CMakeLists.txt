@@ -465,7 +465,7 @@ basalt_embed_manifest(basalt-gguf)
 add_executable(basalt-dequant src/artifact/dequant.cpp)
 target_link_libraries(basalt-dequant PRIVATE artifact)
 basalt_embed_manifest(basalt-dequant)
-# this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
+# this file is nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
 target_compile_definitions(basalt-dequant PRIVATE DEQUANT_SELFTEST)
 if(BUILD_TESTING)
   # the reader refuses a duplicate tensor name at open, naming it (a synthetic GGUF: no model, no GPU)
@@ -1261,7 +1261,7 @@ basalt_gpu_test(NAME dec_commit_finisher COMMAND dec_commit_parity --finisher)
 basalt_gpu_test(NAME dec_commit_lazy COMMAND dec_commit_parity --lazy)
 endif()
 # the IQ kernels that decode a weight part once for every column/entry, bitwise vs the per-column ones
-# (GPU, synthetic, no model; --bench adds old/new timings)
+# (GPU, synthetic, no model; --bench adds timings)
 add_executable(iq_multi_parity tests/kernels/iq_multi_parity.cpp)
 target_include_directories(iq_multi_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(iq_multi_parity PRIVATE kernels ${_gpu_runtime_target})
@@ -1279,8 +1279,8 @@ add_executable(hc8_parity tests/models/qwen4exp/kernels/hc8_parity.cpp)
 target_include_directories(hc8_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(hc8_parity PRIVATE model_qwen4exp_prefill model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME hc8_parity COMMAND hc8_parity)
-# native_expert_grouped's group stride and fused SwiGLU + q8_1, bitwise vs the launches before them (GPU, synthetic,
-# no model; --bench adds v1/new timings of a window's 48 calls in a graph)
+# native_expert_grouped's group stride and fused SwiGLU + q8_1, bitwise vs the separate launches (GPU, synthetic,
+# no model; --bench adds timings of a window's calls in a graph)
 add_executable(native_grouped_parity tests/models/qwen4exp/kernels/native_grouped_parity.cpp)
 target_include_directories(native_grouped_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(native_grouped_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
@@ -1536,8 +1536,8 @@ target_include_directories(cvec_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(cvec_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME cvec_parity COMMAND cvec_parity)
 
-# The rewritten per-hit and grouped expert kernels vs the previous ones, bitwise (GPU, synthetic, no model).
-# `--bench` adds previous/new timings on engine-like shapes.
+# The per-hit and grouped expert kernels vs the reference ones, bitwise (GPU, synthetic, no model).
+# `--bench` adds timings on engine-like shapes.
 add_executable(s2_expert_grouped_parity tests/models/qwen4exp/kernels/s2_expert_grouped_parity.cpp)
 target_include_directories(s2_expert_grouped_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(s2_expert_grouped_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})

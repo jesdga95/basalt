@@ -1,4 +1,4 @@
-"""Inkling 2 tool calls that reach the reply in a form other than the one in the template (#540, #553): the native
+"""Inkling 2 tool calls that reach the reply in a form other than the one in the template: the native
 call with no name in its header, with no header, or in a block left open, and the call written as XML
 (`<invoke name=...><parameter name=...>`, bare or wrapped in `<tool_call><function_calls>`). Each is a call whole and
 streamed, in every chunking, through the OpenAI and Anthropic routes; text that only talks about the tags stays text."""

@@ -202,7 +202,7 @@ public:
     /// A prompt chunk sends layer l's rows to the second card: it holds experts of the layer that the main card has no copy of.
     bool peer_runs(int l) const { return peer_n(l) > 0 && !all_copied(l); }
     const SpillPlan& spill() const { return spill_; }
-    /// gpu-mode peer (docs/design/multi-gpu.md): the experts that spilled from the main card and the second card holds in
+    /// gpu-mode peer (docs/architecture/multi-gpu.md): the experts that spilled from the main card and the second card holds in
     /// its VRAM, the hottest first as far as its room goes. The main card runs every layer; a decode window's pairs on
     /// these experts go to the card from the CPU experts' doorbell thread (cpu_experts.hpp), a prompt chunk's rows go to
     /// it layer by layer (prompt.cpp) and its partial sums come back. They have no RAM copy and no staging.

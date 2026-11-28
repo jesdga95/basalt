@@ -5,7 +5,7 @@ to the others: [models](index.md). Rounding and quality: [precision](../precisio
 
 ## Pack
 
-One file, `Hy4-flash-NVFP4.basalt` (158.7 GB), built from Tencent's BF16 checkpoint (Tencent Hy License 1.0) with the vision
+The pack is `Hy4-flash-NVFP4.basalt` (158.7 GB), built from Tencent's BF16 checkpoint (Tencent Hy License 1.0) with the vision
 projector and the DFly2 drafter:
 
 - Routed experts: NVFP4, rounded once from BF16 (83.6 GB).
@@ -17,8 +17,8 @@ projector and the DFly2 drafter:
 
 Download it from [Hugging Face](https://huggingface.co/jesdga/Hy4-flash-Basalt)
 (`hf download jesdga/Hy4-flash-Basalt Hy4-flash-NVFP4.basalt --local-dir models`), or build the same file yourself:
-[model file](../model-file.md#hy4-flash-nvfp4-pack). A test pack from AngelSlim's Q4_K_M GGUF converts too
-([model file](../model-file.md#hy4-flash-test-pack)).
+[model file](../model-file/hy4-flash.md#hy4-flash-nvfp4-pack). A test pack from AngelSlim's Q4_K_M GGUF converts too
+([model file](../model-file/hy4-flash.md#hy4-flash-test-pack)).
 
 ## Architecture
 
@@ -116,7 +116,7 @@ basalt hy4flash: drafter: 5 layers reading target layers 25..41, 0.66 GiB on the
 ## Parallel slots
 
 `--parallel N` starts N sessions, each with its own caches, rings and drafter context, over the one expert tier and one forward
-scratch. The busy slots decode together, one pass of up to 8 rows ([batched decoding](../design/batching.md)); a request alone in
+scratch. The busy slots decode together, one pass of up to 8 rows ([batched decoding](../architecture/batching.md)); a request alone in
 its slot gives the tokens it gives with `--parallel 1`. Speed with several slots is not measured.
 
 ## Images

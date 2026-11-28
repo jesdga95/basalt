@@ -4,7 +4,7 @@
 // A row's result does not depend on the other rows of its call: the products take a fixed reduction order per row, the
 // experts compute per (row, slot) entry, the attention splits a row's keys by its own key count and the glue runs a block
 // per row. The positions and tokens are read on the card, and the full layers' launch bound (a power of two of keys)
-// only sizes their grid. A batch window (docs/design/batching.md) is the same forward over several sessions' rows, each
+// only sizes their grid. A batch window (docs/architecture/batching.md) is the same forward over several sessions' rows, each
 // segment's attention reading and writing its own session's caches.
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/core/device_copy.hpp"

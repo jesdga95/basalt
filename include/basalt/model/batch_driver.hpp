@@ -1,10 +1,10 @@
-// include/basalt/model/batch_driver.hpp - decode_batch for any model (docs/design/batching.md). A model's session derives
+// include/basalt/model/batch_driver.hpp - decode_batch for any model (docs/architecture/batching.md). A model's session derives
 // BatchSession and writes the hooks below: its rows' inputs to the card, the forward of a window of segments, each session's
 // logits back and its draws. The driver does the rest: the checks, the segments, each session's head rows, the graph of each
 // composition (its first window direct, then captured behind it; the most recently used kept), the order of the streams
 // and one sync for the whole batch. A model whose host steers its forward between launches (experts placed by the host
 // between per-layer graphs) runs its forward directly every window and keeps its own graphs (batch_captured false); a
-// session that cannot batch for now (batch_ready false) has the batch's windows run in turn.
+// session that cannot batch (batch_ready false) has the batch's windows run in turn.
 #pragma once
 
 #include "basalt/core/graph.hpp"
@@ -173,7 +173,7 @@ public:
     }
 
 protected:
-    // ---- the hooks a model writes (docs/design/batching.md, "Adding batching to a model")
+    // ---- the hooks a model writes (docs/architecture/batching.md, "Adding batching to a model")
 
     /// The error messages' prefix: the model's name.
     virtual const char* batch_name() const = 0;

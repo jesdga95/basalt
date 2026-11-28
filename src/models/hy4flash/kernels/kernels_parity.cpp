@@ -1128,7 +1128,7 @@ void test_mla_long() {
 }
 
 // Microbench of a window's attention kernels at the model's geometry (the weights rotate through more than the L2 holds):
-// us per call and GB/s of the bytes each must read.
+// time per call and bandwidth over the bytes each must read.
 void bench_mla() {
     cudaStream_t st;
     cudaStreamCreate(&st);

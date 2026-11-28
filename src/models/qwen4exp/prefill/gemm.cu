@@ -44,8 +44,7 @@ void note(cublasStatus_t s, const char* what) {
 cublasHandle_t g_prepared[16] = {};
 
 // Under --diag-main-card-bits, the main card's algorithm for a product, as its cublasLt heuristic picks it within the workspace: the one
-// cublasGemmEx runs there (checked bit for bit against it on an RTX 5090, and on an RTX 5060 Ti running the 5090's
-// algorithm).  Shared by every stage's Gemm, made once per product shape.
+// cublasGemmEx runs there (bit-identical to it).  Shared by every stage's Gemm, made once per product shape.
 struct MainAlgo {
     cublasLtMatmulDesc_t op = nullptr;
     cublasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;

@@ -96,7 +96,7 @@ public:
     /// the window from `set_keepalive` still finds the SSD awake at the first request.
     void rearm_keepalive();
 
-    /// Fault injection for tests and for the plan's P2 exit check: every read completes no earlier than
+    /// Fault injection for tests: every read completes no earlier than
     /// `delay_us` after it was issued. 0 disables.
     void set_injected_delay_us(double delay_us);
 

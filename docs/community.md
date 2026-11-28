@@ -19,7 +19,7 @@ Optional fields, recorded by `--community` before the engine starts (`basalt-ben
 - per GPU, `pcie`: the link as the driver reports it, e.g. "5.0 x16": the maximum generation (the current one drops at idle) and the current width (the maximum width is the card's, not the slot's, so a slot shared between two cards reads x8).
 - per GPU, `h2d_gbps`: pinned host-to-device copy speed in GB/s, best of several 256 MiB copies.
 
-Optional fields, recorded by `--community` from the same three decode requests (rows from before they existed lack them; `decode_tps` keeps its meaning, so old and new rows compare):
+Optional fields, recorded by `--community` from the same three decode requests (older rows lack them; `decode_tps` keeps its meaning, so old and new rows compare):
 
 - `decode_conv_tps`, `decode_struct_tps`, `decode_prose_tps`: that fixture's generated tokens over its decode time. `decode_tps` stays the sum of the three fixtures' tokens over the sum of their decode times (token-weighted, not the mean of these three).
 - `accept_conv_pct`, `accept_struct_pct`, `accept_prose_pct`: draft tokens the model accepted over draft tokens it offered, in percent, and `draft_len_conv`, `draft_len_struct`, `draft_len_prose`: the mean number of draft tokens offered per decode window. Both are left out for a fixture the model did not draft in.

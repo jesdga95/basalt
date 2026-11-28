@@ -1,4 +1,4 @@
-// src/program/serve/batch_round.cpp - the batch slots' rounds, for every model (docs/design/batching.md): each active slot's
+// src/program/serve/batch_round.cpp - the batch slots' rounds, for every model (docs/architecture/batching.md): each active slot's
 // window, the rows the windows share, the groups that run as one batch through the model's sessions, then each slot's
 // accepted drafts, grammar, logprobs, tokens out and next drafts.
 #include "batch_plan.hpp"

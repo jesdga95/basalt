@@ -1,4 +1,4 @@
-// include/basalt/model/peer_hooks.hpp - gpu-mode peer for any model (docs/design/multi-gpu.md): the main card runs every
+// include/basalt/model/peer_hooks.hpp - gpu-mode peer for any model (docs/architecture/multi-gpu.md): the main card runs every
 // layer and the other cards help. Whatever runs a model's peers derives PeerHooks and writes the hooks below: each peer
 // card's own buffers and the room they leave, what it divides (experts by layer block or one by one, hottest first; a
 // long prompt's layers), its part on each card once dealt, and the main card's part for the start line. The driver
@@ -91,7 +91,7 @@ public:
     void peer_drop_stages() { placed_.stage_first.clear(); }
 
 protected:
-    // ---- the hooks a model writes (docs/design/multi-gpu.md, "Peer")
+    // ---- the hooks a model writes (docs/architecture/multi-gpu.md, "Peer")
 
     /// Opens peer card `card`'s own buffers on CUDA device `device`, whatever it is dealt (its prompt share's staging).
     virtual bool peer_card(size_t card, int device, std::string& err) = 0;

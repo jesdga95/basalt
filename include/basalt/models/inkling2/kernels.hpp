@@ -71,7 +71,7 @@ struct SegCaches {
     float* a_ring = nullptr;
     float* m_ring = nullptr;
 };
-/// A decode window of several conversations (docs/design/batching.md): segment i's rows (at.row0[i]..) take c[i]'s caches,
+/// A decode window of several conversations (docs/architecture/batching.md): segment i's rows (at.row0[i]..) take c[i]'s caches,
 /// and a row's convolutions read only the rows of its own segment before it. at.n = 0 (the default): one conversation, the
 /// arguments' own caches. Every row gives the bits it gives in its conversation's own call.
 struct Segments {

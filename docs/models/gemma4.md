@@ -1,14 +1,14 @@
 # Gemma 4
 
 Google's Gemma 4 (Apache-2.0) instruction models: the 26B A4B (routed experts), the 31B and the 12B (dense). One adapter
-runs all three; each runs with the same command as any model: `basalt serve PACK`. What it supports next to the others:
+runs every size; each runs with the same command as any model: `basalt serve PACK`. What it supports next to the others:
 [models](index.md).
 
 ## Pack
 
 Built from Google's BF16 checkpoint and, for drafting, its assistant drafter by
 `tools/convert/convert.py --checkpoint DIR [--drafter DIR] [--experts-mxfp8 LAYERS] [--mlp-nvfp4]`
-([model file](../model-file.md#gemma-4-pack)):
+([model file](../model-file/gemma4.md)):
 
 | Model | Checkpoint, drafter | Layers (window, full) | Width, MLP | Pack |
 | --- | --- | --- | --- | --- |

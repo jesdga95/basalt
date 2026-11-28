@@ -5,7 +5,7 @@ Settings: [configuration](configuration/index.md). Diagnostic flags: `bin/basalt
 ## Start-up
 
 The page is up at once and the model loads behind it. The header reads `Loading` with the percent over a progress bar while weights load; choosing a model in the picker loads it, and the Unload button beside the model name unloads the loaded one until the next request; each reads `Loading…` or `Unloading…` until the server shows the change, and a refused one shows its error in the header. `/health` and `/metrics`
-show the load: `load.percent` and `load.gib`, the GiB placed so far in one figure over every byte the model loads (a card, a second card, RAM), where it was one figure per target. A failed start-up load ends the server. Requests wait during a load and get a 503 if it fails.
+show the load: `load.percent` and `load.gib`, the GiB placed so far in one figure over every byte the model loads (a card, a second card, RAM). A failed start-up load ends the server. Requests wait during a load and get a 503 if it fails.
 
 ## Concurrent requests: `--parallel N`
 
@@ -176,14 +176,14 @@ identical embeddings. All of them read the projector in place from the model fil
 differ between modes: the sidecar's VRAM cost shrinks the expert cache, and which experts run on the GPU or the CPU shifts the
 last bits of the logits, so a greedy answer can fork after some tokens (`dynamic` does the same with a different cache size).
 
-| Mode | Encoder runs | VRAM cost | Fresh-image TTFT (IQ3_S, 400 W): 1k / 3k / 4k image tokens |
+| Mode | Encoder runs | VRAM cost | Fresh-image latency |
 | --- | --- | --- | --- |
 | `off` | none | none | |
-| GPU number | sidecar `bin/basalt-vision` on that card | about 2.2 GiB of its expert cache | 0.77 s / 1.4 s / 1.8 s |
-| `dynamic` | inside the engine, on the main GPU | none at rest (0.85 GiB pinned RAM) | 0.77 s / 1.45 s / 1.8 s |
-| `cpu` | sidecar on the CPU | none | about 6 s / 40 s / 70 s |
+| GPU number | sidecar `bin/basalt-vision` on that card | a slice of its expert cache | GPU encode |
+| `dynamic` | inside the engine, on the main GPU | none at rest (some pinned RAM) | GPU encode |
+| `cpu` | sidecar on the CPU | none | much slower |
 
-`dynamic` borrows the cache's last slots per image and refills them afterwards (about 70 ms), so the cache is identical after.
+`dynamic` borrows the cache's last slots per image and refills them afterwards, so the cache is identical after.
 Hy4-flash reads images with `dynamic` only: its main-card expert slots go back for the request's pictures and fill again as after a
 prompt. Gemma 4
 reads images with `dynamic` only, from the room it keeps free beside its caches. Which
@@ -210,10 +210,6 @@ Decoding uses FFmpeg 6, 7, 8 or 9 from the machine ([platforms](platforms.md#ffm
 
 Qwen3.8-Flash-Next's frames decode on the encoder's GPU with NVDEC (H.264, HEVC, AV1, VP9 and the older codecs FFmpeg's NVDEC takes); a stream NVDEC
 refuses decodes on the CPU, with the same pixels. Qwen3.8-27B's frames always decode on the CPU. With `dynamic` the expert cache lends NVDEC the memory for the decode when no
-reply is running (tens of ms to lend and refill); beside a running reply the video decodes on the CPU, and the reply keeps going
+reply is running; beside a running reply the video decodes on the CPU, and the reply keeps going
 until the frames are encoded. Another question about the same video, in the same chat or a new one, starts from the video
 already read.
-
-NVFP4 pack, `dynamic`, 400 W + 180 W, cold, time to the first token: a 30 s 1280x720 clip (8,202 prompt tokens) 2.7 s; a minute of
-3840x2160 HEVC 5.2 s (decode 2.6 s, encode 0.3 s, prompt read 1.9 s); of 1920x1080 H.264 4.3 s. A new question on the same 30 s
-clip: 0.4 s.

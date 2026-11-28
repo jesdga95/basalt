@@ -76,8 +76,8 @@ inline uint64_t pin_mapping_bytes(uint64_t pinned) { return pinned / 512; }
 
 /// Host memory an engine takes after its RAM tier has read the free RAM: the CUDA runtime's own host memory for the graphs it
 /// captures, the first request's buffers, the second card's context.  The tier's plan leaves it free beside the reserve; the
-/// serving RAM guard still holds the reserve alone, so the settled free RAM is above the guard and not on it.  0.2.1 left
-/// 2 GiB for it (kLateHostBytes); 0.3.1 removed that and a 64 GB box started at or below its guard (#339).
+/// serving RAM guard still holds the reserve alone, so the settled free RAM is above the guard and not on it.  Without it a
+/// box with little RAM would start at or below its guard.
 inline constexpr uint64_t kPostPlanHostBytes = 2ull << 30;
 
 /// The reserve a RAM tier is sized against: the free RAM the user asked for (`reserve`, the guard's line) and the

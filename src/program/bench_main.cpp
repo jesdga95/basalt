@@ -1396,7 +1396,7 @@ int main(int argc, char** argv) {
                smi && std::atof(smi->c_str()) > 0) {
         power = fmt("%.0f W", std::atof(smi->c_str()));
     }
-    // an integrated GPU has no power limit NVML reads (a GB10's is the system's): no warning, the table says unknown
+    // an integrated GPU has no power limit NVML reads (the system's is not the GPU's): no warning, the table says unknown
     const bool primary_integrated = have_primary && primary.vram_gib <= 0;
     if (power == "unknown" && !primary_integrated)
         basalt::log::warn("basalt-bench", "the power limit could not be read; pass --power-label W");
@@ -1509,7 +1509,7 @@ int main(int argc, char** argv) {
                 gpu_err = "NVML could not read the GPU at " + id;
                 break;
             }
-            // NVML gives an integrated GPU (a GB10) no memory size and no power limit: its memory is the machine's, and
+            // NVML gives an integrated GPU no memory size and no power limit: its memory is the machine's, and
             // its power is the submitter's to state, since the SoC's limit is not the GPU's
             const bool integrated = g.vram_gib <= 0;
             if (integrated) {

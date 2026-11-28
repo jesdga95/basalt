@@ -206,7 +206,7 @@ void test_resident_lend_region() {
     require(budget_lend_room(10, 10) == 10, "a budget of exactly the complement must keep the lend region");
     require(budget_lend_room(68, 39) == 68, "a budget above the complement must give the lend region its rest");
     require(budget_lend_room(17, 10) - 10 == 7, "the lend region's room is what the budget has after the complement");
-    // the caller asks with the complement plus the adaptive swaps' free places (#342, #366): a budget that holds the
+    // the caller asks with the complement plus the adaptive swaps' free places: a budget that holds the
     // experts but not the places keeps no lend region, so the places stay; one that holds both keeps it
     constexpr uint64_t experts = 3779, places = 75;   // 37.79 GiB and 749 MiB, in 10 MiB
     require(budget_lend_room(3700, experts + places) == 0, "a budget short of the experts kept the lend region");
@@ -216,7 +216,7 @@ void test_resident_lend_region() {
     require(budget_lend_room(3900, experts + places) == 3900, "a budget above both must give the lend region its rest");
 }
 
-// A 62 GiB machine with swap, one card, a third of the experts left in the file (issue #285): the tier leaves the OS
+// A 62 GiB machine with swap, one card, a third of the experts left in the file: the tier leaves the OS
 // file cache its floor beside the reserve, so the experts read from the file and the rest of the system keep their RAM.
 void test_file_cache_keep() {
     using basalt::core::FileCache;
@@ -251,7 +251,7 @@ void test_plan_reserve() {
     require(plan_reserve(2 * kGiB) == 2 * kGiB + kPostPlanHostBytes, "the plan leaves the reserve and the late allowance");
     require(plan_reserve(0) == 0, "a guard that is off leaves nothing");
     // a tier sized against plan_reserve() still has the guard's line free after the engine takes its late memory, where one
-    // sized against the reserve alone ends on it (#339)
+    // sized against the reserve alone ends on it
     const uint64_t avail = 55 * kGiB, reserve = 2 * kGiB;
     const uint64_t on_line = avail - ram_tier_room(avail, reserve, false);
     const uint64_t with_allowance = avail - ram_tier_room(avail, plan_reserve(reserve), false);
