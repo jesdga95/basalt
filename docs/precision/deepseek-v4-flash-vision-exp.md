@@ -61,6 +61,11 @@ A targeted `t=1` replay compared all 255 rows in each of 14 selected chunks (5, 
 remaining high-KLD positions. This rules out window size and run-to-run variation as causes of those tails;
 they are reproducible Basalt/reference divergences and form the corrected parity baseline.
 
+A later 100-chunk gate on the tree that carries the admission policy and 6-slot prompt staging, at
+`--resident-budget-gib 145 --expert-cache 1000`, scored PPL `3.9965 +/- 0.0599`, mean KLD `0.15568`, p99 `1.9971`, max
+`7.7249` and top-1 `87.92%`, with 57.4% VRAM / 11.7% PCIe / 31.0% CPU lookups; the model page carries it beside the
+default cache size's measurements.
+
 The run loaded the full 137.1 GiB RAM expert tier (256/256 experts per layer), with zero experts in
 the file tier; the GPU held 34/256 experts per layer in an 18.20 GiB cache. The final 8-chunk continuation
 reported 63.6% VRAM lookups, 14.1% bus copies, 22.3% CPU lookups, and 0.0% file reads. Prompt reads

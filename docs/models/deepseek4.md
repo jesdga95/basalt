@@ -29,18 +29,22 @@ and 6-slot cross-layer expert staging. Decode uses per-layer CUDA graphs, multi-
 staging, and the 3-stage DSpark drafter. The expert tier admits an expert to the card on two CPU uses with a two-lookup
 margin over its victim, halves the counts that pick victims every 256 tokens, budgets 128 copy claims per window row, and
 lends its prompt arena in 256 MiB segments, so promoted experts stop thrashing a 256-slot layer. Measured on a single
-RTX 5090 (32 GiB VRAM, 475 W power limit) + 247 GiB DDR5 RAM (`--resident-budget-gib 145`, 29/256 MXFP4 experts/layer in
-VRAM, drafting at its default):
+RTX 5090 (32 GiB VRAM, 475 W power limit) + 247 GiB DDR5 RAM (`--resident-budget-gib 145`, drafting at its default, no
+`--expert-cache` so the tier fills the card with 27 of 256 MXFP4 experts a layer), two arms a row:
 
 | Benchmark | Rate (tok/s) | Notes |
 | --- | ---: | --- |
-| `pp16384` | 2,330 | Engine (`2,309` wall) |
-| `tg conv / struct / prose` (lossless) | 34-36 / 38-43 / 35-36 | 58-59% VRAM, 12-13% PCIe, 29% CPU |
-| `tg conv / struct / prose` (`--route-prior 0.5 --route-tail-skip 4`) | 34 / 43 / 35 | Opt-in lossy routing |
+| `pp16384` | 2,290-2,300 | Engine (`2,271` / `2,281` wall) |
+| `tg conv / struct / prose` (lossless) | 36-38 / 42-44 / 38 | 70% VRAM, 11% PCIe, 19% CPU |
+| `tg conv / struct / prose` (`--expert-cache 1000`) | 35-36 / 41-42 / 36 | 23/256 a layer, 2.9 GiB of VRAM left idle: 67% VRAM, 12% PCIe, 21% CPU |
+| `tg conv / struct / prose` (`--route-prior 0.5 --route-tail-skip 4`) | 34 / 43 / 35 | Opt-in lossy routing, at the older 29/256 cache |
 
-100-chunk `--kv fp8` Wikitext-2 KLD gate against `dsv4visionexp-source-base.kld`: PPL `3.9836 +/- 0.0596` (base
-`4.3379`), mean KLD `0.15429`, top-1 `87.92%`. Vision (`ds4_vision_tower_test`, `ds4_vision_reserve_test`) and
-DSpark attach (`tools/convert/test_dspark_deepseek4_attach.py`) pass.
+The 100-chunk `--kv fp8` Wikitext-2 KLD gate against `dsv4visionexp-source-base.kld` ran on this tree at
+`--resident-budget-gib 145 --expert-cache 1000` (the table's pinned row): 25,500 rows, PPL `3.9965 +/- 0.0599` (base `4.3379`,
+`ln(PPL/base) -0.08199`), mean KLD `0.15568`, median `0.03208`, p99 `1.9971`, max `7.7249`, top-1 `87.92%`, with 57.4%
+VRAM / 11.7% PCIe / 31.0% CPU lookups. The earlier gate (`3.9836` / `0.15429`) held 34 experts a layer; the 0.3% PPL and
+0.9% KLD difference is what this gate gives across placements, and top-1 is the same. Vision (`ds4_vision_tower_test`,
+`ds4_vision_reserve_test`) and DSpark attach (`tools/convert/test_dspark_deepseek4_attach.py`) pass.
 
 Conversation checkpoints now snapshot the sliding-window rings and rolling attention/indexer compressor state; compressed
 attention and CSA index rows use the shared positional-cell save/restore path. A two-chunk Wikitext gate exercised save,
@@ -71,6 +75,17 @@ The kernels alone are 7.61 ms/token and the copies 14.86, and with the idle gaps
 of what the engine measured. Nearly three quarters of it is expert traffic and the waits it forces, so a pass waits on
 the placement the tier chose, not on the token path that joins it. The profiled run's own 38.0 tok/s is not a throughput
 figure: different fixture, and a trace is not the benchmark.
+
+Those copies already run at the link's own rate: `basalt-bench --hardware` measures this machine's pinned host-to-device
+copy at 33.0 GB/s and the pass moves its blobs at 33.6 GB/s, so no scheduling change makes the same bytes arrive sooner.
+Only fewer miss bytes shorten the pass, and the card's shares are the lever: a pinned 1,000-expert cache is 23 of 256
+experts a layer and leaves 2.9 GiB of VRAM free, while the tier's own sizing (no `--expert-cache`) fills it to 27. That
+is the whole of it: 23 to 27 slots a layer measured conv `37.6` and `35.6` against `35.7` and `35.4` tok/s, struct `43.7`
+and `41.9` against `41.7` and `40.7`, prose `38.2` and `38.1` against `35.9` and `35.8`, and pp16384 `2,290` and `2,300`
+against `2,319` and `2,312`: +6% prose and +4% struct, inside the conv spread, 1% off on the prompt, which uses the room
+the extra copies take. The default was already the fast path; the pinned size was the slower one. Fifty tokens a second
+would need a 20 ms pass, and its 499 MB of miss traffic alone is 15 ms at this link, so that target needs fewer routed
+experts a token (the opt-in lossy flags) or a faster link, not another placement.
 
 ## KV caches and `--kv`
 
@@ -162,14 +177,19 @@ staged only while encoding; `--vision dynamic` must return encoder memory to the
 
 ## Open items
 
-- **Per-layer slot weights (`core::ExpertTierSpec::layer_weights`) are unset for this model.** A table needs a per-layer
-  count of what each layer's misses cost, and this tree cannot produce one: `ExpertTier::report()` prints the aggregate
-  hit/copy/CPU split only, the console's expert map (serve path, `expert_map`) is a 640-pair routing sample rather than
-  per-layer misses, `--expert-profile-save` writes through Flash-Next's adaptive tier alone, and `--diag-dump` is wired
-  for DeepSeek-V4.1-Flash, Hy4-flash and Inkling 2 but not here. Any of three would produce the trace - route IDs from a
-  `--diag-dump` for this model, a per-layer line beside the TIER report, or a full rather than sampled per-layer tally.
-  The weights then follow Hy4-flash's method: a 768-token decode trace per fixture, each layer's misses priced at what
-  its CPU share took, the copies given four at a time where they save most, half the move kept. No value is guessed.
+- **Per-layer slot weights (`core::ExpertTierSpec::layer_weights`) were derived from the measured profile and rejected on
+  measurement.** `data/profiles/deepseek4-43x256.prof` ranks all 11,008 (layer, expert) pairs by measured routing
+  frequency, so its first 1,204 pairs are the most-routed experts the card can hold at 28 slots a layer; those pairs give
+  layers 19 (layer 0) to 36 (layer 42) slots instead of 28 each. At `--expert-cache 1000` that is 16-30 slots: the ABBA
+  measured conv `34.3` and `34.3` against `35.7` and `35.4` tok/s, struct `39.6` and `41.8` against `41.7` and `40.7`,
+  prose `36.6` and `35.6` against `35.9` and `35.8`, and pp16384 `2,305` and `2,306` against `2,319` and `2,312`. Both conv
+  arms sit below both uniform arms, and struct's PCIe share rose from 16.4% to 19.5%. A corpus-wide routing ranking is not
+  a decode miss trace: the admission policy finds its own equilibrium on the traffic a request actually sends, and a layer
+  short of slots pays it back in copies. The table was removed rather than retuned.
+- **What is left for decode speed.** The pass's expert copies are at the measured link rate (33.6 against 33.0 GB/s), so
+  the remaining lever is residency, and the tier already takes it: four more slots a layer (23 to 27) buys 3-6% (the
+  table), and past that the card is full at 27-28 of 256 experts a layer. Two more levers are measured and closed:
+  per-layer slot weights (above) and the bus/CPU split of the misses (`bus_share` at 75% measured neutral).
 
 ## Milestones and gates
 
