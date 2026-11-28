@@ -162,7 +162,7 @@ public:
                     dev(indexer_select_count_, rows) && dev(comp_limit_csa_, rows) && dev(comp_limit_hca_, rows) &&
                     dev(hca_iota_, (size_t) max_hca_cap * rows) && dev(indexer_rope_angles_, 32 * rows) &&
                     dev(compress_rope_freq_, 32) &&
-                  dev(sampled_, 1) && dev(expert_input_q8_, kernels::native_q8_1_bytes(geo_.n_embd, kExpertWindow)) &&
+                  dev(sampled_, kExpertWindow) && dev(expert_input_q8_, kernels::native_q8_1_bytes(geo_.n_embd, kExpertWindow)) &&
                   dev(expert_scratch_, kernels::native_expert_scratch_bytes(kExpertWindowRoutes, geo_.n_ff_exp)) &&
                   dev(d_gpu_expert_rows_, (size_t) kExpertWindowRoutes * n) &&
                    dev(expert_plan_, sizeof(ExpertPlan)) && dev(expert_plan2_, sizeof(ExpertPlan)) && dev(logit_bias_, (size_t) geo_.n_vocab) &&
@@ -386,13 +386,11 @@ public:
             return {model::Status::Error, "deepseek4: cannot retain decode logits rows"};
         tokens_.insert(tokens_.end(), r.tokens, r.tokens + r.n_tokens);
         if (r.row_tokens) {
-            for (int t = 0; t < r.n_tokens; ++t) {
+            for (int t = 0; t < r.n_tokens; ++t)
                 kernels::sample_tokens(final_logits_ + (size_t) t * geo_.n_vocab, 1, geo_.n_vocab,
-                                       history_row(t), history_len_, draw_params(t), sampled_, stream_);
-                int32_t picked = -1;
-                if (!copy_to_host(&picked, sampled_, sizeof(picked))) return {model::Status::Error, err_};
-                r.row_tokens[t] = picked;
-            }
+                                       history_row(t), history_len_, draw_params(t), sampled_ + t, stream_);
+            if (!copy_to_host(r.row_tokens, sampled_, (size_t) r.n_tokens * sizeof(int32_t)))
+                return {model::Status::Error, err_};
         }
         const float* last_logits = final_logits_ + (size_t) (r.n_tokens - 1) * geo_.n_vocab;
         if (r.logits && !copy_to_host(r.logits, last_logits, (size_t) geo_.n_vocab * sizeof(float)))
@@ -1043,7 +1041,7 @@ private:
     std::vector<ResolvedLayer> layers_;
     HeadWeights head_weights_{};
     cudaStream_t stream_ = nullptr, row_st_ = nullptr, br_[2]{};
-    cudaEvent_t row_ev_[2]{}, br_ev_[6]{};
+    cudaEvent_t row_ev_[2]{}, br_ev_[7]{};
     std::vector<cudaGraphExec_t> head_g_, tail_g_;
     int hca_iota_chunks_ = -1;
     int32_t row0_token_ = -1;
@@ -1316,6 +1314,7 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
                             static_cast<const float*>(rl.index_norm->ptr), geo_.rms_eps, compress_rope_freq_,
                             cache.indexer_state_kv, cache.indexer_state_score,
                             cache.indexer->data(), comp_row_, format_, br_[1]);
+                        if (cudaEventRecord(br_ev_[6], br_[1]) != cudaSuccess) return fail_cuda("indexer compress done");
                     }
                     const CompressKind kind = ratio == 4 ? CompressKind::Csa : CompressKind::Hca;
                     project_and_compress(kind, ratio, geo_.n_embd, n_tokens, attn_normed_,
@@ -1331,24 +1330,25 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
                 kernels::sparse_mqa_q_latent(attn_q8_, attention.attention.q, n_tokens, q_latent_, q_latent_q8_, stream_);
 
                 if (ratio == 4 && visible > 0) {
-                    // Run indexer Q + selection on br_[1] concurrently with q_heads on stream_
+                    // Run indexer Q + selection on br_[0] concurrently with attn_compress on br_[1] and q_heads on stream_
                     if (cudaEventRecord(br_ev_[4], stream_) != cudaSuccess ||
-                        cudaStreamWaitEvent(br_[1], br_ev_[4], 0) != cudaSuccess)
+                        cudaStreamWaitEvent(br_[0], br_ev_[4], 0) != cudaSuccess ||
+                        cudaStreamWaitEvent(br_[0], br_ev_[6], 0) != cudaSuccess)
                         return fail_cuda("indexer wait ql");
                     indexer_project_q8_0_pos(rl.index_q->ptr, static_cast<const uint16_t*>(rl.index_proj->ptr), q_latent_,
                         attn_normed_, positions_, compress_rope_freq_, n_tokens, indexer_q_, indexer_head_weights_,
-                        indexer_project_workspace_, indexer_project_workspace_bytes(n_tokens), br_[1]);
+                        indexer_project_workspace_, indexer_project_workspace_bytes(n_tokens), br_[0]);
                     LayerCache& cache = layer_cache_[(size_t) layer];
                     if (use_graphs) {
                         indexer_select_window(indexer_q_, indexer_head_weights_, cache.indexer->data(),
                             max_index_rows, positions_, n_tokens, selected_ids_, indexer_select_count_,
-                            indexer_select_workspace_, indexer_select_window_workspace_bytes(max_index_rows), format_, br_[1]);
+                            indexer_select_workspace_, indexer_select_window_workspace_bytes(max_index_rows), format_, br_[0]);
                     } else {
                         indexer_select(indexer_q_, indexer_head_weights_, cache.indexer->data(),
                             visible, (int) pos, n_tokens, selected_ids_, indexer_select_count_,
-                            indexer_select_workspace_, indexer_select_workspace_bytes(visible), format_, br_[1]);
+                            indexer_select_workspace_, indexer_select_workspace_bytes(visible), format_, br_[0]);
                     }
-                    if (cudaEventRecord(br_ev_[5], br_[1]) != cudaSuccess) return fail_cuda("indexer done");
+                    if (cudaEventRecord(br_ev_[5], br_[0]) != cudaSuccess) return fail_cuda("indexer done");
                     selection.n_sel = kernels::kSparseMqaTopK;
                     selection.sel = selected_ids_;
                     selection.comp = cache.attention->data();
