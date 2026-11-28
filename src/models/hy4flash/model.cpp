@@ -112,7 +112,7 @@ core::ExpertTierSpec Hy4Model::tier_spec() const {
     s.claims_per_row = kClaimsPerRow;
     s.victim_half_life = kVictimHalfLife;
     if (s.n_layers == 41 && s.n_expert == 512) s.layer_weights.assign(std::begin(kLayerSlotWeights), std::end(kLayerSlotWeights));
-    s.share_max_tokens = 16384;
+    s.share_max_tokens = kMaxChunk;   // a peer share takes a whole prompt chunk
     s.share_stride = expert_stride();
     s.lend_segment = kExpertLendSegment;
     s.host.bytes = [this] { return engram_ ? engram_->ram_bytes() : 0; };

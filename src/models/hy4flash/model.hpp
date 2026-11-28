@@ -29,6 +29,7 @@ constexpr int kMaxSecondCards = 3;
 constexpr int kMaxWindow = 8;   // rows of a decode window, and of one expert group
 constexpr int64_t kDefaultContext = 8192;
 constexpr uint64_t kExpertLendSegment = 256ull << 20;
+constexpr int kMaxChunk = 32768;   ///< rows a prompt chunk may carry (the residual streams and the experts' pairs)
 
 class Hy4Model final : public model::LoadedModel {
 public:
