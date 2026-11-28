@@ -91,6 +91,7 @@ public:
         if (h_expert_ids_) cudaFreeHost(h_expert_ids_);
         if (h_expert_seq_) cudaFreeHost(h_expert_seq_);
         if (h_route_meta_) cudaFreeHost(h_route_meta_);
+        if (h_join_) cudaFreeHost(h_join_);
         if (feat_ev_) cudaEventDestroy(feat_ev_);
         if (h_initial_) cudaFreeHost(h_initial_);
     }
@@ -202,17 +203,6 @@ public:
                             cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
             err = "cannot upload DeepSeek4 compression RoPE frequencies";
             return false;
-        }
-        if (max_hca_rows > 0) {
-            std::vector<int32_t> h_iota((size_t) max_hca_rows * rows);
-            for (size_t t = 0; t < rows; ++t)
-                for (int i = 0; i < max_hca_rows; ++i)
-                    h_iota[t * (size_t) max_hca_rows + (size_t) i] = i;
-            if (cudaMemcpyAsync(hca_iota_, h_iota.data(), h_iota.size() * sizeof(int32_t),
-                                cudaMemcpyHostToDevice, stream_) != cudaSuccess) {
-                err = "cannot upload DeepSeek4 HCA iota table";
-                return false;
-            }
         }
         layer_cache_.resize((size_t) geo_.n_layers);
         for (int layer = 0; layer < geo_.n_layers; ++layer) {
@@ -960,6 +950,7 @@ private:
     float *compress_rope_freq_ = nullptr, *indexer_rope_angles_ = nullptr;
     void *indexer_project_workspace_ = nullptr, *indexer_select_workspace_ = nullptr;
     int32_t *comp_row_ = nullptr, *selected_ids_ = nullptr, *indexer_select_count_ = nullptr, *comp_limit_csa_ = nullptr, *comp_limit_hca_ = nullptr, *hca_iota_ = nullptr;
+    int hca_iota_stride_ = 0;
     void *shared_in_q8_ = nullptr, *shared_hidden_q8_ = nullptr;
     float *shared_gate_ = nullptr, *shared_up_ = nullptr, *shared_hidden_ = nullptr;
     float *router_logits_ = nullptr, *route_weights_ = nullptr;
@@ -1152,6 +1143,15 @@ bool Session::forward_rows(const int32_t* tokens, int n_tokens, int64_t pos, con
                     selection.comp = cache.attention->data();
                     selection.comp_type = format_ == CacheFormat::Fp8 ? kernels::MqaRowType::Fp4 : kernels::MqaRowType::F16;
                     if (visible > 0) {
+                        if (visible != hca_iota_stride_) {
+                            std::vector<int32_t> h_iota((size_t) kExpertWindow * visible);
+                            for (int t = 0; t < kExpertWindow; ++t)
+                                for (int i = 0; i < visible; ++i) h_iota[(size_t) t * visible + i] = i;
+                            if (cudaMemcpyAsync(hca_iota_, h_iota.data(), h_iota.size() * sizeof(int32_t),
+                                                cudaMemcpyHostToDevice, stream_) != cudaSuccess)
+                                return fail_cuda("HCA iota upload");
+                            hca_iota_stride_ = visible;
+                        }
                         selection.sel = hca_iota_;
                         selection.comp_limit = comp_limit_hca_;
                     }

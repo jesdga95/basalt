@@ -98,7 +98,7 @@ public:
                   device(shared_gate_, (size_t) cap_ * g_.n_ff_exp * sizeof(float)) &&
                   device(shared_up_, (size_t) cap_ * g_.n_ff_exp * sizeof(float)) &&
                   device(shared_hidden_, (size_t) cap_ * g_.n_ff_exp * sizeof(float)) &&
-                  device(shared_bounds_, 2 * sizeof(int32_t)) && device(identity_, (size_t) cap_ * sizeof(int32_t)) &&
+                  device(shared_bounds_, 2 * sizeof(int32_t)) && device(identity_, route_cap_ * sizeof(int32_t)) &&
                   cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking) == cudaSuccess;
         cudaError_t pinned = cudaSuccess;
         for (int i = 0; i < 2 && ok; ++i) {
@@ -123,7 +123,7 @@ public:
         rows_host_.resize(route_cap_);
         token_host_.resize(route_cap_);
         bounds_host_.resize((size_t) g_.n_expert + 1);
-        mmq::iota(identity_, cap_, nullptr);
+        mmq::iota(identity_, (int64_t) route_cap_, nullptr);
         const int32_t b[2] = {0, 0};
         if (cudaMemcpy(shared_bounds_, b, sizeof(b), cudaMemcpyHostToDevice) != cudaSuccess) {
             err = "deepseek4: cannot initialize prompt MMQ bounds";
@@ -204,11 +204,9 @@ public:
         const ExpertLayer& el = weights_.pack().experts[(size_t) layer];
         const auto L = kernels::native_expert_layout(el.gate_up_type, el.down_type, g_.n_embd, g_.n_ff_exp,
                                                       g_.swiglu_limit);
-        mmq::quantize(x, token_ids_, xq_, el.gate_up_type, g_.n_embd, g_.n_embd, total, stream);
         const size_t gate_bytes = L.gu_row * (size_t) g_.n_ff_exp;
         const size_t up_bytes = L.up_row * (size_t) g_.n_ff_exp;
         const size_t down_bytes = L.d_row * (size_t) g_.n_embd;
-        const size_t hq_row_bytes = mmq::q8_bytes(1, g_.n_ff_exp);
 
         for (size_t first = 0, gidx = 0; first < used.size(); first += (size_t) kGroup, ++gidx) {
             Stage& B = stage_[gidx & 1];
@@ -271,33 +269,32 @@ public:
                 return false;
             }
             const int row0 = bounds_host_[(size_t) used[first]];
+            mmq::quantize(x, token_ids_ + row0, xq_, el.gate_up_type, g_.n_embd, g_.n_embd, group_rows, stream);
             mmq::Product gu;
             gu.type = el.gate_up_type;
             gu.w_rows = 2 * (int64_t) g_.n_ff_exp;
             gu.w_cols = g_.n_embd;
             gu.expert_bytes = gu_stride_;
             gu.xq = xq_;
-            gu.ids = output_ids_ + row0;
+            gu.ids = identity_;
             gu.total_rows = group_rows;
             gu.max_rows = group_max;
-            gu.dst = gu_ + (size_t) row0 * 2 * (size_t) g_.n_ff_exp;
+            gu.dst = gu_;
             gu.ld_dst = gu.w_rows;
             gu.w = B.gu;
             gu.n = n;
             gu.bounds = B.bounds;
             mmq_.run(gu, stream);
 
-            swiglu_split_clamped(gu.dst, group_rows, g_.n_ff_exp, g_.swiglu_limit,
-                                 h_ + (size_t) row0 * (size_t) g_.n_ff_exp, stream);
-            mmq::quantize(h_ + (size_t) row0 * (size_t) g_.n_ff_exp, output_ids_ + row0,
-                          hq_ + (size_t) row0 * hq_row_bytes, el.down_type, g_.n_ff_exp, g_.n_ff_exp, group_rows, stream);
+            swiglu_split_clamped(gu_, group_rows, g_.n_ff_exp, g_.swiglu_limit, h_, stream);
+            mmq::quantize(h_, nullptr, hq_, el.down_type, g_.n_ff_exp, g_.n_ff_exp, group_rows, stream);
 
             mmq::Product down;
             down.type = el.down_type;
             down.w_rows = g_.n_embd;
             down.w_cols = g_.n_ff_exp;
             down.expert_bytes = down_stride_;
-            down.xq = hq_ + (size_t) row0 * hq_row_bytes;
+            down.xq = hq_;
             down.ids = output_ids_ + row0;
             down.total_rows = group_rows;
             down.max_rows = group_max;
@@ -462,7 +459,7 @@ size_t prefill_ffn_bytes(const ModelWeights& weights, int row_cap) {
            route_cap * (size_t) g.n_embd * sizeof(float) + route_cap * sizeof(int32_t) * 2 +
            ((size_t) g.n_expert + 1) * sizeof(int32_t) +
            mmq::q8_bytes((int64_t) cap, g.n_embd) + mmq::q8_bytes((int64_t) cap, g.n_ff_exp) +
-           cap * (size_t) g.n_ff_exp * sizeof(float) * 3 + 2 * sizeof(int32_t) + cap * sizeof(int32_t);
+           cap * (size_t) g.n_ff_exp * sizeof(float) * 3 + 2 * sizeof(int32_t) + route_cap * sizeof(int32_t);
 }
 
 uint64_t prompt_room_bytes(const ModelWeights& weights, int64_t context, int cap) {

@@ -1,6 +1,8 @@
 // CPU reference of the cache-row roundings and layouts for the parity test (the model's act_quant / fp4_act_quant).
 #pragma once
 
+#include "basalt/log.hpp"
+
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -18,7 +20,7 @@ namespace ds4ref {
 
 inline void check(cudaError_t e, const char* what) {
     if (e == cudaSuccess) return;
-    std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+    basalt::log::error("deepseek4 cache_rows", "%s: %s", what, cudaGetErrorString(e));
     std::exit(1);
 }
 

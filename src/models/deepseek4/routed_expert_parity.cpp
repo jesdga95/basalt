@@ -188,6 +188,40 @@ int main(int argc, char** argv) {
         });
         bench_line("deepseek4 routed experts T=8", us, E * expert_bytes);
     }
+    {
+        constexpr int T = 2, H = 64, K = 6;
+        std::vector<float> h_rows(T * K * H), h_w(T * K), h_shared(T * H), h_out(T * H);
+        for (size_t i = 0; i < h_rows.size(); ++i) h_rows[i] = std::sin((float) i * 0.13f);
+        for (size_t i = 0; i < h_w.size(); ++i) h_w[i] = 0.1f + 0.05f * (float) i;
+        for (size_t i = 0; i < h_shared.size(); ++i) h_shared[i] = std::cos((float) i * 0.07f);
+        float *d_rows = nullptr, *d_w = nullptr, *d_shared = nullptr, *d_out = nullptr;
+        if (cudaMalloc(&d_rows, h_rows.size() * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&d_w, h_w.size() * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&d_shared, h_shared.size() * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&d_out, h_out.size() * sizeof(float)) != cudaSuccess) return 1;
+        cudaMemcpy(d_rows, h_rows.data(), h_rows.size() * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_w, h_w.data(), h_w.size() * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_shared, h_shared.data(), h_shared.size() * sizeof(float), cudaMemcpyHostToDevice);
+        basalt::models::deepseek4::WindowRowPtrs ptrs;
+        for (int r = 0; r < T * K; ++r) ptrs.p[r] = d_rows + (size_t) r * H;
+        basalt::models::deepseek4::weighted_route_sum_ptrs(ptrs, d_w, d_shared, T, H, d_out, stream);
+        cudaStreamSynchronize(stream);
+        cudaMemcpy(h_out.data(), d_out, h_out.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        double max_err = 0.0;
+        for (int t = 0; t < T; ++t) {
+            for (int c = 0; c < H; ++c) {
+                double ref = h_shared[(size_t) t * H + c];
+                for (int k = 0; k < K; ++k) ref += (double) h_w[(size_t) t * K + k] * h_rows[((size_t) t * K + k) * H + c];
+                max_err = std::max(max_err, std::abs((double) h_out[(size_t) t * H + c] - ref));
+            }
+        }
+        cudaFree(d_rows); cudaFree(d_w); cudaFree(d_shared); cudaFree(d_out);
+        if (max_err > 1e-5) {
+            std::printf("weighted_route_sum_ptrs max_err=%.3e\n", max_err);
+            cudaStreamDestroy(stream);
+            return 1;
+        }
+    }
     cudaStreamDestroy(stream);
     return error.rms_rel <= 0.03 && independent ? 0 : 1;
 }
