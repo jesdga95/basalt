@@ -2,6 +2,7 @@
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/core/progress.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/models/qwen4exp/geometry.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
@@ -119,6 +120,7 @@ bool Prefill::Run::Chunk::Experts::Group::cpu_start() {
             m.cpu_jobs.push_back(j);
         }
         cpu_fut = std::async(std::launch::async, [&m = m, &cf, &cpu_ms = cpu_ms, q2, T = T, &owner = owner]() -> bool {
+            const core::OnDevice od(m.device);
             const auto t0 = Clock::now();
             cudaEventSynchronize(m.cpu_ev_x);   // the activations are on the host
             for (int64_t t = 0; t < T; ++t) {

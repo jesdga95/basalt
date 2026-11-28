@@ -56,16 +56,17 @@ struct PeerStage {
     uint8_t* buf[kBufs] = {};
     cudaEvent_t d2h[kBufs] = {}, h2d[kBufs] = {};
     cudaStream_t stream = nullptr;
-    int dev = -1, n = 0;
+    int dev = -1, primary_dev = -1, n = 0;
     bool ok = false;
     size_t bytes = 0;
     bool setup(int peer_dev, size_t blob_bytes) {
         if (ok && dev == peer_dev && bytes >= blob_bytes) return true;
         release();
         dev = peer_dev;
+        if (cudaGetDevice(&primary_dev) != cudaSuccess) { cudaGetLastError(); release(); return false; }
         bytes = blob_bytes;
         for (int i = 0; i < kBufs; ++i)
-            if (cudaHostAlloc((void**) &buf[i], bytes, cudaHostAllocDefault) != cudaSuccess) { cudaGetLastError(); release(); return false; }
+            if (cudaHostAlloc((void**) &buf[i], bytes, cudaHostAllocPortable) != cudaSuccess) { cudaGetLastError(); release(); return false; }
         // h2d is recorded on the primary's copy stream, so it belongs to the current (primary) device; the rest to the peer
         for (int i = 0; i < kBufs; ++i)
             if (cudaEventCreateWithFlags(&h2d[i], cudaEventDisableTiming) != cudaSuccess) { release(); return false; }
@@ -91,15 +92,30 @@ struct PeerStage {
     }
     void release() {
         ok = false;
+        if (dev >= 0) {
+            const core::OnDevice od(dev);
+            if (stream) cudaStreamSynchronize(stream);
+            for (int i = 0; i < kBufs; ++i)
+                if (d2h[i]) { cudaEventDestroy(d2h[i]); d2h[i] = nullptr; }
+            if (stream) { cudaStreamDestroy(stream); stream = nullptr; }
+        }
+        if (primary_dev >= 0) {
+            const core::OnDevice op(primary_dev);
+            for (int i = 0; i < kBufs; ++i)
+                if (h2d[i]) {
+                    cudaEventSynchronize(h2d[i]);
+                    cudaEventDestroy(h2d[i]);
+                    h2d[i] = nullptr;
+                }
+        }
         for (int i = 0; i < kBufs; ++i) {
-            if (buf[i]) cudaFreeHost(buf[i]);
-            buf[i] = nullptr;
-            if (d2h[i]) cudaEventDestroy(d2h[i]);
-            if (h2d[i]) cudaEventDestroy(h2d[i]);
+            if (buf[i]) { cudaFreeHost(buf[i]); buf[i] = nullptr; }
             d2h[i] = h2d[i] = nullptr;
         }
-        if (stream) { const core::OnDevice od(dev); cudaStreamDestroy(stream); }
         stream = nullptr;
+        n = 0;
+        dev = -1;
+        primary_dev = -1;
     }
     ~PeerStage() { release(); }
 };
