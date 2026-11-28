@@ -18,6 +18,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 #include <algorithm>
 #include <cmath>
@@ -25,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -1313,7 +1315,9 @@ void test_hca_mma512() {
     DevBuf<float> dq(q_all.size()), dsink(NH);
     dq.upload(q_all); dsink.upload(sink);
 
-    for (bool fp8 : {false, true}) {
+    for (int prof : {0, 1, 2, 3}) {   // bit 0 = FP8 cache; bit 1 = wide amplitude: cache values up to +-16, BF16
+        const bool fp8 = (prof & 1) != 0;    // rope far beyond FP16's range (70000..120000), FP8 group scale 2^-18
+        const bool wide = (prof & 2) != 0;
         const size_t row_bytes = fp8 ? (size_t) layout::kHcaFp8RowBytes : (size_t) HD * 2;
         const int n_slots = 4 + cap;   // 4 compressed blocks + the window ring
         // The caches as raw bytes and their exact FP64 dequantizations: what the kernels read.
@@ -1329,14 +1333,14 @@ void test_hca_mma512() {
             if (!fp8) {
                 __half* h = reinterpret_cast<__half*>(r);
                 for (int c = 0; c < HD; ++c) {
-                    h[c] = __float2half_rn(rnd(-0.5f, 0.5f));
+                    h[c] = __float2half_rn(rnd(wide ? -16.0f : -0.5f, wide ? 16.0f : 0.5f));
                     deq[s][c] = __half2float(h[c]);
                 }
                 continue;
             }
             float scales[7];   // powers of two, exact in FP16; 64 values a group (448 nope = 7 groups)
             for (int g = 0; g < 7; ++g) {
-                scales[g] = (float) std::ldexp(1.0, -6 - ((s + g) % 6));
+                scales[g] = (float) std::ldexp(1.0, wide ? -18 : -6 - ((s + g) % 6));
                 std::memcpy(r + 448 + 4 * g, &scales[g], 4);
             }
             for (int c = 0; c < 448; ++c) {
@@ -1347,9 +1351,15 @@ void test_hca_mma512() {
                 deq[s][c] = e4m3_code_f64(b) * (double) scales[c >> 6];
             }
             for (int c = 0; c < 64; ++c) {
-                const uint16_t bf = __bfloat16_as_ushort(__float2bfloat16(rnd(-0.5f, 0.5f)));
+                // the wide profile pushes the BF16 rope past FP16's range, where the MMA path (and the reference)
+                // saturates it to +-65504 and the scalar path reads it at full width.  One pattern for every slot:
+                // the scores then differ between rows only through the tiny FP8 values, so the softmax weights (and
+                // with them the check) do not hinge on an FP32-vs-FP64 argmax flip while the saturation still runs
+                const float rv = wide ? (float) ((c & 1) ? -70000 : 70000) : rnd(-0.5f, 0.5f);
+                const uint16_t bf = __bfloat16_as_ushort(__float2bfloat16(rv));
                 std::memcpy(r + 476 + 2 * c, &bf, 2);
-                deq[s][448 + c] = __bfloat162float(__ushort_as_bfloat16(bf));
+                const double raw = __bfloat162float(__ushort_as_bfloat16(bf));
+                deq[s][448 + c] = std::max(-65504.0, std::min(65504.0, raw));
             }
         }
         // The current chunk's kv_rot rows, derived from their window ring slots (exactly representable in the cache's
@@ -1406,12 +1416,27 @@ void test_hca_mma512() {
 
         char name[112];
         std::vector<double> h1d(h1.begin(), h1.end());
-        std::snprintf(name, sizeof name, "hca_attention mma512 (32 tok, %d heads, %s) vs fp64", NH, fp8 ? "fp8" : "f16");
-        check_tol(name, rel_l2_err(hmm, ref), 2e-3);
-        std::snprintf(name, sizeof name, "hca_attention mma512 (32 tok, %d heads, %s) vs scalar/token", NH, fp8 ? "fp8" : "f16");
-        check_tol(name, rel_l2_err(hmm, h1d), 2e-3);
-        std::snprintf(name, sizeof name, "hca_attention gqa512 (%d heads, %s) vs fp64", NH, fp8 ? "fp8" : "f16");
-        check_tol(name, rel_l2_err(h1, ref), 2e-3);
+        const char* amp = wide ? ", wide" : "";
+        std::snprintf(name, sizeof name, "hca_attention mma512 (32 tok, %d heads, %s%s) vs fp64", NH, fp8 ? "fp8" : "f16",
+                      amp);
+        check_tol(name, rel_l2_err(hmm, ref), (wide && fp8) ? 5e-3 : 2e-3);
+        if (wide && fp8) {
+            // the reference saturates the huge rope values exactly as the MMA path does, but the scalar path reads
+            // them at full BF16 width, so its scores may pick a different maximum: what the two paths still owe each
+            // other (and the 2^-18 group scale travelling FP16 subnormals through the MMA) is finite output, no NaN
+            int non_finite = 0;
+            for (float v : hmm) non_finite += std::isfinite(v) ? 0 : 1;
+            for (float v : h1) non_finite += std::isfinite(v) ? 0 : 1;
+            std::snprintf(name, sizeof name, "hca_attention mma512 (32 tok, %d heads, fp8, wide) finite", NH);
+            check_tol(name, (double) non_finite, 0.0);
+        } else {
+            std::snprintf(name, sizeof name, "hca_attention mma512 (32 tok, %d heads, %s%s) vs scalar/token", NH,
+                          fp8 ? "fp8" : "f16", amp);
+            check_tol(name, rel_l2_err(hmm, h1d), 2e-3);
+            std::snprintf(name, sizeof name, "hca_attention gqa512 (%d heads, %s%s) vs fp64", NH, fp8 ? "fp8" : "f16",
+                          amp);
+            check_tol(name, rel_l2_err(h1, ref), 2e-3);
+        }
     }
     }
 }
@@ -1438,7 +1463,9 @@ void test_dsa_preabsorbed_mma512() {
     DevBuf<int32_t> dsel(sel_idx.size());
     dql.upload(q_lat); dqf.upload(q_full); dsink.upload(sink); dsel.upload(sel_idx);
 
-    for (bool fp8 : {false, true}) {
+    for (int prof : {0, 1, 2, 3}) {   // bit 0 = FP8 cache; bit 1 = wide amplitude: values up to +-16, BF16 rope far
+        const bool fp8 = (prof & 1) != 0;    // beyond FP16's range (70000..120000), FP8 group scale 2^-18
+        const bool wide = (prof & 2) != 0;
         const size_t row_bytes = fp8 ? (size_t) layout::kDsaFp8RowBytes : (size_t) (kLora + kRope) * 2;
         std::vector<uint8_t> cache((size_t) n_cells * row_bytes, 0);
         std::vector<std::vector<double>> deq(n_cells, std::vector<double>(kLora + kRope, 0.0));
@@ -1452,13 +1479,13 @@ void test_dsa_preabsorbed_mma512() {
             if (!fp8) {
                 __half* h = reinterpret_cast<__half*>(r);
                 for (int c = 0; c < kLora + kRope; ++c) {
-                    h[c] = __float2half_rn(rnd(-0.5f, 0.5f));
+                    h[c] = __float2half_rn(rnd(wide ? -16.0f : -0.5f, wide ? 16.0f : 0.5f));
                     deq[s][c] = __half2float(h[c]);
                 }
             } else {
                 float scales[4];
                 for (int g = 0; g < 4; ++g) {
-                    scales[g] = (float) std::ldexp(1.0, -6 - ((s + g) % 5));
+                    scales[g] = (float) std::ldexp(1.0, wide ? -18 : -6 - ((s + g) % 5));
                     std::memcpy(r + kLora + 4 * g, &scales[g], 4);
                 }
                 for (int c = 0; c < kLora; ++c) {
@@ -1469,9 +1496,14 @@ void test_dsa_preabsorbed_mma512() {
                     deq[s][c] = e4m3_code_f64(b) * (double) scales[c >> 7];
                 }
                 for (int c = 0; c < kRope; ++c) {
-                    const uint16_t bf = __bfloat16_as_ushort(__float2bfloat16(rnd(-0.5f, 0.5f)));
+                    // the wide profile pushes the BF16 rope past FP16's range (the MMA path and the reference
+                    // saturate it to +-65504); one pattern for every cell, so the softmax weights do not hinge on an
+                    // FP32-vs-FP64 argmax flip while the saturation still runs
+                    const float rv = wide ? (float) ((c & 1) ? -70000 : 70000) : rnd(-0.5f, 0.5f);
+                    const uint16_t bf = __bfloat16_as_ushort(__float2bfloat16(rv));
                     std::memcpy(r + 528 + 2 * c, &bf, 2);
-                    deq[s][kLora + c] = __bfloat162float(__ushort_as_bfloat16(bf));
+                    const double raw = __bfloat162float(__ushort_as_bfloat16(bf));
+                    deq[s][kLora + c] = std::max(-65504.0, std::min(65504.0, raw));
                 }
             }
         }
@@ -1514,10 +1546,184 @@ void test_dsa_preabsorbed_mma512() {
         for (size_t i = 0; i < hmm16.size(); ++i) hmm[i] = __half2float(__ushort_as_half(hmm16[i]));
 
         char name[112];
-        std::snprintf(name, sizeof name, "dsa_mla preabsorbed mma512 (32 tok, 64 heads, %s) vs fp64",
-                      fp8 ? "fp8" : "f16");
+        std::snprintf(name, sizeof name, "dsa_mla preabsorbed mma512 (32 tok, 64 heads, %s%s) vs fp64",
+                      fp8 ? "fp8" : "f16", wide ? ", wide" : "");
+        // the wide profile's saturated rope values are one pattern for every cell, so the scores differ only through
+        // the tiny FP8 values and the check does not hinge on an FP32-vs-FP64 argmax flip; a broken saturation (an
+        // +-Inf operand, hence NaN, or operands off by the 65504 clamp) still fails it outright
         check_tol(name, rel_l2_err(hmm, ref), 3e-3);
+        if (wide && fp8) {
+            int non_finite = 0;
+            for (float v : hmm) non_finite += std::isfinite(v) ? 0 : 1;
+            check_tol("dsa_mla preabsorbed mma512 (32 tok, 64 heads, fp8, wide) finite", (double) non_finite, 0.0);
+        }
     }
+}
+
+// -----------------------------------------------------------------------------
+// 11. The batched Tensor-Core Lightning Indexer of session.cpp's `use_tc_indexer` path at its widest batch: tw = 128
+//     query tokens per pass, one dequantized BF16 key tile of tile_k = 64 keys per cuBLAS GEMM, tiles over
+//     k0 = 0, 64, 128.  pos[t] = 70..197 with win_size = 32 puts the `older_n == top_k` boundary inside the batch (at
+//     pos = 95): the first 26 tokens take the select kernel's `older_n <= top_k` shortcut (whose scores the reduce
+//     kernel never writes) while the rest run the radix top-K over an `older_n` of up to 166.  scores_buf starts
+//     filled with quiet NaN over its whole extent, so one index outside [0, older_n) or outside the trailing window
+//     means a NaN (or a stale byte) got into a selection.  Checked against a CPU FP64 reference of the exact BF16
+//     operands the GEMM read, against a CPU exact top-K of the scores the GPU itself produced, and against
+//     dsa_indexer_topk_merge's own selection on the same BF16-rounded queries.
+// -----------------------------------------------------------------------------
+void test_dsa_indexer_batched128() {
+    const int tw = 128, idx_h = 64, idx_d = 128, top_k = 64, win = 32, tile_k = 64, pos0 = 70;
+    const int scores_stride = pos0 + tw;   // the session strides a batch's scores by the chunk's last position + 1
+    const int sel_w = top_k + win;
+    std::vector<int32_t> pos(tw);
+    for (int t = 0; t < tw; ++t) pos[t] = pos0 + t;                       // older_n = 39..166
+    const int tw_older = pos[tw - 1] + 1 - win, n_keys = pos0 + tw;       // 166 scored keys, 198 cache rows
+
+    // The keys and queries through dsa_indexer_prepare itself: rows 0..197 in the cache (so every key a token below
+    // scores exists), and the batch's queries are the rows of the tokens the batch asks about
+    const RopeTable rt = rope_table_plain(100000.0f);
+    auto iq_all = rand_vec((size_t) n_keys * idx_h * idx_d, -0.5f, 0.5f, 1301);
+    auto ik_all = rand_vec((size_t) n_keys * idx_d, -0.5f, 0.5f, 1302);
+    auto knw = rand_vec(idx_d, 0.8f, 1.2f, 1303);
+    auto knb = rand_vec(idx_d, -0.2f, 0.2f, 1304);
+    auto iw = rand_vec((size_t) tw * idx_h, 0.05f, 1.0f, 1305);
+    std::vector<int32_t> pos_keys(n_keys);
+    for (int j = 0; j < n_keys; ++j) pos_keys[j] = j;
+
+    DevBuf<float> diq(iq_all.size()), dik(ik_all.size()), dknw(idx_d), dknb(idx_d), diw(iw.size());
+    DevBuf<int32_t> dpos_keys(n_keys), dpos(tw);
+    diq.upload(iq_all); dik.upload(ik_all); dknw.upload(knw); dknb.upload(knb); diw.upload(iw);
+    dpos_keys.upload(pos_keys); dpos.upload(pos);
+    DevBuf<uint8_t> dk_idx((size_t) n_keys * layout::kIdxFp4RowBytes);
+    dsa_indexer_prepare(diq.ptr, dik.ptr, dknw.ptr, dknb.ptr, dpos_keys.ptr, n_keys, idx_h, idx_d, 64, 1e-6f, rt,
+                        dk_idx.ptr, true, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // The Tensor-Core path scores BF16 queries against BF16 keys; round the queries to BF16 and hand the very same
+    // values to the FP32 dsa_indexer_topk_merge reference, so the two paths differ only by their accumulation order
+    std::vector<float> hiq(iq_all.size());
+    diq.download(hiq);
+    std::vector<uint16_t> hiq_bf16(iq_all.size());
+    for (size_t i = 0; i < hiq.size(); ++i) {
+        hiq_bf16[i] = __bfloat16_as_ushort(__float2bfloat16(hiq[i]));
+        hiq[i] = __bfloat162float(__ushort_as_bfloat16(hiq_bf16[i]));
+    }
+    diq.upload(hiq);   // the FP32 reference scores the BF16 values, too
+    DevBuf<uint16_t> d_qb(iq_all.size());
+    d_qb.upload(hiq_bf16);
+
+    DevBuf<uint16_t> d_kb((size_t) tile_k * idx_d);
+    DevBuf<float> d_dots((size_t) tw * idx_h * tile_k);
+    DevBuf<int32_t> d_sel((size_t) tw * sel_w), d_ref_sel((size_t) tw * sel_w);
+    DevBuf<float> d_scores((size_t) tw * scores_stride), d_ref_scores((size_t) tw * scores_stride);
+    const std::vector<float> all_nan((size_t) tw * scores_stride, std::numeric_limits<float>::quiet_NaN());
+    d_scores.upload(all_nan);   // nothing outside a row's [0, older_n) is ever written: what is left must stay NaN
+    d_ref_scores.upload(all_nan);
+
+    cublasHandle_t hb = nullptr;
+    if (cublasCreate(&hb) != CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "cublasCreate failed\n"); std::exit(2); }
+    const float alpha = 1.0f, beta = 0.0f;
+    for (int k0 = 0; k0 < tw_older; k0 += tile_k) {
+        const int kn = std::min(tile_k, tw_older - k0);
+        dsa_dequant_idx_k_bf16(dk_idx.ptr, k0, kn, idx_d, true, d_kb.ptr, nullptr);
+        if (cublasGemmEx(hb, CUBLAS_OP_T, CUBLAS_OP_N, kn, tw * idx_h, idx_d, &alpha, d_kb.ptr, CUDA_R_16BF, idx_d,
+                         d_qb.ptr + (size_t) pos0 * idx_h * idx_d, CUDA_R_16BF, idx_d, &beta, d_dots.ptr, CUDA_R_32F,
+                         kn, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS) {
+            std::fprintf(stderr, "cublasGemmEx failed\n");
+            std::exit(2);
+        }
+        dsa_indexer_reduce_tile(d_dots.ptr, diw.ptr, dpos.ptr, tw, idx_h, idx_d, top_k, win, k0, kn, d_scores.ptr,
+                                scores_stride, nullptr);
+    }
+    dsa_indexer_select_cached(d_scores.ptr, scores_stride, dpos.ptr, tw, top_k, win, d_sel.ptr, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    cublasDestroy(hb);
+
+    std::vector<float> h_scores(all_nan.size());
+    h_scores.assign(h_scores.size(), 0.0f);
+    CUDA_CHECK(cudaMemcpy(h_scores.data(), d_scores.ptr, h_scores.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    std::vector<int32_t> h_sel((size_t) tw * sel_w), h_ref_sel((size_t) tw * sel_w);
+    d_sel.download(h_sel);
+
+    // The FP32 reference path on the same cache and the same (BF16-rounded) queries, one batch of 128 tokens
+    dsa_indexer_topk_merge(diq.ptr + (size_t) pos0 * idx_h * idx_d, diw.ptr, dk_idx.ptr, dpos.ptr, tw, idx_h, idx_d,
+                           top_k, win, true, d_ref_sel.ptr, nullptr, d_ref_scores.ptr, scores_stride);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    d_ref_sel.download(h_ref_sel);
+
+    // The keys exactly as the GEMM saw them (MXFP4 dequantized to BF16 is exact), for the CPU score reference
+    DevBuf<uint16_t> d_kb_all((size_t) tw_older * idx_d);
+    dsa_dequant_idx_k_bf16(dk_idx.ptr, 0, tw_older, idx_d, true, d_kb_all.ptr, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<uint16_t> h_kb_all((size_t) tw_older * idx_d);
+    d_kb_all.download(h_kb_all);
+
+    int bounds_err = 0, topk_err = 0, merge_err = 0, nan_read = 0;
+    std::vector<float> gpu_scores;
+    std::vector<double> cpu_scores;
+    const double wscale = 1.0 / std::sqrt((double) (idx_d * idx_h));
+    for (int t = 0; t < tw; ++t) {
+        const int seq_len = pos[t] + 1, older_n = std::max(0, seq_len - win);
+        const int swa_n = std::min(seq_len, win), keep_k = std::min(older_n, top_k);
+        std::vector<float> row(scores_stride, 0.0f);
+        if (older_n > top_k) {   // a token at or below the boundary writes (and needs) no scores at all
+            for (int j = 0; j < older_n; ++j) {
+                double tot = 0.0;
+                for (int h = 0; h < idx_h; ++h) {
+                    double dot = 0.0;
+                    const uint16_t* qr = hiq_bf16.data() + ((size_t) (pos0 + t) * idx_h + h) * idx_d;
+                    const uint16_t* kr = h_kb_all.data() + (size_t) j * idx_d;
+                    for (int d = 0; d < idx_d; ++d)
+                        dot += (double) __bfloat162float(__ushort_as_bfloat16(qr[d])) *
+                               __bfloat162float(__ushort_as_bfloat16(kr[d]));
+                    if (dot > 0.0) tot += dot * (double) iw[(size_t) t * idx_h + h] * wscale;
+                }
+                row[j] = h_scores[(size_t) t * scores_stride + j];
+                if (!std::isfinite(row[j])) ++nan_read;   // a scored key must never read the NaN fill
+                gpu_scores.push_back(row[j]);
+                cpu_scores.push_back(tot);
+            }
+        }
+        // The exact top-K of the scores the GPU produced, ties by lowest index like the radix kernel
+        std::vector<std::pair<float, int>> scored;
+        for (int j = 0; j < older_n; ++j) scored.push_back({row[j], j});
+        std::sort(scored.begin(), scored.end(), [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
+            return a.first != b.first ? a.first > b.first : a.second < b.second;
+        });
+        const int part_n = older_n <= top_k ? seq_len : keep_k;   // the shortcut keeps the whole selection in order
+        std::vector<int> want_top;
+        for (int k = 0; k < part_n; ++k)
+            want_top.push_back(older_n <= top_k ? k : scored[(size_t) k].second);
+        std::sort(want_top.begin(), want_top.end());
+        std::vector<int> got_top(h_sel.begin() + (size_t) t * sel_w,
+                                 h_sel.begin() + (size_t) t * sel_w + part_n);
+        std::sort(got_top.begin(), got_top.end());
+        topk_err += (got_top != want_top) ? 1 : 0;
+        // Every entry in range, the trailing window exact, and the padding -1
+        for (int i = 0; i < keep_k; ++i) {
+            const int32_t v = h_sel[(size_t) t * sel_w + i];
+            if (v < 0 || v >= older_n) ++bounds_err;
+        }
+        for (int i = keep_k; i < keep_k + swa_n; ++i)
+            if (h_sel[(size_t) t * sel_w + i] != seq_len - swa_n + (i - keep_k)) ++bounds_err;
+        for (int i = keep_k + swa_n; i < sel_w; ++i)
+            if (h_sel[(size_t) t * sel_w + i] != -1) ++bounds_err;
+        // The FP32 reference path picked the same keys and padded the same way
+        std::vector<int> got_top2(h_sel.begin() + (size_t) t * sel_w,
+                                  h_sel.begin() + (size_t) t * sel_w + part_n);
+        std::vector<int> ref_top(h_ref_sel.begin() + (size_t) t * sel_w,
+                                 h_ref_sel.begin() + (size_t) t * sel_w + part_n);
+        std::sort(got_top2.begin(), got_top2.end());
+        std::sort(ref_top.begin(), ref_top.end());
+        merge_err += (ref_top != got_top2) ? 1 : 0;
+        for (int i = part_n; i < sel_w; ++i)
+            if (h_ref_sel[(size_t) t * sel_w + i] != h_sel[(size_t) t * sel_w + i]) ++merge_err;
+    }
+    check_tol("dsa_indexer batched128 (tc) scores vs fp64", rel_l2_err(gpu_scores, cpu_scores), 5e-3);
+    check_tol("dsa_indexer batched128 (tc) exact top-K", (double) topk_err, 0.0);
+    check_tol("dsa_indexer batched128 (tc) window and bounds", (double) bounds_err, 0.0);
+    check_tol("dsa_indexer batched128 (tc) no NaN read", (double) nan_read, 0.0);
+    check_tol("dsa_indexer batched128 (tc) vs fp32 topk_merge", (double) merge_err, 0.0);
 }
 
 void test_mhc_prefill() {
@@ -1560,6 +1766,7 @@ int main() {
     test_prefill_fast_kernels();
     test_hca_mma512();
     test_dsa_preabsorbed_mma512();
+    test_dsa_indexer_batched128();
     std::printf("ernie55_kernels_parity: %d failure(s)\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

@@ -65,7 +65,7 @@ if(BUILD_TESTING)
         src/models/ernie55/kernels/kernels_parity.cpp
     )
     target_include_directories(ernie55_kernels_parity PRIVATE ${_gpu_include_directories})
-    target_link_libraries(ernie55_kernels_parity PRIVATE ernie55_kernels kernels ${_gpu_runtime_target})
+    target_link_libraries(ernie55_kernels_parity PRIVATE ernie55_kernels kernels CUDA::cublas ${_gpu_runtime_target})
     basalt_gpu_test(NAME ernie55_kernels_parity COMMAND ernie55_kernels_parity)
 
     add_executable(ernie55_dspark_parity

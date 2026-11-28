@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -138,6 +139,7 @@ struct PromptBufs {
     int32_t *pair_map = nullptr, *pair_ident = nullptr;
     int32_t *h_pair_map = nullptr, *h_ids = nullptr;
     int32_t *h_launch_tok = nullptr, *h_launch_bounds = nullptr;
+    size_t h_launch_bounds_cap = 0;   ///< entries h_launch_bounds holds (both launch paths write into it)
     float *gu = nullptr, *h = nullptr;
     void *xq1 = nullptr, *xq2 = nullptr, *xq_lat = nullptr;
     // Prompt Attention acceleration scratch (MLA-DSA FP16 W_UK/W_UV + BF16 TC Indexer + HCA 8-group batched oa MMQ)
@@ -169,6 +171,7 @@ struct PromptBufs {
         ready = false;
         rows = 0;
         own_row_bufs = false;
+        h_launch_bounds_cap = 0;
         router_w = nullptr;
         idx_q_bf16 = nullptr;
         idx_k_bf16 = nullptr;
@@ -897,10 +900,12 @@ private:
         b.h_pair_map = pin_i((size_t) R * K);
         b.h_ids = pin_i((size_t) R * K);
         b.h_launch_tok = pin_i((size_t) R * K);
-        // The staging loop writes <= 2 bounds entries per expert slice (slices: <= n_expert + rows/kLaunchRows), the
-        // prompt expert ring <= ring_cap_ + its own slices (ring_cap_ <= n_expert); this holds both paths' worst case
-        // at once (a few KiB of pinned memory), so the pre-packed launch tables can never overrun.
-        b.h_launch_bounds = pin_i((size_t) 4 * g_.n_expert + 3 * ((size_t) R * K / kLaunchRows + 1) + 16);
+        // The provable worst case for the pre-packed bounds tables, which the ringed and the staged launch path share:
+        // a path's launches walk <= n_expert expert slices plus one slice per kLaunchRows of its rows (<= R * K /
+        // kLaunchRows extra), and each launch writes 1 + (the slices it covers) entries, so <= 2 * (n_expert +
+        // R * K / kLaunchRows + 1) per path.  Twice that, plus slack (a few KiB of pinned memory), holds both at once.
+        b.h_launch_bounds_cap = 4 * (size_t) g_.n_expert + 4 * ((size_t) R * K / kLaunchRows + 1) + 16;
+        b.h_launch_bounds = pin_i(b.h_launch_bounds_cap);
         b.gu = alloc_f((size_t) kLaunchRows * 2 * F);
         b.h = alloc_f((size_t) kLaunchRows * F);
         b.xq1 = alloc_bytes(mmq::q8_bytes(std::max(kLaunchRows, R), std::max(L, H)));
@@ -961,6 +966,16 @@ private:
         return true;
     }
 
+    // The provable capacity of the pinned launch-bounds table (see make_prompt_bufs): one launch writes 1 + nb
+    // entries at bnd_cur, and exceeding that bound would overrun the table, so the chunk fails instead of it.
+    static bool bounds_fit(const PromptBufs& b, int32_t bnd_cur, int nb, std::string& err) {
+        if ((size_t) bnd_cur + (size_t) (nb + 1) <= b.h_launch_bounds_cap) return true;
+        assert(false);
+        err = "ernie55: prompt launch bounds overflow (" + std::to_string((long long) bnd_cur) + " + " +
+              std::to_string(nb + 1) + " of " + std::to_string((long long) b.h_launch_bounds_cap) + ")";
+        return false;
+    }
+
     bool open_prompt(int total, std::string& err) {
         if (big_.ready) return true;
         cudaSetDevice(m_.device());
@@ -996,26 +1011,46 @@ private:
         n_prompt_dev_ = n_prompt_bus_ = n_prompt_peer_ = n_prompt_cpu_ = n_prompt_file_ = n_prompt_ring_ = 0;
         n_prompt_peer_rows_ = n_prompt_cpu_rows_ = 0;
 
-        // First try bounded partial lend for the full target chunk `want` (plus ring if long) so GPU 0 keeps its
-        // hottest decode experts untouched without shrinking `want` prematurely when lend_all() would fit it.
+        // First try bounded partial lend, which leaves GPU 0's hottest decode experts on the card. A chunk wide enough
+        // to route to (almost) every expert asks for its ring first and for `want` without the ring second: the ring
+        // only pays off at that width (its bytes are 2 * cap expert blobs, and a narrower chunk reloads each layer's
+        // experts either way), so a long prompt that does not fit goes to lend_all() whole rather than to a chunk
+        // whose MoE PCIe reloads are no longer amortized. A shorter chunk keeps its halving shrink instead.
         if (tier && tier->partial_lend()) {
-            PromptBufs probe;
-            uint64_t need = 0;
-            std::string pe;
-            make_prompt_bufs(probe, want, pe, &need);
+            struct Try {
+                int r;
+                uint64_t ring;   ///< ring bytes to leave room for beside the chunk
+            };
+            std::vector<Try> tries;
             const uint64_t ring_need =
                 (total >= kRingRows && want >= kRingRows) ? expert_ring_bytes(ring_target_cap()) : 0;
-            if (tier->lend(need + ring_need + kMmqHeadroom) && make_prompt_bufs(big_, want, pe)) {
-                // MMQ allocates its stream-k buffers on its first launches: a chunk that left the card no room
-                // for them ended the engine
-                size_t free_b = 0, total_b = 0;
-                if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b < kMmqHeadroom) {
-                    big_.release();
-                } else {
-                    open_prompt_ring(total, want);
-                    lent_ = true;
-                    return true;
+            tries.push_back({want, ring_need});
+            if (ring_need > 0) tries.push_back({want, 0});   // the ring is what a long chunk pays for, R is not
+            else
+                for (int R = want / 2; R >= kMaxDecodeWindow * 2; R /= 2) tries.push_back({R, 0});
+            for (const Try& t : tries) {
+                PromptBufs probe;
+                uint64_t need = 0;
+                std::string pe;
+                make_prompt_bufs(probe, t.r, pe, &need);
+                if (!tier->lend(need + t.ring + kMmqHeadroom)) {
+                    if (m_.flags().diag_rows > 0 && t.ring == 0) break;   // --diag-rows tests exactly the width it asked for
+                    continue;
                 }
+                // From the byte lend() gives up, `lent_` says the tier owns VRAM again: every way out of this function
+                // (and release_prompt) then runs tier->reclaim(), so nothing a lend took can stay unmapped.
+                lent_ = true;
+                if (make_prompt_bufs(big_, t.r, pe)) {
+                    // MMQ allocates its stream-k buffers on its first launches: a chunk that left the card no room
+                    // for them ended the engine
+                    size_t free_b = 0, total_b = 0;
+                    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b >= kMmqHeadroom) {
+                        open_prompt_ring(total, t.r);
+                        return true;
+                    }
+                    big_.release();
+                }
+                break;   // a partial lend has given all it may give: only lend_all() below can top that up
             }
         }
         if (tier) {
@@ -1146,7 +1181,8 @@ private:
             cap -= kStageExperts;
         }
         if (!ring_) return false;
-        if (cudaMemset((uint8_t*) ring_ + 2 * (size_t) cap * stride_, 0, past) != cudaSuccess) {
+        // the whole ring starts zeroed, the read-past bytes above the last slot of slot 1 included
+        if (cudaMemset(ring_, 0, expert_ring_bytes(cap)) != cudaSuccess) {
             cudaGetLastError();
             cudaFree(ring_);
             ring_ = nullptr;
@@ -1243,6 +1279,13 @@ private:
                 pos[(size_t) e] = p;
                 ++p;
             }
+        }
+        // The MMQ reads a few bytes past the last expert it launches (a matrix whose last row is not a multiple of 256
+        // values is read on to the next multiple, and a stray scale there would be NaN): zero what follows this layer's
+        // packed experts, so a layer that packed fewer of them than the one before never reads that one's bytes.
+        if (p < ring_cap_) {
+            const size_t zero_n = std::min(expert_past(), (size_t) (ring_cap_ - p) * stride_);
+            cudaMemsetAsync(base + (size_t) p * stride_, 0, zero_n, ring_stream_);
         }
         cudaEventRecord(ring_copied_[slot], ring_stream_);
         return true;
@@ -1821,6 +1864,7 @@ private:
                 const int nb = rpos[(size_t) rslices[rb1 - 1].e] - p0 + 1;   // packed slots, gaps included
                 const int32_t tok_off = tok_cur, bnd_off = bnd_cur;
                 int32_t ntok = 0;
+                if (!bounds_fit(big_, bnd_cur, nb, err)) return false;   // the launch writes 1 + nb entries here
                 big_.h_launch_bounds[bnd_cur++] = 0;
                 size_t cur = rb0;
                 for (int q = 0; q < nb; ++q) {
@@ -1925,6 +1969,7 @@ private:
             }
             const int32_t tok_off = tok_cur, bnd_off = bnd_cur;
             int32_t ntok = 0;
+            if (!bounds_fit(big_, bnd_cur, nb, err)) return false;   // the launch writes 1 + nb entries here
             big_.h_launch_bounds[bnd_cur++] = 0;
             for (int q = 0; q < nb; ++q) {
                 const UsedSlice& sl = slices[b0 + (size_t) q];

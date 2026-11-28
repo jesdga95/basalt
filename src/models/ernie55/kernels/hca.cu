@@ -6,6 +6,7 @@
 //   - Inverse interleaved RoPE on VHA-mixed attention output
 #include "basalt/models/ernie55/kernels.hpp"
 
+#include "basalt/kernels/mma_f16.cuh"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
 #include "basalt/models/ernie55/cache_layout.hpp"
@@ -553,55 +554,44 @@ constexpr size_t mma512_smem() {
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 
-__device__ __forceinline__ void ldsm4(uint32_t (&r)[4], const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"((uint32_t) __cvta_generic_to_shared(p)));
-}
-__device__ __forceinline__ void ldsm4t(uint32_t (&r)[4], const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"((uint32_t) __cvta_generic_to_shared(p)));
-}
-__device__ __forceinline__ void mma16816h(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-__device__ __forceinline__ uint32_t bf2_to_h2(uint32_t v) {
-    const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&v));
-    const __half2 h = __float22half2_rn(f);
-    return *reinterpret_cast<const uint32_t*>(&h);
-}
-__device__ __forceinline__ uint32_t e4m3x2_to_h2(uint32_t codes, __half2 scale) {
-    const __half2 h = __hmul2(__half2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) codes, __NV_E4M3)), scale);
-    return *reinterpret_cast<const uint32_t*>(&h);
-}
+// the FP16 MMA inlines and the wider -> FP16 conversions Basalt's attention kernels share
+using basalt::kernels::mma_f16::bf2_to_h2;
+using basalt::kernels::mma_f16::e4m3x2_to_h2_f32scale;
+using basalt::kernels::mma_f16::f32_to_h_clamped;
+using basalt::kernels::mma_f16::ldsm4;
+using basalt::kernels::mma_f16::ldsm4t;
+using basalt::kernels::mma_f16::mma16816h;
 
 // Eight values of a cache row's chunk ch (of 64) as eight packed FP16 values, ready for the shared-memory staging.
 // FP16 rows: the eight halves. FP8 rows: chunks below 56 are eight E4M3 codes times their 64-value group's scale
 // (8-value chunks, 64-value groups: scales[ch >> 3], NOT hy4flash's ch >> 4), the rest eight BF16 rope values. The
 // rope tail starts at row + 448 + 7 * 4 = 476, which is only 4-byte aligned (476 % 16 == 12): it loads as four
-// uint32_t, never a uint4 (that would be a misaligned-address trap). A code times its power-of-two scale (>= 2^-22
-// from store_hca_row) is exact in FP16.
+// uint32_t, never a uint4 (that would be a misaligned-address trap). An FP8 code times its power-of-two scale stays
+// normal in FP16 down to 2^-14; the smaller scales store_hca_row may hold (down to 2^-22) round through FP16
+// subnormals, and the BF16 rope values and F32 kv_rot rows saturate to FP16's finite range, never to +-Inf.
 template <bool FP8>
 __device__ __forceinline__ uint4 fetch_row8(const uint8_t* cache, size_t slot, int ch) {
     if (!FP8) return *reinterpret_cast<const uint4*>(cache + slot * (size_t) (2 * 512) + ch * 16);
     const uint8_t* row = cache + slot * (size_t) kHcaFp8Stride;
     if (ch < 56) {
         const uint2 codes = *reinterpret_cast<const uint2*>(row + ch * 8);
-        const __half2 s = __float2half2_rn(reinterpret_cast<const float*>(row + 448)[ch >> 3]);
-        return make_uint4(e4m3x2_to_h2(codes.x & 0xffffu, s), e4m3x2_to_h2(codes.x >> 16, s),
-                          e4m3x2_to_h2(codes.y & 0xffffu, s), e4m3x2_to_h2(codes.y >> 16, s));
+        const float s = reinterpret_cast<const float*>(row + 448)[ch >> 3];
+        return make_uint4(e4m3x2_to_h2_f32scale(codes.x & 0xffffu, s), e4m3x2_to_h2_f32scale(codes.x >> 16, s),
+                          e4m3x2_to_h2_f32scale(codes.y & 0xffffu, s), e4m3x2_to_h2_f32scale(codes.y >> 16, s));
     }
     const uint32_t* w = reinterpret_cast<const uint32_t*>(row + 448 + 7 * 4 + (ch - 56) * 16);
     return make_uint4(bf2_to_h2(w[0]), bf2_to_h2(w[1]), bf2_to_h2(w[2]), bf2_to_h2(w[3]));
 }
 
 // The eight F32 values of a kv_rot row's chunk ch as eight packed FP16 values (the row is 16-byte aligned: its base
-// is a cudaMalloc'd float buffer, the row and chunk offsets are multiples of 16 bytes).
+// is a cudaMalloc'd float buffer, the row and chunk offsets are multiples of 16 bytes), saturated to FP16's range.
 __device__ __forceinline__ uint4 fetch_f32_8(const float* row, int ch) {
     const float4* src = reinterpret_cast<const float4*>(row + ch * 8);
     const float4 a = src[0], b = src[1];
-    const __half2 h0 = __float22half2_rn(make_float2(a.x, a.y));
-    const __half2 h1 = __float22half2_rn(make_float2(a.z, a.w));
-    const __half2 h2 = __float22half2_rn(make_float2(b.x, b.y));
-    const __half2 h3 = __float22half2_rn(make_float2(b.z, b.w));
+    const __half2 h0 = __halves2half2(f32_to_h_clamped(a.x), f32_to_h_clamped(a.y));
+    const __half2 h1 = __halves2half2(f32_to_h_clamped(a.z), f32_to_h_clamped(a.w));
+    const __half2 h2 = __halves2half2(f32_to_h_clamped(b.x), f32_to_h_clamped(b.y));
+    const __half2 h3 = __halves2half2(f32_to_h_clamped(b.z), f32_to_h_clamped(b.w));
     return make_uint4(*reinterpret_cast<const uint32_t*>(&h0), *reinterpret_cast<const uint32_t*>(&h1),
                       *reinterpret_cast<const uint32_t*>(&h2), *reinterpret_cast<const uint32_t*>(&h3));
 }
@@ -639,7 +629,7 @@ __global__ void __launch_bounds__(256) hca_attention_mma512_kernel(const float* 
         const int h = i / W, e = i - h * W;
         const int gh = h0 + h;
         const float v = gh < n_heads ? q[((size_t) t * n_heads + gh) * W + e] : 0.0f;
-        qh[h * kMmaLd + e] = __half_as_ushort(__float2half_rn(v * kHcaScale512));
+        qh[h * kMmaLd + e] = __half_as_ushort(f32_to_h_clamped(v * kHcaScale512));
     }
     // the softmax: a warp keeps 2 * kMmaG = 4 heads
     float m[2 * kMmaG], l[2 * kMmaG];
@@ -871,22 +861,13 @@ void hca_attention(const float* q, const uint8_t* comp_cache, const uint8_t* win
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
         // the prefill pass: one tensor-core block per (32-head tile, token)
         if (n_tokens > 8) {
-            // the dynamic shared-memory opt-in, once per instantiation; a device that rejects it keeps the scalar kernel
-            static bool smem_raised[2] = {false, false};
-            static bool mma_usable[2] = {false, false};
-            const int sel = fp8 ? 1 : 0;
-            if (!smem_raised[sel]) {
-                const cudaError_t err =
-                    fp8
-                        ? cudaFuncSetAttribute(hca_attention_mma512_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                               (int) mma512_smem())
-                        : cudaFuncSetAttribute(hca_attention_mma512_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                               (int) mma512_smem());
-                mma_usable[sel] = err == cudaSuccess;
-                if (!mma_usable[sel]) cudaGetLastError();
-                smem_raised[sel] = true;
-            }
-            if (mma_usable[sel]) {
+            // the dynamic shared-memory opt-in and the sm_80+ check, once per device and instantiation; a card that
+            // rejects either keeps the scalar kernel
+            static bk::mma_f16::MmaSmemCache smem_cache[2];
+            const bool mma_usable =
+                fp8 ? bk::mma_f16::mma_smem_ready(smem_cache[1], hca_attention_mma512_kernel<true>, mma512_smem())
+                    : bk::mma_f16::mma_smem_ready(smem_cache[0], hca_attention_mma512_kernel<false>, mma512_smem());
+            if (mma_usable) {
                 const dim3 grid((n_heads + 16 * kMmaG - 1) / (16 * kMmaG), n_tokens);
                 if (fp8)
                     hca_attention_mma512_kernel<true><<<grid, 256, mma512_smem(), (cudaStream_t) stream>>>(

@@ -6,6 +6,7 @@
 //     merged with trailing sliding window [max(0, pos-win+1)..pos]
 //   - Absorbed sparse MLA attention over selected positions with per-head softmax_offset sink and Q8_0 kv_b_proj
 #include "basalt/models/ernie55/kernels.hpp"
+#include "basalt/kernels/mma_f16.cuh"
 #include "basalt/kernels/mxfp4_scale.hpp"
 #include "basalt/models/ernie55/cache_layout.hpp"
 
@@ -885,46 +886,30 @@ constexpr size_t dsa_mma512_smem() {
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 
-__device__ __forceinline__ void dsa_ldsm4(uint32_t (&r)[4], const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"((uint32_t) __cvta_generic_to_shared(p)));
-}
-__device__ __forceinline__ void dsa_ldsm4t(uint32_t (&r)[4], const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"((uint32_t) __cvta_generic_to_shared(p)));
-}
-__device__ __forceinline__ void dsa_mma16816h(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-__device__ __forceinline__ uint32_t dsa_bf2_to_h2(uint32_t v) {
-    const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&v));
-    const __half2 h = __float22half2_rn(f);
-    return *reinterpret_cast<const uint32_t*>(&h);
-}
-__device__ __forceinline__ uint32_t dsa_e4m3x2_to_h2(uint32_t codes, __half2 scale) {
-    const __half2 h = __hmul2(__half2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) codes, __NV_E4M3)), scale);
-    return *reinterpret_cast<const uint32_t*>(&h);
-}
+// the FP16 MMA inlines and the wider -> FP16 conversions Basalt's attention kernels share
+using basalt::kernels::mma_f16::bf2_to_h2;
+using basalt::kernels::mma_f16::e4m3x2_to_h2_f32scale;
+using basalt::kernels::mma_f16::f32_to_h_clamped;
+using basalt::kernels::mma_f16::ldsm4;
+using basalt::kernels::mma_f16::ldsm4t;
+using basalt::kernels::mma_f16::mma16816h;
 
 // Eight values of a DSA latent KV row's chunk ch (of 72: 64 c_kv + 8 k_pe) as eight packed FP16 values.
 // FP8 layout (kDsaFp8RowBytes = 656, 16-byte aligned): 512 E4M3 c_kv + 4 float scales (128-value groups -> ch >> 4)
-// + 64 BF16 k_pe starting at byte 528 (528 % 16 == 0).
+// + 64 BF16 k_pe starting at byte 528 (528 % 16 == 0).  A code times its power-of-two scale stays normal in FP16
+// down to 2^-14 (smaller scales round through FP16 subnormals); the BF16 k_pe saturates to FP16's finite range.
 template <bool FP8>
 __device__ __forceinline__ uint4 dsa_fetch_row8(const uint8_t* kv_cache, size_t cell, int ch) {
     if (!FP8) return *reinterpret_cast<const uint4*>(kv_cache + cell * (size_t) (2 * 576) + ch * 16);
     const uint8_t* row = kv_cache + cell * (size_t) kDsaFp8RowBytes;
     if (ch < 64) {
         const uint2 codes = *reinterpret_cast<const uint2*>(row + ch * 8);
-        const __half2 s = __float2half2_rn(reinterpret_cast<const float*>(row + 512)[ch >> 4]);
-        return make_uint4(dsa_e4m3x2_to_h2(codes.x & 0xffffu, s), dsa_e4m3x2_to_h2(codes.x >> 16, s),
-                          dsa_e4m3x2_to_h2(codes.y & 0xffffu, s), dsa_e4m3x2_to_h2(codes.y >> 16, s));
+        const float s = reinterpret_cast<const float*>(row + 512)[ch >> 4];
+        return make_uint4(e4m3x2_to_h2_f32scale(codes.x & 0xffffu, s), e4m3x2_to_h2_f32scale(codes.x >> 16, s),
+                          e4m3x2_to_h2_f32scale(codes.y & 0xffffu, s), e4m3x2_to_h2_f32scale(codes.y >> 16, s));
     }
     const uint4 w = *reinterpret_cast<const uint4*>(row + 528 + (ch - 64) * 16);
-    return make_uint4(dsa_bf2_to_h2(w.x), dsa_bf2_to_h2(w.y), dsa_bf2_to_h2(w.z), dsa_bf2_to_h2(w.w));
+    return make_uint4(bf2_to_h2(w.x), bf2_to_h2(w.y), bf2_to_h2(w.z), bf2_to_h2(w.w));
 }
 
 // One block (256 threads, 8 warps) per (32-head tile, token): FP16 Tensor-Core sparse MLA attention over sel_idx.
@@ -957,7 +942,7 @@ __global__ void __launch_bounds__(256) dsa_mla_attention_preabsorbed_mma512_kern
             if (e < W) v = q_lat_in[((size_t) gh * n_tokens + t) * W + e];
             else v = q_full[((size_t) t * n_heads + gh) * qd + qk_nope + (e - W)];
         }
-        qh[h * kDsaMmaLd + e] = __half_as_ushort(__float2half_rn(v * scale));
+        qh[h * kDsaMmaLd + e] = __half_as_ushort(f32_to_h_clamped(v * scale));
     }
 
     float m[2 * kDsaMmaG], l[2 * kDsaMmaG];
@@ -1014,14 +999,14 @@ __global__ void __launch_bounds__(256) dsa_mla_attention_preabsorbed_mma512_kern
                 uint32_t b[kDsaMmaG][4];
 #pragma unroll
                 for (int nt = 0; nt < kDsaMmaG; ++nt)
-                    dsa_ldsm4(b[nt], ks + ((cp * kDsaMmaG + nt) * 8 + r8) * kDsaMmaLd + kb + id * 8);
+                    ldsm4(b[nt], ks + ((cp * kDsaMmaG + nt) * 8 + r8) * kDsaMmaLd + kb + id * 8);
 #pragma unroll
                 for (int s2 = 0; s2 < 2; ++s2) {
                     const int kd = kb + s2 * 16;
                     uint32_t ah[4];
-                    dsa_ldsm4(ah, qh + (rg * 16 + (id & 1) * 8 + r8) * kDsaMmaLd + kd + (id >> 1) * 8);
+                    ldsm4(ah, qh + (rg * 16 + (id & 1) * 8 + r8) * kDsaMmaLd + kd + (id >> 1) * 8);
 #pragma unroll
-                    for (int nt = 0; nt < kDsaMmaG; ++nt) dsa_mma16816h(c[nt], ah, b[nt][2 * s2], b[nt][2 * s2 + 1]);
+                    for (int nt = 0; nt < kDsaMmaG; ++nt) mma16816h(c[nt], ah, b[nt][2 * s2], b[nt][2 * s2 + 1]);
                 }
             }
             const int row = rg * 16 + (lane >> 2);
@@ -1068,14 +1053,14 @@ __global__ void __launch_bounds__(256) dsa_mla_attention_preabsorbed_mma512_kern
 #pragma unroll
             for (int s2 = 0; s2 < 2; ++s2) {
                 uint32_t ah[4];
-                dsa_ldsm4(ah, ph + (rg * 16 + (id & 1) * 8 + r8) * kDsaMmaPLd + s2 * 16 + (id >> 1) * 8);
+                ldsm4(ah, ph + (rg * 16 + (id & 1) * 8 + r8) * kDsaMmaPLd + s2 * 16 + (id >> 1) * 8);
 #pragma unroll
                 for (int jj = 0; jj < 4 * kDsaMmaG; ++jj) {
                     uint32_t b[4];
-                    dsa_ldsm4t(b, ks + (s2 * 16 + (id & 1) * 8 + r8) * kDsaMmaLd + dq * (W / (2 * kDsaMmaG)) + jj * 16 +
+                    ldsm4t(b, ks + (s2 * 16 + (id & 1) * 8 + r8) * kDsaMmaLd + dq * (W / (2 * kDsaMmaG)) + jj * 16 +
                                       (id >> 1) * 8);
-                    dsa_mma16816h(acc[2 * jj], ah, b[0], b[1]);
-                    dsa_mma16816h(acc[2 * jj + 1], ah, b[2], b[3]);
+                    mma16816h(acc[2 * jj], ah, b[0], b[1]);
+                    mma16816h(acc[2 * jj + 1], ah, b[2], b[3]);
                 }
             }
         }
@@ -1091,13 +1076,13 @@ __global__ void __launch_bounds__(256) dsa_mla_attention_preabsorbed_mma512_kern
         const int d = dq * (W / (2 * kDsaMmaG)) + j * 8 + (lane & 3) * 2;
         if (g0 < n_heads) {
             uint16_t* o0 = o_lat_f16 + ((size_t) g0 * n_tokens + t) * W + d;
-            o0[0] = __half_as_ushort(__float2half_rn(acc[j][0] * i0));
-            o0[1] = __half_as_ushort(__float2half_rn(acc[j][1] * i0));
+            o0[0] = __half_as_ushort(f32_to_h_clamped(acc[j][0] * i0));
+            o0[1] = __half_as_ushort(f32_to_h_clamped(acc[j][1] * i0));
         }
         if (g1 < n_heads) {
             uint16_t* o1 = o_lat_f16 + ((size_t) g1 * n_tokens + t) * W + d;
-            o1[0] = __half_as_ushort(__float2half_rn(acc[j][2] * i1));
-            o1[1] = __half_as_ushort(__float2half_rn(acc[j][3] * i1));
+            o1[0] = __half_as_ushort(f32_to_h_clamped(acc[j][2] * i1));
+            o1[1] = __half_as_ushort(f32_to_h_clamped(acc[j][3] * i1));
         }
     }
 }
@@ -1264,21 +1249,17 @@ void dsa_mla_attention_preabsorbed(const float* q_lat, const float* q_full, cons
     if (n_tokens <= 0) return;
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     if (n_tokens > 8 && kv_lora == 512 && qk_rope == 64) {
-        static bool smem_raised[2] = {false, false};
-        static bool mma_usable[2] = {false, false};
-        const int sel = fp8 ? 1 : 0;
-        if (!smem_raised[sel]) {
-            const cudaError_t err =
-                fp8
-                    ? cudaFuncSetAttribute(dsa_mla_attention_preabsorbed_mma512_kernel<true>,
-                                           cudaFuncAttributeMaxDynamicSharedMemorySize, (int) dsa_mma512_smem())
-                    : cudaFuncSetAttribute(dsa_mla_attention_preabsorbed_mma512_kernel<false>,
-                                           cudaFuncAttributeMaxDynamicSharedMemorySize, (int) dsa_mma512_smem());
-            mma_usable[sel] = err == cudaSuccess;
-            if (!mma_usable[sel]) cudaGetLastError();
-            smem_raised[sel] = true;
-        }
-        if (mma_usable[sel]) {
+        // the dynamic shared-memory opt-in and the sm_80+ check, once per device and instantiation; a card that
+        // rejects either keeps the one-block-a-head-group kernel
+        static basalt::kernels::mma_f16::MmaSmemCache smem_cache[2];
+        const bool mma_usable =
+            fp8 ? basalt::kernels::mma_f16::mma_smem_ready(smem_cache[1],
+                                                           dsa_mla_attention_preabsorbed_mma512_kernel<true>,
+                                                           dsa_mma512_smem())
+                : basalt::kernels::mma_f16::mma_smem_ready(smem_cache[0],
+                                                           dsa_mla_attention_preabsorbed_mma512_kernel<false>,
+                                                           dsa_mma512_smem());
+        if (mma_usable) {
             const dim3 grid((n_heads + 16 * kDsaMmaG - 1) / (16 * kDsaMmaG), n_tokens);
             if (fp8)
                 dsa_mla_attention_preabsorbed_mma512_kernel<true><<<grid, 256, dsa_mma512_smem(), (cudaStream_t) stream>>>(
