@@ -1230,6 +1230,17 @@ class SessionAffinity(PickSlot):
         after = [self.pick(e, p, None) for p in ([1, 2, 3, 4, 5, 6], [1, 2, 3, 9], [7, 8], [1, 2, 3])]
         self.assertEqual(before, after)
 
+    def test_empty_owned_slot_is_reused_when_prompt_cache_is_off(self):
+        """With prompt-cache=0 (slot_held == 0), a session's free empty slot is reused instead of drifting."""
+        e = self.engine(3)
+        self.hold(e, [[], [], []])
+        e.claim_slot(0, "s1")
+        self.assertEqual(self.pick(e, [1, 2, 3], session="s1"), 0)
+        self.assertEqual(e.slot_owner, {0: "s1"})
+        # When slot 0 holds a non-matching cached conversation, s1 still takes an unowned slot instead of clobbering it.
+        self.hold(e, [[9, 8, 7], [], []])
+        self.assertEqual(self.pick(e, [1, 2, 3], session="s1"), 1)
+
 
 class RestartRaces(unittest.TestCase):
     """Concurrent engine restarts must neither deadlock _hold_prompt nor reuse a stale-generation slot."""
@@ -1813,6 +1824,188 @@ class ConcurrencyLifecycleResources(unittest.TestCase):
             self.assertTrue(fake_proc.stderr.closed)
             # On Windows, unlinking log_path also proves the log file handle was closed.
             log_path.unlink()
+
+    def test_may_go_solo_blocked_while_another_request_is_admitting_or_queued(self):
+        from serve.engine.slots import AdmissionQueue
+
+        e = ProcessEngine("missing-executable", [], lazy=True)
+        e.ctl = threading.Lock()
+        e.slot_cv = threading.Condition()
+        e.admission = AdmissionQueue()
+        e.waiting = 0
+        e.admitting = 0
+        e.wait_lens = []
+        e.ctl_epoch = 0
+        e.info = {"slot_cache": 1}
+        e.slot_busy = [True, False]
+        e.alive = lambda: True
+
+        self.assertTrue(e._may_go_solo(64, 0, None))
+        # _take_control transitions waiting -> admitting atomically before attach()/PMATCH runs.
+        gen = e._take_control(threading.Event(), 10)
+        with self.assertRaises(StopIteration) as cm:
+            next(gen)
+        self.assertTrue(cm.exception.value)
+        self.assertEqual((e.waiting, e.admitting), (0, 1))
+        self.assertFalse(e._may_go_solo(64, 0, None))
+        e._release_control()
+        self.assertEqual(e.admitting, 0)
+        self.assertTrue(e._may_go_solo(64, 0, None))
+        # A waiter queued in AdmissionQueue also blocks _may_go_solo.
+        ticket = e.admission.join()
+        try:
+            self.assertFalse(e._may_go_solo(64, 0, None))
+        finally:
+            e.admission.leave(ticket)
+        self.assertTrue(e._may_go_solo(64, 0, None))
+
+    def test_batch_watchdogs_kill_hung_child_on_silence(self):
+        import io
+        import queue
+        from types import SimpleNamespace
+        from serve.engine.errors import EngineSilent
+        from serve.engine.slots import AdmissionQueue
+
+        def make_hung():
+            killed = []
+            e = ProcessEngine("missing-executable", [], lazy=True)
+            e.ended = False
+            e.silence_s = 0.08
+            e.batch = 2
+            e.max_context = 4096
+            e.info = {"slot0_solo": 1}
+            e.gen = 1
+            e.ctl = threading.Lock()
+            e.slot_cv = threading.Condition()
+            e.admission = AdmissionQueue()
+            e.slot_ends = 0
+            e.prompt_lock = threading.Lock()
+            e.wlock = threading.Lock()
+            e.lines = queue.Queue()
+            e.prompt_q = queue.Queue()
+            e.slot_q = [queue.Queue(), queue.Queue()]
+            e.slot_busy = [False, False]
+            e.slot_held = [0, 0]
+            e.slot_epoch = [0, 0]
+            e.slot_used = [0.0, 0.0]
+            e.slot_order = [0, 1]
+            e.slot_owner = {}
+            e.slot_thread = [None, None]
+            e.waiting = 0
+            e.admitting = 0
+            e.wait_lens = []
+            e.ctl_epoch = 0
+            e._ctl_mode = "batch"
+            e._ctl_erred = False
+            e._yielded = None
+            e.proc = SimpleNamespace(
+                poll=lambda: 1 if killed else None,
+                stdin=io.StringIO(),
+                kill=lambda: killed.append("kill"),
+                wait=lambda timeout=None: killed.append("wait"),
+            )
+            return e, killed
+
+        # 1) _control() silence watchdog
+        e, killed = make_hung()
+        with self.assertRaises(EngineSilent):
+            list(e._control(threading.Event(), lambda t: None, prompt_len=0))
+        self.assertEqual(killed, ["kill", "wait"])
+        self.assertTrue(e.ended)
+
+        # 2) _hold_prompt() silence watchdog releases prompt_lock
+        e, killed = make_hung()
+        with self.assertRaises(EngineSilent):
+            e._hold_prompt([1, 2, 3], None)
+        self.assertEqual(killed, ["kill", "wait"])
+        self.assertTrue(e.prompt_lock.acquire(blocking=False))
+        e.prompt_lock.release()
+
+        # 3) _drain_control() / _meet() timeout kills still-alive child
+        e, killed = make_hung()
+        with self.assertRaises(EngineSilent):
+            e._meet(1, born=1)
+        self.assertEqual(killed, ["kill", "wait"])
+        self.assertTrue(e.ended)
+
+        # 4) batch slot loop (slot_q.get) silence watchdog clears slot_busy and kills child
+        e, killed = make_hung()
+        e._meet = lambda handle, born: [0, 0]
+
+        def fake_control(cancel, on_tok, **kw):
+            on_tok(42)
+            e._ctl_result = ("badm", True, False)
+            if False:
+                yield None
+
+        e._control = fake_control
+        with self.assertRaises(EngineSilent):
+            list(e._generate_batched([1, 2, 3], {"handle": 1, "gen": 1}, 3, 8, {},
+                                     threading.Event(), None, None, None))
+        self.assertEqual(killed, ["kill", "wait"])
+        self.assertFalse(any(e.slot_busy))
+
+    def test_badm_zero_carries_multi_run_metrics(self):
+        """A request finishing on BADM <slot> 0 after a solo run keeps first reused, summed read_ms, and draft counts."""
+        import io
+        import queue
+        from types import SimpleNamespace
+        from serve.engine.slots import AdmissionQueue
+
+        e = ProcessEngine("missing-executable", [], lazy=True)
+        e.ended = False
+        e.batch = 2
+        e.max_context = 4096
+        e.info = {}
+        e.gen = 1
+        e.ctl = threading.Lock()
+        e.slot_cv = threading.Condition()
+        e.admission = AdmissionQueue()
+        e.slot_ends = 0
+        e.wlock = threading.Lock()
+        e.lines = queue.Queue()
+        e.slot_q = [queue.Queue(), queue.Queue()]
+        e.slot_busy = [False, False]
+        e.slot_held = [0, 0]
+        e.slot_epoch = [0, 0]
+        e.slot_used = [0.0, 0.0]
+        e.slot_order = [0, 1]
+        e.slot_owner = {}
+        e.slot_thread = [None, None]
+        e.waiting = 0
+        e.admitting = 0
+        e.wait_lens = []
+        e.ctl_epoch = 0
+        e._yielded = None
+        e.proc = SimpleNamespace(poll=lambda: None, stdin=io.StringIO())
+        e.eos_ids = lambda: {257}
+        e._meet = lambda handle, born: [0, 0]
+
+        run = [0]
+
+        def fake_control(cancel, on_tok, **kw):
+            run[0] += 1
+            if run[0] == 1:
+                # Solo run: cold prompt (reused=0, prompt_ms=500.0), 3 drafts accepted / 6 offered, 2 windows, cancelled
+                on_tok(65)
+                e._parse_done("DONE 1 100 500.0 10.0 cancel 3 6 0 0 0 0 0 0.0 100 0 2")
+                e._ctl_result = ("done", None)
+            else:
+                # Batch admission finishes on its admission token (EOS): engine reports full prompt reused & 0.4ms read
+                on_tok(257)
+                e._parse_done("DONE 1 101 0.4 2.0 stop 0 0 100 0 0 0 0 0.0 1 0 1")
+                e._ctl_result = ("badm", False, False)
+            if False:
+                yield None
+
+        e._control = fake_control
+        tokens = list(e._generate_batched(list(range(100)), {"handle": 1, "gen": 1}, 100, 16, {},
+                                          threading.Event(), None, None, None))
+        self.assertEqual(tokens, [65, 257])
+        self.assertEqual(e.last["reused"], 0)
+        self.assertAlmostEqual(e.last["prompt_ms"], 500.4, places=2)
+        self.assertEqual((e.last["drafts_accepted"], e.last["drafts_offered"], e.last["windows"]), (3, 6, 3))
+        self.assertFalse(any(e.slot_busy))
 
 
 if __name__ == "__main__":

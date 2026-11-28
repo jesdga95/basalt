@@ -260,11 +260,11 @@ tr.live td { color: var(--accent); }
 .sb-tbl .t, .sb-tbl .c { padding: 10px 0; border-top: 1px solid var(--line-soft); font: 500 14px/1 var(--font-mono); text-align: right; white-space: nowrap; }
 .sb-tbl .t { font-family: var(--font-sans); text-align: left; }
 
-/* Slot cards (1, 2, 4 slots): each section is heading, headline figure, its graphic right under it, then its rows. One strip
+/* Slot cards (1 to 4 slots): each section is heading, headline figure, its graphic right under it, then its rows. One strip
    spans the card's bottom: the slot's decode rate over 60 s, with tokens accepted per window as faint ticks. */
 .scards { height: 100%; display: grid; gap: 16px 48px; }
 .scards.n2 { grid-template-columns: 1fr 1fr; }
-.scards.n4 { grid-template-columns: 1fr 1fr; grid-template-rows: repeat(2, minmax(0, 1fr)); row-gap: 22px; }
+.scards.n3, .scards.n4 { grid-template-columns: 1fr 1fr; grid-template-rows: repeat(2, minmax(0, 1fr)); row-gap: 22px; }
 .scard { min-height: 0; display: flex; flex-direction: column; }
 /* no slot up: the cards' layout, quiet */
 .sdown { height: 100%; display: flex; flex-direction: column; }
@@ -436,7 +436,7 @@ a.tot { color: inherit; text-decoration: none; }
   .map { flex: none; height: 240px; }
   .none { grid-column: 1 / -1; }
   .rq { grid-template-columns: minmax(0, 1fr); gap: 32px; }
-  .hw, .sl2, .scards.n2, .scards.n4, .gpus.rich.n2, .gch3 { grid-template-columns: minmax(0, 1fr); gap: 20px; }
+  .hw, .sl2, .scards.n2, .scards.n3, .scards.n4, .gpus.rich.n2, .gch3 { grid-template-columns: minmax(0, 1fr); gap: 20px; }
   .scard.full .secs, .scard.half .secs, .scard.quarter .secs { grid-template-columns: 1fr 1fr; row-gap: 16px; }
   .scards, .hw, .gpus.rich, .gpu.one, .gpu.two { height: auto; }
 }

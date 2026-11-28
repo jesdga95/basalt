@@ -217,6 +217,190 @@ class QuotedCallValues(unittest.TestCase):
         self.assertEqual([(e.kind, e.text) for e in ev],
                          [("content", f"{CALL_START}\n{FUNC_START}write>\n" + "chunk " * 5)])
 
+    def test_stream_tools_event_by_event_parity_and_linear_scaling(self):
+        import time
+        from serve.frontend import Event, ToolCall, _text_kinds, _tool_properties, call_end, param_end
+
+        class ReferenceOutputParser(OutputParser):
+            """Pre-optimization reference using flat _buf and direct call_end/param_end on every feed()."""
+
+            def _scan(self, final: bool = False):
+                out = []
+
+                def args(s):
+                    if s:
+                        out.append(Event("tool_args", s, call=self.scall))
+
+                while True:
+                    rest = self._buf[self.sp:]
+                    if self.ss == "name":
+                        a = rest.find("<function=")
+                        b = rest.find(">", a + 10) if a >= 0 else -1
+                        if b < 0:
+                            return out
+                        name = rest[a + 10:b]
+                        self.scall = ToolCall(name=name, arguments={})
+                        self.sdeclared = _tool_properties(self.schemas.get(name))
+                        out.append(Event("tool_start", call=self.scall))
+                        args("{")
+                        self.sp += b + 1
+                        self.ss = "between"
+                    elif self.ss == "between":
+                        stripped = rest.lstrip()
+                        self.sp += len(rest) - len(stripped)
+                        if stripped.startswith("<parameter="):
+                            b = stripped.find(">")
+                            if b < 0:
+                                return out
+                            pname = stripped[11:b]
+                            args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
+                            self.sfirst = False
+                            self.sp += b + 1
+                            self.spname = pname
+                            text, null = _text_kinds(self.sdeclared.get(pname))
+                            if text and not null:
+                                args('"')
+                                self.ss, self.sval_started = "str", False
+                            else:
+                                self.ss = "raw"
+                        elif stripped.startswith("</function>"):
+                            args("}")
+                            self.sp += len("</function>")
+                            self.ss = "done"
+                        else:
+                            return out
+                    elif self.ss == "str":
+                        if not self.sval_started:
+                            if not rest:
+                                return out
+                            if rest[0] == "\n":
+                                self.sp += 1
+                                rest = rest[1:]
+                            self.sval_started = True
+                            self.svstart = self.sp
+                        end = param_end(self._buf[self.svstart:], final=final, name=self.spname) if PARAM_END in rest else -1
+                        end = end - (self.sp - self.svstart) if end >= 0 else end
+                        if end >= 0:
+                            value = rest[:end]
+                            if value.endswith("\n"):
+                                value = value[:-1]
+                            args(json.dumps(value)[1:-1] + '"')
+                            self.sp += end + len(PARAM_END)
+                            self.ss = "between"
+                            continue
+                        safe = rest.find(PARAM_END) if end == -2 else len(rest) - self._hold(rest, (PARAM_END,))
+                        if safe > 0 and rest[safe - 1] == "\n":
+                            safe -= 1
+                        if safe > 0:
+                            args(json.dumps(rest[:safe])[1:-1])
+                            self.sp += safe
+                        return out
+                    elif self.ss == "raw":
+                        end = param_end(rest, final=final, name=self.spname) if PARAM_END in rest else -1
+                        if end < 0:
+                            return out
+                        value = rest[:end]
+                        if value.startswith("\n"):
+                            value = value[1:]
+                        if value.endswith("\n"):
+                            value = value[:-1]
+                        from serve.frontend import _decode_param
+                        args(json.dumps(_decode_param(value, self.sdeclared.get(self.spname)), ensure_ascii=False))
+                        self.sp += end + len(PARAM_END)
+                        self.ss = "between"
+                    else:
+                        return out
+
+            def feed(self, delta: str, *, final: bool = False):
+                self._buf += delta
+                out = []
+                while True:
+                    if self.state != "call":
+                        self._call_parts.clear()
+                        return out + super().feed("", final=final)
+                    i = call_end(self._buf, final=final) if CALL_END in self._buf else -1
+                    if self.stream_tools:
+                        if i >= 0:
+                            whole, self._buf = self._buf, self._buf[:i + len(CALL_END)]
+                            out += self._scan(final=True)
+                            out += self._close_scan()
+                            self._buf = whole
+                        else:
+                            out += self._scan(final=final)
+                    if i < 0:
+                        return out
+                    body = self._buf[:i]
+                    self._buf = self._buf[i + len(CALL_END):]
+                    name = body.strip()[len("<function="):].split(">", 1)[0]
+                    try:
+                        call = parse_tool_call(body, self.schemas.get(name))
+                    except ValueError:
+                        out.append(Event("content", CALL_START + body + CALL_END))
+                        self._reset_scan()
+                        self.state, self.lead = "content", True
+                        continue
+                    if self.scall is not None:
+                        call.id = self.scall.id
+                    out.append(Event("tool_call", call=call))
+                    self._reset_scan()
+                    self.state, self.lead = "content", True
+
+        def sig(evts):
+            return [(e.kind, e.text, e.call.name if e.call else None, e.call.arguments if e.call else None)
+                    for e in evts]
+
+        raw_schema = {"name": "write", "parameters": {"properties": {
+            "path": {"type": "string"}, "content": {"type": "string"}, "meta": {"type": "object"}}}}
+        samples = [
+            *[call_text(v) for v in VALUES.values()],
+            call_text(VALUES["whole close inside"]) + "\n" + call_text("two"),
+            call_text(VALUES["unclosed function with parameter"]) + "\nnow the second:\n" + call_text("two"),
+            call_text("one") + "\nprose between\n" + call_text("two") + "\ndone.",
+            f"plan\n</think>\n\n{CALL_START}\n{FUNC_START}write>\n{PARAM_START}meta>\n"
+            f'{{"note": "a {PARAM_END} b {CALL_END} c", "nums": [1, 2, 3]}}\n{PARAM_END}\n'
+            f"{PARAM_START}content>\nhello\n{PARAM_END}\n{FUNC_END}\n{CALL_END}\ntail",
+            f"{CALL_START}\nnot a call\n{CALL_END}\nafter",
+            f"{CALL_START}\n{FUNC_START}write>\n{PARAM_START}path>\na.txt\n{PARAM_END}\n{FUNC_END}",
+        ]
+        for idx, text in enumerate(samples):
+            thinking = "</think>" in text
+            for tools in ([raw_schema], None):
+                for stream in (False, True):
+                    for step in (1, 3, 7, 19, len(text)):
+                        with self.subTest(idx=idx, tools=bool(tools), stream=stream, step=step):
+                            fast = OutputParser(thinking=thinking, tools=tools, stream_tools=stream)
+                            ref = ReferenceOutputParser(thinking=thinking, tools=tools, stream_tools=stream)
+                            for pos in range(0, len(text), step):
+                                chunk = text[pos:pos + step]
+                                self.assertEqual(sig(fast.feed(chunk)), sig(ref.feed(chunk)))
+                            self.assertEqual(sig(fast.finish()), sig(ref.finish()))
+
+        # O(N) performance verification under stream_tools=True for 64 KiB raw JSON, quoted </tool_call>, and quoted whole-close.
+        big_json = json.dumps({"items": ["x" * 16 for _ in range(3000)]})
+        big_str = "abcd" * 16000
+        cases = [
+            (f"{CALL_START}\n{FUNC_START}write>\n{PARAM_START}meta>\n{big_json}\n{PARAM_END}\n{FUNC_END}\n{CALL_END}",
+             [raw_schema], "raw_json"),
+            (f"{CALL_START}\n{FUNC_START}write>\n{PARAM_START}content>\nquoted {CALL_END}\n{big_str}\n{PARAM_END}\n{FUNC_END}\n{CALL_END}",
+             [raw_schema], "quoted_call_end"),
+            (f"{CALL_START}\n{FUNC_START}write>\n{PARAM_START}content>\n{PARAM_END}\n{FUNC_END}\n{CALL_END}\n{big_str}\n{PARAM_END}\n{FUNC_END}\n{CALL_END}",
+             [raw_schema], "quoted_whole_close"),
+        ]
+        for payload, tools, label in cases:
+            with self.subTest(perf=label):
+                p = OutputParser(thinking=False, tools=tools, stream_tools=True)
+                t0 = time.monotonic()
+                evts = []
+                for pos in range(0, len(payload), 4):
+                    evts.extend(p.feed(payload[pos:pos + 4]))
+                evts.extend(p.finish())
+                dt = time.monotonic() - t0
+                calls = [e.call for e in evts if e.kind == "tool_call"]
+                self.assertEqual(len(calls), 1)
+                streamed = "".join(e.text for e in evts if e.kind == "tool_args")
+                self.assertEqual(json.loads(streamed), calls[0].arguments)
+                self.assertLess(dt, 2.0, f"{label} took {dt:.2f}s (expected O(N) < 2s)")
+
 
 if __name__ == "__main__":
     unittest.main()
