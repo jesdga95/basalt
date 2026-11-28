@@ -5,9 +5,17 @@
 #include "basalt/platform/memory.hpp"
 #include "basalt/platform/system.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <string>
+#include <thread>
+
+#if !defined(_WIN32)
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #if defined(_WIN32)
 #include "basalt/platform/win.hpp"
@@ -67,6 +75,31 @@ int main() {
 
     const std::string os = host_os_name();
     check(gpu_memory_pages() == (os == "Windows" || os == "WSL2"), "gpu_memory_pages: only the Windows driver pages");
+#if !defined(_WIN32)
+    // A whole core of busy work outside this process must read as about one external core: `busy` minus `self`
+    // minus the kernel workers may drop a term or double-count one, and the governor would then shed or not shed
+    // on a wrong number. Kernel reclaim workers are excluded on purpose; a spinner excludes that doubt too,
+    // because the kernel does not reclaim in a pure-CPU child.
+    if (ExternalCpuLoad probe; true) {
+        check(probe.sample() == 0, "ExternalCpuLoad's first sample is the zero interval");
+        if (const pid_t kid = fork(); kid == 0) {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(1200);
+            volatile double sink = 1;
+            while (std::chrono::steady_clock::now() < until) sink = sink * 1.0000001 + 1;
+            _exit(0);
+        } else if (kid > 0) {
+            double peak = 0;
+            for (int i = 0; i < 14; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                peak = std::max(peak, probe.sample());
+            }
+            int status = 0;
+            waitpid(kid, &status, 0);
+            check(peak > 0.6 && peak < 1.8, "one busy child core reads as about one external core (peak)");
+        } else
+            check(false, "ExternalCpuLoad: fork failed");
+    }
+#endif
     const DynLib nvml = DynLib::open_nvml();
     if (nvml) {
         check(nvml.sym<void*>("nvmlInit_v2") != nullptr, "the management library, when present, exports nvmlInit_v2");
