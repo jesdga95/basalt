@@ -940,6 +940,8 @@ def main():
     a = ap.parse_args()
     if a.mlp_nvfp4 and (not a.checkpoint or a.sections_from or a.requant_dense_q6k):
         ap.error("--mlp-nvfp4 goes with a gemma4 --checkpoint")
+    if a.experts_mxfp8 and (not a.checkpoint or a.sections_from):
+        ap.error("--experts-mxfp8 goes with a gemma4 --checkpoint")
     if a.into or a.roll_back or a.undo_dir:
         if not a.into or not a.undo_dir or bool(a.dspark) + bool(a.dfly) + a.roll_back != 1 or a.out or a.gguf or a.sections_from or a.checkpoint or a.requant_dense_q6k or a.dflash2:
             ap.error("--into takes --undo-dir and one of --dspark, --dfly or --roll-back, and nothing else")

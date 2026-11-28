@@ -297,7 +297,10 @@ bool TierExperts::begin_window(cudaStream_t stream, std::string& err) {
 void TierExperts::ring(int l, int rows, const float* xr, const float* w, const int32_t* ids, cudaStream_t stream) {
     Impl& p = *impl_;
     moe_ring(ids, rows, p.k, tab(l), xr, w, p.width, l, p.x_dev, p.ids_dev, p.bell_dev, p.seq, stream);
-    cudaMemcpyAsync(p.d_log + (size_t) l * kMoePairs, ids, (size_t) rows * p.k * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream);
+    if (const cudaError_t ce = cudaMemcpyAsync(p.d_log + (size_t) l * kMoePairs, ids, (size_t) rows * p.k * sizeof(int32_t),
+                                               cudaMemcpyDeviceToDevice, stream);
+        ce != cudaSuccess)
+        p.fail(std::string("choice log copy: ") + cudaGetErrorString(ce));
 }
 
 void TierExperts::merge(int l, int rows, const int32_t* ids, float* out, cudaStream_t stream) {
@@ -305,7 +308,10 @@ void TierExperts::merge(int l, int rows, const int32_t* ids, float* out, cudaStr
     moe_merge(ids, rows, p.k, tab(l), p.out_dev, out, p.width, p.bell_dev, p.seq, stream);
     cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
     cudaStreamIsCapturing(stream, &cs);   // a captured window records the event as its own node
-    cudaEventRecordWithFlags(p.done_ev[(size_t) l], stream, cs == cudaStreamCaptureStatusActive ? cudaEventRecordExternal : cudaEventRecordDefault);
+    if (const cudaError_t ce = cudaEventRecordWithFlags(p.done_ev[(size_t) l], stream,
+                                                        cs == cudaStreamCaptureStatusActive ? cudaEventRecordExternal : cudaEventRecordDefault);
+        ce != cudaSuccess)
+        p.fail(std::string("merge event: ") + cudaGetErrorString(ce));
 }
 
 void TierExperts::issue_copies() {
@@ -318,7 +324,10 @@ void TierExperts::end_window(int rows, cudaStream_t stream) {
     Impl& p = *impl_;
     if (!p.off) return;
     p.log_rows = rows;
-    cudaMemcpyAsync(p.h_log, p.d_log, (size_t) p.n_layers * kMoePairs * sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
+    if (const cudaError_t ce = cudaMemcpyAsync(p.h_log, p.d_log, (size_t) p.n_layers * kMoePairs * sizeof(int32_t),
+                                               cudaMemcpyDeviceToHost, stream);
+        ce != cudaSuccess)
+        p.fail(std::string("choice log read-back: ") + cudaGetErrorString(ce));
 }
 
 bool TierExperts::prompt_begin(cudaStream_t stream, std::string& err) {
