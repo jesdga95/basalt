@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -36,14 +37,25 @@ class Arena {
 public:
     ~Arena();
     bool reserve(size_t bytes);
-    template <class T> T* take(size_t n) { return static_cast<T*>(take_bytes(n * sizeof(T))); }
+    template <class T> T* take(size_t n) {
+        if constexpr (sizeof(T) > 1) {
+            if (n > std::numeric_limits<size_t>::max() / sizeof(T)) {
+                failed_ = true;
+                return nullptr;
+            }
+        }
+        return static_cast<T*>(take_bytes(n * sizeof(T)));
+    }
     void* take_bytes(size_t n);
     void rewind(size_t mark) { used_ = mark; }
     size_t mark() const { return used_; }
     size_t size() const { return size_; }
+    bool ok() const { return !failed_; }
 private:
     uint8_t* base_ = nullptr;
     size_t size_ = 0, used_ = 0;
+    int device_ = -1;
+    bool failed_ = false;
 };
 
 /// A batch window's device table: per window row its GDN segment, where its GDN rows go in its session, per segment its
@@ -159,6 +171,7 @@ public:
     SplitHand* hand = nullptr;                   // the layer split's decode hand-off, on both cards' models (null: none)
     Model* split_model = nullptr;                // the split's second card's model, and its CUDA device
     int split_dev = -1;
+    int device = -1;                             // the CUDA device this model's resources live on
     ~Model();
     bool ensure_chunk(std::string& err);
     /// llama.cpp's MMQ readied for every product of the model (its kernels loaded for each format and height).

@@ -51,8 +51,13 @@ struct BatchShared {
 class BatchSession : public ModelSession {
 public:
     Result decode_batch(ModelSession* const* peers, const DecodeRequest* reqs, int n) final {
-        if (n == 1) return peers[0]->decode_window(reqs[0]);
         const std::string who = batch_name();
+        if (n <= 0 || peers == nullptr || reqs == nullptr)
+            return {Status::Error, who + ": an empty or null batch"};
+        if (n == 1) {
+            if (peers[0] == nullptr) return {Status::Error, who + ": a null session in a batch"};
+            return peers[0]->decode_window(reqs[0]);
+        }
         std::vector<BatchSession*> ss;
         for (int i = 0; i < n; ++i) {
             BatchSession* s = dynamic_cast<BatchSession*>(peers[i]);
@@ -73,9 +78,17 @@ public:
         // every session readies first (what each queues on its own stream runs side by side), then the shared scratch and
         // the caches are the leader's stream's: whatever another session queued has run
         for (int i = 0; i < n; ++i)
-            if (!ss[(size_t) i]->batch_reserve(reqs[i], err)) return {Status::Refused, who + ": " + err};
+            if (!ss[(size_t) i]->batch_reserve(reqs[i], err)) {
+                for (int j = 0; j <= i; ++j) (void) cudaStreamSynchronize(ss[(size_t) j]->batch_stream());
+                (void) cudaGetLastError();
+                return {Status::Refused, who + ": " + err};
+            }
         for (int i = 1; i < n; ++i)
-            if (cudaStreamSynchronize(ss[(size_t) i]->batch_stream()) != cudaSuccess) return {Status::Error, who + ": a session's stream failed"};
+            if (cudaStreamSynchronize(ss[(size_t) i]->batch_stream()) != cudaSuccess) {
+                for (int j = i + 1; j < n; ++j) (void) cudaStreamSynchronize(ss[(size_t) j]->batch_stream());
+                (void) cudaGetLastError();
+                return {Status::Error, who + ": a session's stream failed"};
+            }
         std::vector<int> head((size_t) n, 0);
         for (int i = 0; i < n; ++i) {
             const DecodeRequest& r = reqs[i];
@@ -83,14 +96,23 @@ public:
         }
         const BatchView v{w, ss.data(), reqs, head.data(), n, st};
         GraphLru<core::CapturedGraph>::Key key;
-        if (!batch_stage(v, key, err)) return {Status::Error, who + ": " + err};
-        struct End {   // every exit after the stage ends the window (batch_end): an early one here, the last after its sync
+        if (!batch_stage(v, key, err)) {
+            (void) cudaStreamSynchronize(st);
+            (void) cudaGetLastError();
+            return {Status::Error, who + ": " + err};
+        }
+        struct End {   // every exit after the stage drains the stream and ends the window (batch_end)
             BatchSession& s;
+            cudaStream_t stream;
             bool open = true;
             ~End() {
-                if (open) s.batch_end(std::nullopt);
+                if (open) {
+                    (void) cudaStreamSynchronize(stream);
+                    (void) cudaGetLastError();
+                    s.batch_end(std::nullopt);
+                }
             }
-        } end{*this};
+        } end{*this, st};
         if (batch_key_per_seg()) {
             for (int i = 0; i < n; ++i)
                 key.insert(key.end(), {(uint64_t) (uintptr_t) ss[(size_t) i], (uint64_t) w.segs[(size_t) i].rows, (uint64_t) head[(size_t) i]});
@@ -100,10 +122,7 @@ public:
         }
         BatchShared& sh = batch_shared();
         if (!batch_captured()) {
-            if (!batch_forward(v, err)) {
-                cudaStreamSynchronize(st);
-                return {Status::Error, who + ": " + err};
-            }
+            if (!batch_forward(v, err)) return {Status::Error, who + ": " + err};
         } else if (core::CapturedGraph* g = sh.graphs.find(key)) {
             if (!g->launch(st, err)) return {Status::Error, who + ": " + err};
         } else if (uint8_t* seen = sh.seen.find(key); seen == nullptr) {
