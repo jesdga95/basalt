@@ -110,8 +110,10 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
     if (const Json* kv = meta.get("gguf_kv"))
         if (const Json* t = kv->get("tokenizer.ggml.tokens")) g.n_vocab = (int) t->count;
     if (g.n_vocab == 0) g.n_vocab = u("vocab_size");
-    if (g.n_layers <= 0 || g.n_embd <= 0 || g.n_expert <= 0 || (int) g.heads.size() < g.n_layers ||
-        (int) g.swa.size() < g.n_layers || (int) g.indexed.size() < g.n_layers) {
+    if (g.n_layers <= 0 || g.n_embd <= 0 || g.n_embd % 32 != 0 || g.n_vocab <= 0 || g.n_expert <= 0 ||
+        g.n_dense < 0 || g.n_dense >= g.n_layers || (g.n_dense > 0 && g.n_ff <= 0) || g.q_lora <= 0 ||
+        g.n_used <= 0 || g.n_used > g.n_expert || g.window <= 0 ||
+        (int) g.heads.size() < g.n_layers || (int) g.swa.size() < g.n_layers || (int) g.indexed.size() < g.n_layers) {
         err = path + ": meta.geometry is incomplete";
         return false;
     }
@@ -121,18 +123,31 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
     g.clamp_exp.resize((size_t) g.n_layers, 10.0f);
     // the layouts this engine runs: four identity streams, one latent for both layer kinds, an indexer on every layer
     // that is not a window layer, experts that run in a latent
-    if (g.hc_mult != 4 || g.qk_dim != 256 ||g.kv_lora != 512 || g.rope_dim != 64 || g.v_dim != 256 ||
+    if (g.hc_mult != 4 || g.qk_dim != 256 || g.kv_lora != 512 || g.rope_dim != 64 || g.v_dim != 256 ||
         g.qk_dim - g.rope_dim != 192 || g.n_latent <= 0 || g.n_ff_exp != g.n_latent || g.n_shared != 1 || g.idx_pool != 4 ||
         g.idx_dim != 128 || g.n_used > 16 || g.n_expert > 512) {
         err = path + ": a Hy4-flash layout this engine does not run (4 streams, MLA 192 + 64 over a 512 latent, a 1536 latent "
                      "for the experts, indexer keys of 128 pooled by 4)";
         return false;
     }
-    for (int l = 0; l < g.n_layers; ++l)
+    bool any_indexed = false;
+    for (int l = 0; l < g.n_layers; ++l) {
+        if (g.heads[(size_t) l] <= 0 || g.heads[(size_t) l] % 8 != 0) {
+            err = path + ": layer " + std::to_string(l) + " has an invalid attention head count";
+            return false;
+        }
         if (g.swa[(size_t) l] == g.indexed[(size_t) l]) {
             err = path + ": layer " + std::to_string(l) + " is neither a window layer nor an indexed one, or both";
             return false;
         }
+        any_indexed = any_indexed || g.indexed[(size_t) l];
+    }
+    if (any_indexed &&
+        (g.idx_heads <= 0 || g.idx_top_k <= 0 || g.idx_top_k % g.idx_pool != 0 ||
+         g.idx_top_k / g.idx_pool - (g.idx_select_tail ? 1 : 0) < 1)) {
+        err = path + ": meta.geometry has invalid indexer parameters";
+        return false;
+    }
 
     p.vision = p.file.range("vision/mmproj");
     for (const auto& [name, t] : tj->members) {
@@ -149,7 +164,12 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
             err = path + ": tensor " + name + " names a missing section " + section;
             return false;
         }
-        r.offset = sec->offset + t.get("offset")->u64();
+        const Json* off = t.get("offset");
+        if (!off || !off->is_number() || off->neg) {
+            err = path + ": tensor " + name + " has no offset";
+            return false;
+        }
+        r.offset = sec->offset + off->u64();
         p.tensors.emplace(name, std::move(r));
     }
 
@@ -160,14 +180,20 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
         std::istringstream in(std::string(text.begin(), text.end()));
         std::string line;
         p.experts.assign((size_t) g.n_layers, ExpertLayer{});
-        int seen = 0;
+        int seen = 0, version = 0;
         while (std::getline(in, line)) {
+            if (line.rfind("# experts v", 0) == 0) version = std::atoi(line.c_str() + 11);
             if (line.empty() || line[0] == '#') continue;
             std::istringstream ls(line);
-            long long l, gu, d;
+            long long l, gu, d, up = -1;
             unsigned long long off, by;
-            if (!(ls >> l >> gu >> d >> off >> by) || l < 0 || l >= g.n_layers) {
+            if (!(ls >> l >> gu >> d >> off >> by) || l < g.n_dense || l >= g.n_layers || by == 0 ||
+                p.experts[(size_t) l].present || (version >= 7 && !(ls >> up))) {
                 err = "experts.layout: bad line '" + line + "'";
+                return false;
+            }
+            if (version >= 7 && up != gu) {   // v7: the up rows' type; this model's kernels take one gate/up type
+                err = "experts.layout: layer " + std::to_string(l) + "'s gate and up differ in type";
                 return false;
             }
             p.experts[(size_t) l] = {true, (int) gu, (int) d, off, by};
@@ -182,16 +208,20 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
 
     if (const Json* ej = meta.get("engram"); ej && ej->is_object()) {
         EngramInfo& e = p.engram;
-        const core::ModelFile::Section* sec = p.file.find(ej->get("section") ? ej->get("section")->s : "engram");
-        if (!sec || num_or(ej->get("type_id"), 0) != 43) {
-            err = path + ": meta.engram has no section or is not F8_E4M3 rows";
+        const Json* sj = ej->get("section");
+        const core::ModelFile::Section* sec = p.file.find(sj && sj->is_string() ? sj->s : "engram");
+        const Json *rj = ej->get("rows"), *rbj = ej->get("row_bytes"), *rvj = ej->get("row_values");
+        if (!sec || num_or(ej->get("type_id"), 0) != 43 || !rj || !rj->is_number() || rj->neg ||
+            !rbj || !rbj->is_number() || rbj->neg || !rvj || !rvj->is_number() || rvj->neg) {
+            err = path + ": meta.engram has no section, missing table geometry, or is not F8_E4M3 rows";
             return false;
         }
         e.present = true;
         e.file_offset = sec->offset;
-        e.rows = ej->get("rows")->u64();
-        e.row_bytes = (uint32_t) ej->get("row_bytes")->u64();
-        e.row_values = (int) ej->get("row_values")->u64();
+        e.rows = rj->u64();
+        const uint64_t rb = rbj->u64(), rv = rvj->u64();
+        e.row_bytes = (uint32_t) rb;
+        e.row_values = (int) rv;
         for (double d : numbers(ej->get("ple.layers"))) e.layers.push_back((int) d);
         e.n_gram = (int) num_or(ej->get("ple.ngram_size"), 3);
         e.n_head = (int) num_or(ej->get("ple.heads_per_ngram"), 8);
@@ -200,10 +230,25 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
         e.primes = unsigneds(ej->get("ple.head_vocab_sizes"));
         e.offsets = unsigneds(ej->get("ple.head_offsets"));
         const size_t ne = e.layers.size();
-        if (e.row_bytes != (uint32_t) e.row_values || e.mult.size() != ne * (size_t) e.n_gram ||
+        if (e.rows == 0 || rv == 0 || rv > (uint64_t) g.n_embd || rb != rv ||
+            e.n_gram < 2 || e.n_gram > 3 || e.n_head <= 0 || e.n_head > g.n_embd ||
+            (int64_t) e.n_cols() * e.row_values > g.n_embd ||
+            e.mult.size() != ne * (size_t) e.n_gram ||
             e.primes.size() != ne * (size_t) e.n_cols() || e.offsets.size() != e.primes.size()) {
-            err = path + ": the Engram hash arrays do not match its layer count";
+            err = path + ": the Engram hash arrays or table geometry are invalid";
             return false;
+        }
+        for (int l : e.layers) {
+            if (l < 0 || l >= g.n_layers) {
+                err = path + ": meta.engram names an out-of-range layer " + std::to_string(l);
+                return false;
+            }
+        }
+        for (size_t i = 0; i < e.primes.size(); ++i) {
+            if (e.primes[i] == 0 || e.offsets[i] >= e.rows || e.primes[i] > e.rows - e.offsets[i]) {
+                err = path + ": meta.engram has a zero prime or out-of-range head offset";
+                return false;
+            }
         }
         std::vector<uint8_t> raw;
         if (!p.file.read("meta", raw, err)) return false;
