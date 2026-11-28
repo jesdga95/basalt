@@ -262,7 +262,7 @@ private:
     Pack pack_;
     model::ModelDesc desc_;
     std::vector<LayerWeights> layers_;
-    std::vector<void*> dev_;                 ///< every device allocation, freed with the model
+    std::vector<std::pair<int, void*>> dev_; ///< (device, allocation), freed with the model
     uint8_t* head_ = nullptr;
     uint16_t* embd_host_ = nullptr;          ///< pinned, mapped
     uint16_t* embd_dev_ = nullptr;           ///< its device address
