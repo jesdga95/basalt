@@ -25,6 +25,7 @@
 #include <cuda_runtime.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 
@@ -402,7 +403,8 @@ __global__ void __launch_bounds__(256) quantize_kernel(const In* __restrict__ x,
         float t = 0.0f;
         for (int i = 0; i < 8; ++i) t = fmaxf(t, red[i]);
         scale[blockIdx.x] = t / 448.0f;
-        inv_s = t > 0.0f ? 448.0f / t : 0.0f;
+        const float raw_inv = t > 0.0f ? 448.0f / t : 0.0f;
+        inv_s = isfinite(raw_inv) ? raw_inv : 0.0f;
     }
     __syncthreads();
     const float inv = inv_s;

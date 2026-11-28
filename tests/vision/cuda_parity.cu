@@ -500,7 +500,7 @@ int main(int argc, char** argv) {
         test_elementwise();
         test_attention();
     } else if (argc >= 4 && !std::strcmp(argv[1], "encoder")) {
-        run_encoder(argv[2], argv[3]);
+        if (run_encoder(argv[2], argv[3]) != 0) return 2;
     } else if (argc >= 4 && !std::strcmp(argv[1], "video")) {
         if (run_video(argv[2], argv[3]) != 0) return 2;
     } else {

@@ -107,24 +107,23 @@ float f16(float v) { return ggml_fp16_to_fp32(ggml_fp32_to_fp16(v)); }
 // the FP4 activation rounding (quantize_kernel in moe_fp4.cu): token scale g = amax / (6 * 448), per 16 values a UE4M3
 // scale of block amax / (6 g), codes rounded to nearest even on x / (scale * g)
 float e4m3_round(float v) {
-    static float tab[127];
-    static bool init = false;
-    if (!init) {
+    static const std::array<float, 127> tab = [] {
+        std::array<float, 127> t{};
         for (int c = 0; c < 127; ++c) {
             const int e = c >> 3, m = c & 7;
-            tab[c] = e == 0 ? std::ldexp((float) m, -9) : std::ldexp(1.0f + m / 8.0f, e - 7);
+            t[(size_t) c] = e == 0 ? std::ldexp((float) m, -9) : std::ldexp(1.0f + m / 8.0f, e - 7);
         }
-        init = true;
-    }
+        return t;
+    }();
     if (!(v > 0.0f)) return 0.0f;
     if (v >= 448.0f) return 448.0f;
     int lo = 0, hi = 126;   // the largest code at or below v
     while (hi > lo) {
         const int mid = (lo + hi + 1) >> 1;
-        if (tab[mid] <= v) lo = mid; else hi = mid - 1;
+        if (tab[(size_t) mid] <= v) lo = mid; else hi = mid - 1;
     }
-    if (lo == 126) return tab[lo];
-    const float a = tab[lo], b = tab[lo + 1], mid = 0.5f * (a + b);
+    if (lo == 126) return tab[(size_t) lo];
+    const float a = tab[(size_t) lo], b = tab[(size_t) (lo + 1)], mid = 0.5f * (a + b);
     return v < mid ? a : v > mid ? b : (lo & 1 ? b : a);
 }
 float e2m1_round(float v) {
@@ -444,10 +443,10 @@ bool split_equivalence(const char* name, const Layer& L, const float* x_dev, con
     const int64_t rows = (int64_t) L.T * K;
     const size_t n = L.order.size(), groups = (n + GROUP - 1) / GROUP;
     Dev src_dev((size_t) rows * 4);
-    ck(cudaMemcpy(src_dev.p, L.src.data(), L.src.size() * 4, cudaMemcpyHostToDevice), "src");
+    ck(cudaMemcpyAsync(src_dev.p, L.src.data(), L.src.size() * 4, cudaMemcpyHostToDevice, s), "src");
     Bufs b(rows, L.bh.size());
     F4 f(rows, n);
-    ck(cudaMemset(b.dm.p, 0xff, (size_t) rows * N * 4), "clr");
+    ck(cudaMemsetAsync(b.dm.p, 0xff, (size_t) rows * N * 4, s), "clr");
     run_fp4(f, b, L, x_dev, src_dev.as<int32_t>(), blob, s);
     ck(cudaStreamSynchronize(s), "sync abs");
     const std::vector<float> ref = download(b.dm, (size_t) rows * N);
@@ -457,7 +456,7 @@ bool split_equivalence(const char* name, const Layer& L, const float* x_dev, con
     int runs_unsplit = 0, runs_small = 0;
     for (int64_t cap : {(int64_t) 1 << 40, (int64_t) 2 * 64 + 1, (int64_t) 65, maxcnt, (int64_t) 1}) {
         F4Run r(std::min<int64_t>(rows, std::max(cap, maxcnt)));
-        ck(cudaMemset(b.dm.p, 0xff, (size_t) rows * N * 4), "clr");
+        ck(cudaMemsetAsync(b.dm.p, 0xff, (size_t) rows * N * 4, s), "clr");
         bool guards = true;
         const int runs = run_fp4_group(f, r, b, L, x_dev, src_dev.as<int32_t>(), blob, cap, guards, s);
         const std::vector<float> y = download(b.dm, (size_t) rows * N);
@@ -500,15 +499,15 @@ bool edge_activations(const std::vector<std::vector<uint8_t>>& host, const std::
         t7[c] = c == 1234 ? 1e-30f : 0.0f;
     }
     Dev x_dev((size_t) R * N * 4);
-    ck(cudaMemcpy(x_dev.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
+    ck(cudaMemcpyAsync(x_dev.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice, s), "x");
     const int32_t bounds[2] = {0, R};
     Dev bd(8);
-    ck(cudaMemcpy(bd.p, bounds, 8, cudaMemcpyHostToDevice), "bounds");
+    ck(cudaMemcpyAsync(bd.p, bounds, 8, cudaMemcpyHostToDevice, s), "bounds");
     F4 f(R, 1);
     fp4::plan(bd.as<int32_t>(), 1, f.tox.as<int32_t>(), s);
     fp4::quantize(x_dev.as<float>(), nullptr, bd.as<int32_t>(), f.tox.as<int32_t>(), 1, f.a4x.p, f.gsx.as<float>(), N, N, R, s);
     Dev gu((size_t) R * 1280 * 4);
-    ck(cudaMemset(gu.p, 0xff, gu.bytes), "clr");
+    ck(cudaMemsetAsync(gu.p, 0xff, gu.bytes, s), "clr");
     fp4::Product p;
     p.blob[0] = blob[0];
     p.w_off = 0; p.w_rows = 1280; p.w_cols = N; p.n = 1;
@@ -550,7 +549,7 @@ bool edge_activations(const std::vector<std::vector<uint8_t>>& host, const std::
         std::vector<float> xk((size_t) RK * N);
         for (int i = 0; i < RK; ++i) std::memcpy(xk.data() + (size_t) i * N, x.data() + (size_t) keep[i] * N, N * 4);
         Dev xk_dev(xk.size() * 4);
-        ck(cudaMemcpy(xk_dev.p, xk.data(), xk.size() * 4, cudaMemcpyHostToDevice), "x");
+        ck(cudaMemcpyAsync(xk_dev.p, xk.data(), xk.size() * 4, cudaMemcpyHostToDevice, s), "x");
         Layer L;
         L.T = RK;
         L.E = 1;
@@ -562,12 +561,12 @@ bool edge_activations(const std::vector<std::vector<uint8_t>>& host, const std::
         L.bh = {0, RK, 0, RK};
         // rows = T * K in the helpers: this layer has RK rows, so describe it with K = 1 rows by hand
         Dev src_dev((size_t) RK * 4), bdev(L.bh.size() * 4), dm((size_t) RK * N * 4);
-        ck(cudaMemcpy(src_dev.p, L.src.data(), RK * 4, cudaMemcpyHostToDevice), "src");
-        ck(cudaMemcpy(bdev.p, L.bh.data(), L.bh.size() * 4, cudaMemcpyHostToDevice), "bounds");
+        ck(cudaMemcpyAsync(src_dev.p, L.src.data(), RK * 4, cudaMemcpyHostToDevice, s), "src");
+        ck(cudaMemcpyAsync(bdev.p, L.bh.data(), L.bh.size() * 4, cudaMemcpyHostToDevice, s), "bounds");
         F4 fk(RK, 1);
         fp4::quantize_tokens(xk_dev.as<float>(), RK, N, N, fk.a4x.p, fk.gsx.as<float>(), s);
         F4Run r(RK);
-        ck(cudaMemset(dm.p, 0xff, dm.bytes), "clr");
+        ck(cudaMemsetAsync(dm.p, 0xff, dm.bytes, s), "clr");
         fp4::Group g;
         g.n = 1;
         g.blob[0] = blob[0];
@@ -630,15 +629,14 @@ int parity(cudaStream_t s) {
     run_mmq(ctx, b, L, x_dev.as<float>(), src_dev.as<int32_t>(), blob, false, s);
     ck(cudaStreamSynchronize(s), "sync");
     const std::vector<float> y1 = download(b.dm, (size_t) rows * N);
-    ck(cudaMemset(b.dm.p, 0xff, (size_t) rows * N * 4), "sentinel");
-    ck(cudaMemset(b.scales(), 0xff, GROUP * 16), "sentinel");
-    ck(cudaDeviceSynchronize(), "sentinel");
+    ck(cudaMemsetAsync(b.dm.p, 0xff, (size_t) rows * N * 4, s), "sentinel");
+    ck(cudaMemsetAsync(b.scales(), 0xff, GROUP * 16, s), "sentinel");
     run_mmq(ctx, b, L, x_dev.as<float>(), src_dev.as<int32_t>(), blob, true, s);
     ck(cudaStreamSynchronize(s), "sync");
     const std::vector<float> y = download(b.dm, (size_t) rows * N), ygu = download(b.gu, (size_t) rows * 1280);
     F4 f4(rows, L.order.size());
-    ck(cudaMemset(b.dm.p, 0, (size_t) rows * N * 4), "clr");
-    ck(cudaMemset(b.gu.p, 0, (size_t) rows * 1280 * 4), "clr");
+    ck(cudaMemsetAsync(b.dm.p, 0, (size_t) rows * N * 4, s), "clr");
+    ck(cudaMemsetAsync(b.gu.p, 0, (size_t) rows * 1280 * 4, s), "clr");
     run_fp4(f4, b, L, x_dev.as<float>(), src_dev.as<int32_t>(), blob, s);
     ck(cudaStreamSynchronize(s), "sync fp4");
     const std::vector<float> fy = download(b.dm, (size_t) rows * N), fgu = download(b.gu, (size_t) rows * 1280),
@@ -647,7 +645,7 @@ int parity(cudaStream_t s) {
     // the production gate/up: token planes, SwiGLU in the epilogue; H must be the plain product + mmq::swiglu's bits
     const bool planes_ok = token_planes_match(f4, L, x_dev.as<float>(), src_dev.as<int32_t>(), s);
     Dev hf_dev((size_t) rows * FF * 4);
-    ck(cudaMemset(hf_dev.p, 0xff, hf_dev.bytes), "clr");
+    ck(cudaMemsetAsync(hf_dev.p, 0xff, hf_dev.bytes, s), "clr");
     run_fused_h(f4, b, L, x_dev.as<float>(), src_dev.as<int32_t>(), blob, hf_dev.as<float>(), s);
     ck(cudaStreamSynchronize(s), "sync fused");
     const std::vector<float> hf = download(hf_dev, (size_t) rows * FF);
@@ -773,8 +771,8 @@ int parity(cudaStream_t s) {
         Layer L2 = L;
         for (int e = 0; e < E; ++e) std::reverse(L2.src.begin() + L.off[(size_t) e], L2.src.begin() + L.off[(size_t) e + 1]);
         Dev src2((size_t) rows * 4);
-        ck(cudaMemcpy(src2.p, L2.src.data(), L2.src.size() * 4, cudaMemcpyHostToDevice), "src2");
-        ck(cudaMemset(b.dm.p, 0xff, (size_t) rows * N * 4), "clr");
+        ck(cudaMemcpyAsync(src2.p, L2.src.data(), L2.src.size() * 4, cudaMemcpyHostToDevice, s), "src2");
+        ck(cudaMemsetAsync(b.dm.p, 0xff, (size_t) rows * N * 4, s), "clr");
         run_fp4(f4, b, L2, x_dev.as<float>(), src2.as<int32_t>(), blob, s);
         ck(cudaStreamSynchronize(s), "sync fp4 reversed");
         const std::vector<float> ry = download(b.dm, (size_t) rows * N);

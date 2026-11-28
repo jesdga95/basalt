@@ -102,8 +102,13 @@ __global__ void swiglu_kernel(const float* __restrict__ gu, float* __restrict__ 
     const float* row = gu + r * 2 * n_ff;
     float g = interleaved ? row[2 * k] : row[k], u = interleaved ? row[2 * k + 1] : row[n_ff + k];
     if (tail == nullptr) {
-        if constexpr (CAP) h[i] = __fmul_rn(__fmul_rn(cg * tanhf(g / cg), 1.0f / (1.0f + expf(-g))), cu * tanhf(u / cu));
-        else h[i] = g / (1.0f + __expf(-g)) * u;
+        if constexpr (CAP) {
+            const float gc = cg > 0.0f ? cg * tanhf(g / cg) : g;
+            const float uc = cu > 0.0f ? cu * tanhf(u / cu) : u;
+            h[i] = __fmul_rn(__fmul_rn(gc, 1.0f / (1.0f + expf(-g))), uc);
+        } else {
+            h[i] = g / (1.0f + __expf(-g)) * u;
+        }
         return;
     }
     // the row's expert: given, or the last q with bounds[q] <= r
@@ -114,8 +119,13 @@ __global__ void swiglu_kernel(const float* __restrict__ gu, float* __restrict__ 
     const float4 s = *(const float4*) ((const uint8_t*) tail + (size_t) q * tail_stride);   // {s_gate, s_up, s_down, -}
     g *= s.x;
     u *= s.y;
-    if constexpr (CAP) h[i] = __fmul_rn(__fmul_rn(cg * tanhf(g / cg), 1.0f / (1.0f + expf(-g))), cu * tanhf(u / cu)) * s.z;
-    else h[i] = g / (1.0f + __expf(-g)) * u * s.z;
+    if constexpr (CAP) {
+        const float gc = cg > 0.0f ? cg * tanhf(g / cg) : g;
+        const float uc = cu > 0.0f ? cu * tanhf(u / cu) : u;
+        h[i] = __fmul_rn(__fmul_rn(gc, 1.0f / (1.0f + expf(-g))), uc) * s.z;
+    } else {
+        h[i] = g / (1.0f + __expf(-g)) * u * s.z;
+    }
 }
 
 __global__ void iota_kernel(int32_t* dst, int64_t n) {
@@ -337,7 +347,7 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
     if (form.row_expert == nullptr && (bounds == nullptr || n <= 0)) tail = nullptr;
     const cudaStream_t s = (cudaStream_t) stream;
     const size_t ts = form.tail_stride ? form.tail_stride : sizeof(float4);
-    if (form.gate_softcap > 0.0f)
+    if (form.gate_softcap > 0.0f || form.up_softcap > 0.0f)
         swiglu_kernel<true><<<blocks(rows * n_ff), 256, 0, s>>>(gu, h, rows, n_ff, interleaved, (const float4*) tail, bounds, n,
                                                                 form.gate_softcap, form.up_softcap, form.row_expert, ts);
     else

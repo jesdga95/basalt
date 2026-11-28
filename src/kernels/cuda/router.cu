@@ -351,14 +351,17 @@ router_select_warp_kernel(const float* __restrict__ logits, const float* __restr
     for (int j = 0; j < EP; ++j) {
         s[j] = score(tl[lane + 32 * j], gate);
         b[j] = bias ? s[j] + bias_reg[j] : s[j];
+        if (isnan(b[j])) { b[j] = -INFINITY; s[j] = 0.f; }
     }
+    unsigned used = 0u;
     int sel_id = 0;
     float sel_s = 0.f;
     for (int r = 0; r < k; ++r) {
-        float bv = b[0], bs = s[0];
-        int bi = lane;
+        float bv = -INFINITY, bs = 0.f;
+        int bi = NE;
 #pragma unroll
-        for (int j = 1; j < EP; ++j) {
+        for (int j = 0; j < EP; ++j) {
+            if (used & (1u << j)) continue;
             const int idx = lane + 32 * j;
             if (b[j] > bv || (b[j] == bv && idx < bi)) {
                 bv = b[j];
@@ -381,9 +384,7 @@ router_select_warp_kernel(const float* __restrict__ logits, const float* __restr
             sel_id = bi;
             sel_s = bs;
         }
-#pragma unroll
-        for (int j = 0; j < EP; ++j)
-            if (bi == lane + 32 * j) b[j] = -INFINITY;
+        if ((bi & 31) == lane) used |= 1u << (bi >> 5);
     }
     if (gate == 2) {   // softmax over the chosen logits, the largest first
         const float x = expf(sel_s - __shfl_sync(0xffffffffu, sel_s, 0));
@@ -397,9 +398,22 @@ router_select_warp_kernel(const float* __restrict__ logits, const float* __restr
     }
     float sum = 0.f;
     for (int r = 0; r < k; ++r) sum += __shfl_sync(0xffffffffu, sel_s, r);
+    float w = 0.f;
+    if (isfinite(sum)) {
+        w = sel_s / (sum + 1e-20f) * scale;
+    } else {
+        const int n_inf = __popc(__ballot_sync(0xffffffffu, lane < k && isinf(sel_s)));
+        if (n_inf > 0) {
+            w = isinf(sel_s) ? (scale / (float) n_inf) : 0.f;
+        } else {
+            double dsum = 0.0;
+            for (int r = 0; r < k; ++r) dsum += (double) __shfl_sync(0xffffffffu, sel_s, r);
+            w = (float) ((double) sel_s / (dsum + 1e-20)) * scale;
+        }
+    }
     if (lane < k) {
         ids[(size_t) t * k + lane] = sel_id;
-        weights[(size_t) t * k + lane] = sel_s / (sum + 1e-20f) * scale;
+        weights[(size_t) t * k + lane] = w;
     }
 }
 

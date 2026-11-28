@@ -1,6 +1,7 @@
 #include "gpu.hpp"
 
 #include "basalt/core/card_link.hpp"
+#include "basalt/kernels/wait_abort.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/multi_gpu.hpp"
 #include "basalt/platform/memory.hpp"
@@ -107,6 +108,15 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
         const int pairs = basalt::core::enable_peer_access((int) gc.cards.size(), tried);
         if (tried > 0) basalt::log::info("basalt", "peer access: %d of %d ordered pairs enabled", pairs, tried);
     }
+    // Pre-allocate the 64-byte mapped wait-abort word on each chosen card before model loading claims VRAM/pinned RAM.
+    int prev = 0;
+    const bool have_prev = cudaGetDevice(&prev) == cudaSuccess;
+    if (!have_prev) (void) cudaGetLastError();
+    for (const auto& c : gc.cards) {
+        if (cudaSetDevice(c.device) == cudaSuccess) (void) basalt::kernels::wait_abort_try_init();
+        else (void) cudaGetLastError();
+    }
+    if (have_prev) (void) cudaSetDevice(prev);
     return std::nullopt;
 }
 
