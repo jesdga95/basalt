@@ -69,7 +69,7 @@ jobs:
             case "$f" in
               tools/tokenizer.py|tools/check_benchmarks.py|tools/iq_fixture.py)
                 native=true; shared_native=true; continue ;;   # CPU tests run these
-              serve/*|tools/*.py|tools/convert/*|tools/migrations/*|requirements*.txt|*.md|docs/*) continue ;;
+              serve/*|tools/*.py|tools/convert/*|tools/migrations/*|tools/quality_suite/*|requirements*.txt|*.md|docs/*) continue ;;
               .github/workflows/review.yml|.github/workflows/community*.yml|.github/workflows/pr-labels.yml|.github/workflows/ui-screenshot.yml) continue ;;
             esac
             native=true
@@ -113,8 +113,10 @@ jobs:
         run: python -m pip install -r requirements-test.txt pytest pytest-xdist
       - name: Server tests
         run: python -m pytest serve/tests -n auto -q
+      - name: Web UI tests
+        run: node serve/tests/test_web_logs.cjs
       - name: Tool tests
-        run: python -m pytest tools/test_bench_flags.py tools/test_bench_fixtures.py tools/test_serve_launcher.py tools/test_tokenizer.py tools/test_community_gate.py tools/test_community_sync.py tools/test_llm_review.py -q
+        run: python -m pytest tools/test_bench_flags.py tools/test_bench_fixtures.py tools/test_serve_launcher.py tools/test_tokenizer.py tools/test_community_gate.py tools/test_community_sync.py tools/test_llm_review.py tools/test_tools_fixes.py tools/test_iq_fixture.py tools/quality_suite/test_score.py -q
       - name: Converter tests
         run: python -m unittest discover -s tools/convert -p "test_*.py"
       - name: Migration tests

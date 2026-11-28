@@ -212,6 +212,71 @@ int main() {
         const int32_t answer[] = {7, 0, 1, 8, 9};
         CHECK(g.scan(answer, 5, 0) == -1);
     }
+    {   // "think": false without a grammar: only the thinking block is refused, right after a header
+        const PackVocab bv = load_blocks();
+        Guard g(bv);
+        CHECK(g.begin(R"({"kind":"text","think":false})", nullptr, 0, err) && g.on());
+        const int32_t ok[] = {5, 7, 10, 10, 8, 5, 10, 11, 9};   // text block, then a call-like block, then the end
+        CHECK(g.scan(ok, 9, 0) == -1);
+        Guard h(bv);
+        CHECK(h.begin(R"({"kind":"text","think":false})", nullptr, 0, err));
+        const int32_t bad[] = {5, 7, 10, 8, 5, 6};
+        CHECK(h.scan(bad, 6, 0) == 5);
+        Draws d{{7}, {}, {}};
+        int32_t tok = -1;
+        CHECK(h.redraw({}, d.draw(), d.read(), tok) == Redraw::drawn && tok == 7);
+        CHECK(std::isinf(d.masks[0][6]) && d.masks[0][5] == 0.0f && d.masks[0][7] == 0.0f);
+        const int64_t header[] = {5};
+        Guard p(bv);   // a prompt that ends with a header: the first token is the block's
+        CHECK(p.begin(R"({"kind":"text","think":false})", header, 1, err));
+        const int32_t first[] = {6};
+        CHECK(p.scan(first, 1, 0) == 0);
+        Guard t(bv);   // thinking on: the text kind refuses nothing
+        CHECK(t.begin(R"({"kind":"text"})", nullptr, 0, err) && !t.on());
+    }
+    {   // no calls: every block is a text block, the mask holds only its tag after a header
+        const PackVocab bv = load_blocks();
+        Guard g(bv);
+        CHECK(g.begin(R"({"kind":"text","calls":false,"think":false})", nullptr, 0, err) && g.on());
+        const int32_t ok[] = {5, 7, 10, 8, 5, 7, 10};
+        CHECK(g.scan(ok, 7, 0) == -1);
+        const int32_t bad[] = {8, 5, 10};
+        CHECK(g.scan(bad, 3, 0) == 2);
+        Draws d{{7}, {}, {}};
+        int32_t tok = -1;
+        CHECK(g.redraw({}, d.draw(), d.read(), tok) == Redraw::drawn && tok == 7);
+        CHECK(d.masks[0][7] == 0.0f && std::isinf(d.masks[0][10]) && std::isinf(d.masks[0][6]));
+    }
+    {   // "think": false under a lazy tool grammar: free text until a call, the thinking block still refused
+        const PackVocab bv = load_blocks();
+        Guard g(bv);
+        CHECK(g.begin(R"({"kind":"tools","tools":[{"name":"hello","parameters":{}}],"tool_choice":"auto","think":false})",
+                      nullptr, 0, err) && g.on());
+        const int32_t ok[] = {5, 7, 10, 10, 8, 5, 10};
+        CHECK(g.scan(ok, 7, 0) == -1);
+        const int32_t bad[] = {8, 5, 6};
+        CHECK(g.scan(bad, 3, 0) == 2);
+        Guard j(bv);   // after a header only a text block or the start of a tool's name
+        CHECK(j.begin(R"({"kind":"tools","tools":[{"name":"hello","parameters":{}}],"tool_choice":"auto","think":false})",
+                      nullptr, 0, err));
+        const int32_t junk[] = {5, 0};
+        CHECK(j.scan(junk, 2, 0) == 1);
+        Guard r(bv);   // tool_choice required: no text block either
+        CHECK(r.begin(R"({"kind":"tools","tools":[{"name":"hello","parameters":{}}],"tool_choice":"required","think":false})",
+                      nullptr, 0, err));
+        const int32_t txt[] = {5, 7};
+        CHECK(r.scan(txt, 2, 0) == 1);
+        Guard r2(bv);
+        CHECK(r2.begin(R"({"kind":"tools","tools":[{"name":"hello","parameters":{}}],"tool_choice":"required","think":false})",
+                       nullptr, 0, err));
+        const int32_t call[] = {5, 10};
+        CHECK(r2.scan(call, 2, 0) == -1);
+        Guard k(bv);   // the thinking token never opens, whatever precedes it
+        CHECK(k.begin(R"({"kind":"tools","tools":[{"name":"hello","parameters":{}}],"tool_choice":"auto","think":false})",
+                      nullptr, 0, err));
+        const int32_t mid[] = {5, 7, 10, 6};
+        CHECK(k.scan(mid, 4, 0) == 3);
+    }
     {   // tool_choice none: no grammar, the guard stays off
         Guard g(pv);
         CHECK(g.begin(R"({"kind":"tools","tools":[{"name":"f","parameters":{}}],"tool_choice":"none"})", nullptr, 0, err));

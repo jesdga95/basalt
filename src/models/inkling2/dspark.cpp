@@ -7,6 +7,7 @@
 // contributors to the vLLM project).
 #include "basalt/core/device_copy.hpp"
 #include "models/inkling2/dspark.hpp"
+#include "models/inkling2/dflash2.hpp"
 
 #include "basalt/core/diag.hpp"
 #include "basalt/core/model_file.hpp"
@@ -42,6 +43,7 @@ constexpr int kTypeBF16 = 30;
 constexpr int kE = kWidth;
 constexpr int kQ = kHeads * kHeadDim;      // 3072
 constexpr int kKV = kKvHeads * kHeadDim;   // 1024
+constexpr uint64_t kKvScaleBytes = (uint64_t) kKvHeads * (kHeadDim / 64) * 2;   // a cell's int8 scales, K or V
 constexpr int kFrRing = 32;                // positions whose Markov context the ring keeps
 constexpr int kSlice = 8;                  // rows of one commit step (MMVQ's widest)
 constexpr int kRingExtra = 64;             // a sliding-window layer's ring: its window, a block and a window's rows past it
@@ -52,6 +54,8 @@ uint64_t q8_bytes(uint64_t rows, uint64_t n_in) { return rows * (n_in / 32) * 34
 
 int64_t ring_cells(const DsparkGeometry& d) { return (int64_t) d.window + kRingExtra; }
 int64_t full_cells(int64_t context) { return context + kDsBlock; }
+// a full layer's cell, K and V: fp16, or the int8 codes and their scales
+uint64_t full_cell_bytes(bool int8) { return int8 ? 2 * ((uint64_t) kKV + kKvScaleBytes) : 2ull * kKV * 2; }
 
 bk::RopeSpec rope_of(const DsparkGeometry& d) {
     bk::RopeSpec r;
@@ -88,6 +92,8 @@ void ws_need(const DsparkGeometry& d, size_t& partial, size_t& tickets) {
 
 // ---- weights --------------------------------------------------------------------------------------------------------------
 
+DsparkWeights::DsparkWeights() = default;
+
 DsparkWeights::~DsparkWeights() {
     for (void* p : allocs_) cudaFree(p);
     for (void* p : pinned_) cudaFreeHost(p);
@@ -121,6 +127,18 @@ void* DsparkWeights::dev(size_t bytes, bool& ok) {
 
 model::Result dspark_plan(const Pack& pack, core::LoadPlan& reads, int file, int device, std::unique_ptr<DsparkWeights>& out) {
     out.reset();
+    if (pack.dflash2.present) {
+        std::unique_ptr<Dflash2Weights> df2;
+        if (model::Result r = dflash2_plan(pack, reads, file, device, df2); !r.ok()) return r;
+        auto w = std::make_unique<DsparkWeights>();
+        w->n_vocab = pack.geo.n_vocab;
+        w->logit_softcap = pack.dflash2.logit_softcap;
+        w->target_eps = pack.geo.rms_eps;
+        w->bytes_ = df2->bytes();
+        w->df2 = std::move(df2);
+        out = std::move(w);
+        return {};
+    }
     const DsparkGeometry& d = pack.dspark;
     if (!d.present) return {};
     const Geometry& g = pack.geo;
@@ -232,6 +250,11 @@ model::Result DsparkWeights::finish(const void* head_q8, const uint16_t* emb, co
     head = head_q8;
     embedding = emb;
     embed_norm = en;
+    if (df2) {
+        model::Result r = df2->finish(head_q8, emb, en, target_eps, stream);
+        bytes_ = df2->bytes();
+        return r;
+    }
     if (finished_) return {};
     const cudaStream_t s = (cudaStream_t) stream;
     float raw[kDsMixes * kDsTargets], al[kDsMixes * kDsTargets];
@@ -297,13 +320,28 @@ DsHead DsparkWeights::head_args() const {
 
 uint64_t dspark_tap_bytes(int tap_rows) { return 4ull * (uint64_t) std::max(tap_rows, kSlice) * kE * 4; }
 
-uint64_t dspark_session_bytes(const Pack& pack, int64_t context) {
+uint64_t dspark_session_bytes(const Pack& pack) {
+    if (pack.dflash2.present) return dflash2_session_bytes(pack);
     const DsparkGeometry& d = pack.dspark;
     if (!d.present) return 0;
     const uint64_t E = kE;
     uint64_t n = (kFrRing * E + 3 * kDsRank + E + kDsBlock) * 4 + 1024;
     for (int l = 0; l < d.n_layers; ++l)
-        n += 2ull * (uint64_t) (d.swa[(size_t) l] ? ring_cells(d) : full_cells(context)) * kKV * 2;
+        if (d.swa[(size_t) l]) n += 2ull * (uint64_t) ring_cells(d) * kKV * 2;
+    return n;
+}
+
+uint64_t dspark_pool_bytes(const Pack& pack, int64_t positions, uint64_t gran, bool int8) {
+    if (pack.dflash2.present) return dflash2_pool_bytes(pack, positions, gran);
+    const DsparkGeometry& d = pack.dspark;
+    if (!d.present) return 0;
+    // a full layer's arrays: fp16 K and V, or int8 K and V codes and their scales (DsparkHook::init)
+    const uint64_t cells = (uint64_t) full_cells(positions);
+    const auto whole = [&](uint64_t b) { return (b + gran - 1) / gran * gran; };
+    const uint64_t layer = int8 ? 2 * (whole(cells * kKV) + whole(cells * kKvScaleBytes)) : 2 * whole(cells * kKV * 2);
+    uint64_t n = 0;
+    for (int l = 0; l < d.n_layers; ++l)
+        if (!d.swa[(size_t) l]) n += layer;
     return n;
 }
 
@@ -365,6 +403,8 @@ const DsparkWeights::SharedScratch* DsparkWeights::ensure_shared_scratch(int64_t
 
 // ---- the session's hook ---------------------------------------------------------------------------------------------------
 
+DsparkHook::DsparkHook() = default;
+
 DsparkHook::~DsparkHook() {
     for (cudaGraphExec_t g : g_stage_)
         if (g) cudaGraphExecDestroy(g);
@@ -399,8 +439,15 @@ void* DsparkHook::dev(size_t bytes, bool& ok) {
 }
 
 bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context, int tap_rows, float* tap, const std::string& dump,
-                      int64_t backed, std::string& err) {
+                      bool int8, std::string& err) {
     if (!w) return true;
+    if (w->df2) {
+        tap_rows_ = std::max(tap_rows, kSlice);
+        context_ = context;
+        tap_ = tap;
+        df2_ = std::make_unique<Dflash2Hook>();
+        return df2_->init(w->df2.get(), g, context, tap_rows, tap, err);
+    }
     const DsparkGeometry& d = w->geo;
     const size_t E = kE;
     const auto* scr = w->ensure_shared_scratch(context, err);
@@ -412,10 +459,7 @@ bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context
                       align256(4) + align256(kDsBlock * 4) + align256(kDsBlock * 4);
         for (int l = 0; l < d.n_layers; ++l) {
             const bool ring = d.swa[(size_t) l];
-            if (ring || backed <= 0) {
-                const int64_t cap = ring ? ring_cells(d) : full_cells(context);
-                need += 2 * align256((size_t) cap * kKV * 2);
-            }
+            if (ring) need += 2 * align256((size_t) ring_cells(d) * kKV * 2);
         }
         if (!dump.empty()) need += align256((size_t) kDsDrafts * (size_t) w->n_vocab * 4);
         void* slab = nullptr;
@@ -440,24 +484,36 @@ bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context
     kb_ = scr->kb;
     vb_ = scr->vb;
     act_ = scr->act;
+    int8_ = int8;
     cache_.assign((size_t) d.n_layers, Cache{});
     for (int l = 0; l < d.n_layers; ++l) {
         Cache& c = cache_[(size_t) l];
         c.ring = d.swa[(size_t) l];
         c.cap = c.ring ? ring_cells(d) : full_cells(context);
-        if (!c.ring && backed > 0) {   // the range reserved, the first positions' cells backed
-            for (int j = 0; j < 2; ++j) {
-                auto a = std::make_unique<core::ElasticArray>();
-                if (ok && (!a->open((uint64_t) c.cap * kKV * 2, err) ||
-                           !a->ensure((uint64_t) std::min(c.cap, full_cells(backed)) * kKV * 2, 0, err)))
-                    ok = false;
-                (j ? c.v : c.k) = (uint16_t*) a->data();
-                full_.push_back(std::move(a));
+        const bool q8 = int8 && !c.ring;
+        // K and V, or the int8 codes and their scales; a full layer's range reserved, backed as the target's caches grow
+        const uint64_t cell[4] = {q8 ? (uint64_t) kKV : 2ull * kKV, q8 ? (uint64_t) kKV : 2ull * kKV, kKvScaleBytes, kKvScaleBytes};
+        void* buf[4] = {};
+        for (int j = 0; j < (q8 ? 4 : 2); ++j) {
+            if (c.ring) {
+                buf[j] = dev((size_t) c.cap * cell[j], ok);
+                continue;
             }
-            continue;
+            auto a = std::make_unique<core::ElasticArray>();
+            if (ok && !a->open((uint64_t) c.cap * cell[j], err, 1)) ok = false;
+            buf[j] = a->data();
+            full_.push_back(std::move(a));
+            full_cell_.push_back(cell[j]);
         }
-        c.k = (uint16_t*) dev((size_t) c.cap * kKV * 2, ok);
-        c.v = (uint16_t*) dev((size_t) c.cap * kKV * 2, ok);
+        if (q8) {
+            c.q8.k = (int8_t*) buf[0];
+            c.q8.v = (int8_t*) buf[1];
+            c.q8.ks = (uint16_t*) buf[2];
+            c.q8.vs = (uint16_t*) buf[3];
+        } else {
+            c.k = (uint16_t*) buf[0];
+            c.v = (uint16_t*) buf[1];
+        }
     }
     count_backed();
     x_ = scr->x;
@@ -506,11 +562,29 @@ bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context
     return true;
 }
 
+void DsparkHook::put_cache(const Cache& c, int i, uint16_t** k, uint16_t** v, uint16_t** ks, uint16_t** vs) {
+    k[i] = c.q8.k ? (uint16_t*) c.q8.k : c.k;
+    v[i] = c.q8.k ? (uint16_t*) c.q8.v : c.v;
+    ks[i] = c.q8.ks;
+    vs[i] = c.q8.vs;
+}
+
+void DsparkHook::use_tap(float* tap, int rows) {
+    tap_ = tap;
+    tap_rows_ = rows;
+    if (df2_) df2_->use_tap(tap, rows);
+}
+
 int DsparkHook::slot_of_visit(int visit) const {
+    if (df2_) return df2_->slot_of_visit(visit);
     return w_ && visit >= 0 && visit < (int) slot_.size() ? slot_[(size_t) visit] : -1;
 }
 
 void DsparkHook::commit(const int32_t* pos_d, int rows, void* stream, int row0) {
+    if (df2_) {
+        df2_->commit(pos_d, rows, stream, row0);
+        return;
+    }
     if (!w_ || rows <= 0) return;
     const DsparkGeometry& d = w_->geo;
     DsMixArgs ma;
@@ -526,8 +600,7 @@ void DsparkHook::commit(const int32_t* pos_d, int rows, void* stream, int row0) 
             const DsparkLayer& L = w_->layer[(size_t) l];
             const Cache& c = cache_[(size_t) l];
             DsCommitSegs segs;
-            segs.k[0] = c.k;
-            segs.v[0] = c.v;
+            put_cache(c, 0, segs.k, segs.v, segs.ks, segs.vs);
             bk::native_quantize_q8_1(mix_ + (size_t) l * kSlice * kE, act_, kE, n, stream);
             bk::native_q8_planes_mmvq(L.k_ctx_p, act_, kb_, kE, kKV, n, stream);
             bk::native_q8_planes_mmvq(L.v_ctx_p, act_, vb_, kE, kKV, n, stream);
@@ -538,6 +611,10 @@ void DsparkHook::commit(const int32_t* pos_d, int rows, void* stream, int row0) 
 
 void DsparkHook::commit_prompt(const int32_t* pos_d, int rows, basalt::prefill::mmq::Context& mmq, const PromptScratch& s,
                                void* stream) {
+    if (df2_) {
+        df2_->commit_prompt(pos_d, rows, mmq, s, stream);
+        return;
+    }
     if (!w_ || rows <= 0) return;
     if (rows <= kSlice) {
         commit(pos_d, rows, stream);
@@ -579,11 +656,15 @@ void DsparkHook::commit_prompt(const int32_t* pos_d, int rows, basalt::prefill::
         p.dst = s.vb;
         mmq.run(p, stream);
         bk::attn_qk_prepare(nullptr, s.kb, s.vb, nullptr, L.k_ctx_norm, d.rms_eps, rope, s.pos3 + (size_t) r0 * 3, keep, 0,
-                            kKvHeads, nullptr, c.k, c.v, 0, stream, kHeadDim, false, c.cap, pos_d + r0);
+                            kKvHeads, nullptr, c.k, c.v, 0, stream, kHeadDim, false, c.cap, pos_d + r0, c.q8);
     }
 }
 
 void DsparkHook::note(int64_t pos0, int rows) {
+    if (df2_) {
+        df2_->note(pos0, rows);
+        return;
+    }
     if (!w_ || rows <= 0) return;
     if (pos0 > hi_ || pos0 + rows < lo_) lo_ = pos0;   // a gap or a jump back: the record starts again at this run
     else lo_ = std::min(lo_, pos0);
@@ -658,7 +739,7 @@ void DsparkHook::stage(int k, int n, void* stream) {
         qkv.m[2] = mat(L.wv, kKV, sc + 2, vb_, kKV);
         wg::gemm(qkv, act_a_, kDsBlock, ws_, stream);
         bk::attn_qk_prepare(q_, kb_, vb_, L.q_norm, L.k_norm, d.rms_eps, rope_of(d), pos3b_, kDsBlock, kHeads, kKvHeads, qr_, c.k, c.v,
-                            0, stream, kHeadDim, false, c.cap, meta_d_ + 1);
+                            0, stream, kHeadDim, false, c.cap, meta_d_ + 1, c.q8);
         return;
     }
     bk::rms_norm_rows(x_, w.norm, kDsBlock, kE, d.rms_eps, h_, stream);
@@ -707,6 +788,7 @@ bool DsparkHook::stage_graph(int k, int n, void* stream) {
 }
 
 model::Result DsparkHook::draft_begin(int32_t anchor, int64_t pos, int n, void* stream) {
+    if (df2_) return df2_->draft_begin(anchor, pos, n, stream);
     if (!w_) return {model::Status::NotImplemented, "inkling2: the pack has no drafter"};
     pending_ = 0;
     batch_owner_ = nullptr;
@@ -732,7 +814,7 @@ model::Result DsparkHook::draft_begin(int32_t anchor, int64_t pos, int n, void* 
                 // short context runs few splits; the drafts only shape the speed
                 const int64_t cells = pos + kDsBlock - std::max<int64_t>(0, pos - window + 1) + 64;
                 bk::gqa_window_attn(qr_, c.k, c.v, kHeads, kKvHeads, kHeadDim, pos, kDsBlock, pos + kDsBlock, window, c.cap, att_scr_,
-                                    std::min(att_cells_, cells), attn_, stream, true);
+                                    std::min(att_cells_, cells), attn_, stream, true, c.q8);
             }
             if (!graphs_ || !stage_graph(k, n, stream)) {
                 graphs_ = false;
@@ -750,6 +832,7 @@ model::Result DsparkHook::draft_begin(int32_t anchor, int64_t pos, int n, void* 
 
 model::Result DsparkHook::draft_end(int32_t* ids, float* conf, int max_n, int& n, const model::ModelSession::DraftNeed&,
                                     void* stream) {
+    if (df2_) return df2_->draft_end(ids, conf, max_n, n, stream);
     n = 0;
     if (!w_) return {model::Status::NotImplemented, "inkling2: the pack has no drafter"};
     if (pending_ == 0) return {};
@@ -801,13 +884,18 @@ model::Result DsparkHook::draft_end(int32_t* ids, float* conf, int max_n, int& n
 }
 
 size_t DsparkHook::running_bytes() const {
+    if (df2_) return df2_->running_bytes();
     size_t n = 0;
     for (const Cache& c : cache_)
         if (c.ring) n += 2 * (size_t) c.cap * kKV * 2;
     return n;
 }
 
-void DsparkHook::running_regions(core::RunningState& st) const {
+void DsparkHook::running_state(int64_t pos, bool save, core::RunningState& st) const {
+    if (df2_) {
+        df2_->running_state(pos, save, st);
+        return;
+    }
     for (const Cache& c : cache_) {
         if (!c.ring) continue;
         st.regions.push_back({c.k, (size_t) c.cap * kKV * 2});
@@ -815,29 +903,45 @@ void DsparkHook::running_regions(core::RunningState& st) const {
     }
 }
 
+bool DsparkHook::running_restored(int64_t pos, const uint8_t* head) {
+    if (df2_) return df2_->running_restored(pos, head);
+    return true;
+}
+
 size_t DsparkHook::cells_bytes(int64_t positions) const {
+    if (df2_) return 0;
     size_t n = 0;
     for (const Cache& c : cache_)
-        if (!c.ring) n += 2 * (size_t) positions * kKV * 2;
+        if (!c.ring) n += (size_t) positions * full_cell_bytes(int8_);
     return n;
+}
+
+int64_t DsparkHook::backed_cells() const {
+    return df2_ ? df2_->backed_cells() : backed_cells_;
 }
 
 void DsparkHook::count_backed() {
     backed_cells_ = full_cells(context_);
-    for (const auto& a : full_) backed_cells_ = std::min<int64_t>(backed_cells_, (int64_t) (a->backed() / (kKV * 2)));
+    for (size_t i = 0; i < full_.size(); ++i)
+        backed_cells_ = std::min<int64_t>(backed_cells_, (int64_t) (full_[i]->backed() / full_cell_[i]));
 }
 
-uint64_t DsparkHook::grow_bytes(int64_t positions) const {
+uint64_t DsparkHook::grow_bytes(int64_t target, int64_t positions) const {
+    if (df2_) return df2_->grow_bytes(positions);
+    positions = target;
     uint64_t n = 0;
-    for (const auto& a : full_) n += a->growth((uint64_t) std::min(full_cells(context_), full_cells(positions)) * kKV * 2);
+    const uint64_t cells = (uint64_t) std::min(full_cells(context_), full_cells(positions));
+    for (size_t i = 0; i < full_.size(); ++i) n += full_[i]->growth(cells * full_cell_[i]);
     return n;
 }
 
-bool DsparkHook::ensure(int64_t positions, std::string& err) {
+bool DsparkHook::ensure(int64_t target, int64_t positions, std::string& err) {
+    if (df2_) return df2_->ensure(positions, err);
+    positions = target;
     if (full_.empty() || full_cells(positions) <= backed_cells_) return true;
-    const uint64_t bytes = (uint64_t) std::min(full_cells(context_), full_cells(positions)) * kKV * 2;
-    for (const auto& a : full_)
-        if (!a->ensure(bytes, 0, err)) {
+    const uint64_t cells = (uint64_t) std::min(full_cells(context_), full_cells(positions));
+    for (size_t i = 0; i < full_.size(); ++i)
+        if (!full_[i]->ensure(cells * full_cell_[i], 0, err)) {
             err = "the drafter's caches cannot grow to " + std::to_string(positions) + " positions: " + err;
             return false;
         }
@@ -845,58 +949,101 @@ bool DsparkHook::ensure(int64_t positions, std::string& err) {
     return true;
 }
 
+bool DsparkHook::usable() const {
+    if (df2_ && !df2_->usable()) return false;
+    for (const auto& a : full_)
+        if (!a->usable()) return false;
+    return true;
+}
+bool DsparkHook::out_of_memory() const {
+    if (df2_ && df2_->out_of_memory()) return true;
+    for (const auto& a : full_)
+        if (a->out_of_memory()) return true;
+    return false;
+}
+uint64_t DsparkHook::backing_bytes() const {
+    uint64_t n = df2_ ? df2_->backing_bytes() : 0;
+    for (const auto& a : full_) n += a->backed();
+    return n;
+}
+
 void DsparkHook::trim(int64_t positions) {
-    for (const auto& a : full_) a->trim((uint64_t) full_cells(positions) * kKV * 2);
+    if (df2_) {
+        df2_->trim(positions);
+        return;
+    }
+    const uint64_t cells = positions > 0 ? (uint64_t) full_cells(positions) : 0;   // none once the conversation left
+    for (size_t i = 0; i < full_.size(); ++i) full_[i]->trim(cells * full_cell_[i]);
     count_backed();
 }
 
 bool DsparkHook::save_cells(std::vector<core::ConversationKv>& kv, int64_t positions, void* stream) const {
+    if (df2_) return df2_->save_cells(positions, stream);
+    if (!w_) return true;
     if (positions < 0 || positions > backed_cells_) return false;
     cudaStreamSynchronize((cudaStream_t) stream);
+    const auto down = [&](const void* dev, core::ConversationBuffer& to) {
+        return to.visit(0, to.size(), [&](uint8_t* p, size_t n, size_t at) {
+            return basalt::core::device_copy(p, (const uint8_t*) dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess;
+        });
+    };
     for (const Cache& c : cache_) {
         if (c.ring) continue;
         core::ConversationKv k;
-        k.format = 3;   // fp16 rows, cell-major: [cell][kv head][head width]
+        // cell-major rows [cell][kv head][head width]: fp16 (3), or int8 codes with fp16 scales per 64 values (2)
+        k.format = c.q8.k ? 2 : 3;
         k.page_size = 1;
         k.cells = positions;
         k.heads = kKvHeads;
         k.head_dim = kHeadDim;
-        k.k.resize_for_overwrite((size_t) positions * kKV * 2);
-        k.v.resize_for_overwrite((size_t) positions * kKV * 2);
-        const auto down = [&](const uint16_t* dev, core::ConversationBuffer& to) {
-            return to.visit(0, to.size(), [&](uint8_t* p, size_t n, size_t at) {
-                return basalt::core::device_copy(p, (const uint8_t*) dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess;
-            });
-        };
-        if (!down(c.k, k.k) || !down(c.v, k.v)) return false;
+        const size_t row = c.q8.k ? (size_t) kKV : (size_t) kKV * 2;
+        k.k.resize_for_overwrite((size_t) positions * row);
+        k.v.resize_for_overwrite((size_t) positions * row);
+        if (c.q8.k) {
+            k.k_scale.resize_for_overwrite((size_t) positions * kKvScaleBytes);
+            k.v_scale.resize_for_overwrite((size_t) positions * kKvScaleBytes);
+            if (!down(c.q8.k, k.k) || !down(c.q8.v, k.v) || !down(c.q8.ks, k.k_scale) || !down(c.q8.vs, k.v_scale)) return false;
+        } else if (!down(c.k, k.k) || !down(c.v, k.v)) {
+            return false;
+        }
         kv.push_back(std::move(k));
     }
     return true;
 }
 
 bool DsparkHook::restore_cells(const std::vector<core::ConversationKv>& kv, size_t& at, int64_t positions, void* stream) {
+    if (df2_) return df2_->restore_cells(kv.size(), at, positions, stream);
+    if (!w_) return at == kv.size();
     if (positions < 0 || positions > backed_cells_) return false;
     cudaStreamSynchronize((cudaStream_t) stream);
-    const size_t run = (size_t) positions * kKV * sizeof(uint16_t);
+    const auto up = [&](void* dev, const core::ConversationBuffer& from, size_t run) {
+        return from.visit(0, run, [&](const uint8_t* p, size_t n, size_t off) {
+            return basalt::core::device_copy((uint8_t*) dev + off, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
+        });
+    };
     for (const Cache& c : cache_) {
         if (c.ring) continue;
         if (at >= kv.size()) return false;
         const core::ConversationKv& k = kv[at];
-        if (k.format != 3 || k.cells != positions || k.heads != kKvHeads || k.head_dim != kHeadDim ||
-            k.k.size() != run || k.v.size() != run || positions > c.cap)
+        const size_t run = (size_t) positions * (c.q8.k ? (size_t) kKV : (size_t) kKV * 2);
+        const size_t scales = c.q8.k ? (size_t) positions * kKvScaleBytes : 0;
+        if (k.format != (c.q8.k ? 2 : 3) || k.cells != positions || k.heads != kKvHeads || k.head_dim != kHeadDim ||
+            k.k.size() != run || k.v.size() != run || k.k_scale.size() != scales || k.v_scale.size() != scales || positions > c.cap)
             return false;
-        const auto up = [&](uint16_t* dev, const core::ConversationBuffer& from) {
-            return from.visit(0, run, [&](const uint8_t* p, size_t n, size_t off) {
-                return basalt::core::device_copy((uint8_t*) dev + off, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
-            });
-        };
-        if (!up(c.k, k.k) || !up(c.v, k.v)) return false;
+        if (c.q8.k) {
+            if (!up(c.q8.k, k.k, run) || !up(c.q8.v, k.v, run) || !up(c.q8.ks, k.k_scale, scales) || !up(c.q8.vs, k.v_scale, scales))
+                return false;
+        } else if (!up(c.k, k.k, run) || !up(c.v, k.v, run)) {
+            return false;
+        }
         ++at;
     }
     return true;
 }
 
 // ---- multi-session batched DSpark commit & draft --------------------------------------------------------------------------
+
+DsparkBatch::DsparkBatch() = default;
 
 DsparkBatch::~DsparkBatch() {
     for (void* p : allocs_) cudaFree(p);
@@ -917,15 +1064,20 @@ void* DsparkBatch::dev(size_t bytes, bool& ok) {
 bool DsparkBatch::init(const DsparkWeights* w, int max_sessions, int max_rows, int tap_rows, float* tap, int64_t context,
                        std::string& err) {
     if (!w || max_sessions <= 1) return true;
+    if (w->df2) {
+        df2_ = std::make_unique<Dflash2Batch>();
+        return df2_->init(w->df2.get(), max_sessions, max_rows, tap_rows, tap, err);
+    }
     const DsparkGeometry& d = w->geo;
     const size_t E = kE, V = (size_t) w->n_vocab, ff = (size_t) d.n_ff;
     const int S = std::min(max_sessions, kMaxDraftSessions);
     const int S_all = std::max(S, std::min(max_sessions, (int) bk::kWindowSegsMax));
-    const int max_dr_rows = std::max(S * kDsDrafts, S_all * 2);
+    const int max_dr_rows = std::max(S * kDsDrafts, S_all * kBatchDrafts);
     const int CR = 64;
     bool ok = true;
     auto f = [&](size_t n) { return (float*) dev(n * 4, ok); };
     max_sessions_ = S;
+    max_dr_rows_ = max_dr_rows;
     max_rows_ = max_rows;
     tap_rows_ = std::max(tap_rows, kSlice);
     tap_ = tap;
@@ -954,9 +1106,10 @@ bool DsparkBatch::init(const DsparkWeights* w, int max_sessions, int max_rows, i
     }
     att_cells_ = std::max(ring_cells(d), full_cells(context));
     att_scr_ = f(bk::gqa_decode_scratch_floats(att_cells_, CR, kHeads, kHeadDim));
-    // head batch scratch: per-draft-row buffers hold max(16*7, 64*2)=128 rows; per-slot state holds S_all<=64 slots
+    // head batch scratch: per-draft-row buffers hold max_dr_rows rows (a pass of draft()); per-slot state holds S_all slots
     hd_ = f((size_t) max_dr_rows * E);
     hq_ = dev(bk::native_q8_1_bytes(kE, max_dr_rows), ok);
+    head_cols_ = dev(dspark_head_base_cols_bytes(max_dr_rows), ok);
     approx_ = f((size_t) max_dr_rows * dspark_screen_rows((int64_t) V));
     ctx_h_ = f((size_t) max_dr_rows * kDsRnn);
     ctx_f_ = f((size_t) S_all * kDsRnn);
@@ -964,7 +1117,8 @@ bool DsparkBatch::init(const DsparkWeights* w, int max_sessions, int max_rows, i
     latent_ = f((size_t) S_all * kDsRank);
     lat_q_ = dev(bk::native_q8_1_bytes(kDsRank, max_dr_rows), ok);
     head_scr_stride_ = (dspark_head_scratch_bytes((int64_t) V) + 255) & ~(size_t) 255;
-    head_scr_ = dev((size_t) S * head_scr_stride_, ok);
+    head_scr_ = dev((size_t) S_all * head_scr_stride_, ok);
+    lat_cols_ = dev(dspark_head_step_cols_bytes(S_all), ok);
     prev_ = (int32_t*) dev((size_t) S_all * 4, ok);
     w1_row_ = (uint16_t*) dev((size_t) S_all * kDsRank * 2, ok);
     frc_ = f((size_t) S_all * E);
@@ -988,6 +1142,13 @@ bool DsparkBatch::init(const DsparkWeights* w, int max_sessions, int max_rows, i
 
 void DsparkBatch::commit(DsparkHook* const* hooks, int n_seg, const bk::WindowSegs* at_d, const int32_t* pos_d, int rows,
                          void* stream) {
+    if (df2_) {
+        if (rows <= 0 || n_seg <= 0) return;
+        Dflash2Hook* dh[bk::kWindowSegsMax] = {};
+        for (int i = 0; i < n_seg; ++i) dh[i] = hooks[i]->df2_.get();
+        df2_->commit(dh, n_seg, at_d, pos_d, rows, stream);
+        return;
+    }
     if (!w_ || rows <= 0 || n_seg <= 0) return;
     const DsparkGeometry& d = w_->geo;
     DsMixArgs ma;
@@ -1002,10 +1163,7 @@ void DsparkBatch::commit(DsparkHook* const* hooks, int n_seg, const bk::WindowSe
     for (int l = 0; l < d.n_layers; ++l) {
         const DsparkLayer& L = w_->layer[(size_t) l];
         const int64_t cap = hooks[0]->cache_[(size_t) l].cap;
-        for (int i = 0; i < n_seg; ++i) {
-            segs.k[i] = hooks[i]->cache_[(size_t) l].k;
-            segs.v[i] = hooks[i]->cache_[(size_t) l].v;
-        }
+        for (int i = 0; i < n_seg; ++i) DsparkHook::put_cache(hooks[i]->cache_[(size_t) l], i, segs.k, segs.v, segs.ks, segs.vs);
         bk::native_quantize_q8_1(c_mix_ + (size_t) l * rows * kE, c_act_, kE, rows, stream);
         bk::native_q8_planes_mmvq(L.k_ctx_p, c_act_, c_kb_, kE, kKV, rows, stream);
         bk::native_q8_planes_mmvq(L.v_ctx_p, c_act_, c_vb_, kE, kKV, rows, stream);
@@ -1015,6 +1173,17 @@ void DsparkBatch::commit(DsparkHook* const* hooks, int n_seg, const bk::WindowSe
 
 model::Result DsparkBatch::draft(DsparkHook* const* hooks, const int32_t* anchors, const int64_t* pos, const int* n,
                                  int count, void* stream) {
+    if (df2_) {
+        if (count <= 0) return {};
+        if (count > (int) bk::kWindowSegsMax) {
+            for (int i = 0; i < count; ++i)
+                if (model::Result r = hooks[i]->draft_begin(anchors[i], pos[i], n[i], stream); !r.ok()) return r;
+            return {};
+        }
+        Dflash2Hook* dh[bk::kWindowSegsMax] = {};
+        for (int i = 0; i < count; ++i) dh[i] = hooks[i]->df2_.get();
+        return df2_->draft(dh, anchors, pos, n, count, stream);
+    }
     if (!w_) return {model::Status::NotImplemented, "inkling2: the pack has no drafter"};
     if (count <= 0) return {};
     if (count > (int) bk::kWindowSegsMax) {
@@ -1061,14 +1230,15 @@ model::Result DsparkBatch::draft(DsparkHook* const* hooks, const int32_t* anchor
     };
     try {
         bk::PdlScope pdl(true);
-        const int max_dr_rows = std::max(max_sessions_ * kDsDrafts, (int) bk::kWindowSegsMax * 2);
-        const int step_B = (B * n_max <= max_dr_rows) ? B : max_sessions_;
+        const int step_B = (B * n_max <= max_dr_rows_) ? B : max_sessions_;
         for (int b0 = 0; b0 < B; b0 += step_B) {
             const int cb = std::min(step_B, B - b0);
             int sub_nmax = 1;
             for (int i = 0; i < cb; ++i) sub_nmax = std::max(sub_nmax, act_n[b0 + i]);
-            const int blk = kDsBlock;
-            const int chunk_slots = std::min(cb, kChunkSlots);
+            // a block of the anchor and as many masks as drafts are wanted: its attention sees only these rows (the drafts
+            // then differ from a whole block's), and a chunk holds as many blocks as its rows take
+            const int blk = sub_nmax + 1;
+            const int chunk_slots = std::min(cb, kChunkSlots * kDsBlock / blk);
             for (int s0 = 0; s0 < cb; s0 += chunk_slots) {
                 const int cn = std::min(chunk_slots, cb - s0);
                 const int R = cn * blk;
@@ -1096,13 +1266,12 @@ model::Result DsparkBatch::draft(DsparkHook* const* hooks, const int32_t* anchor
                     const bool ring = act[b0 + s0]->cache_[(size_t) l].ring;
                     for (int c = 0; c < cn; ++c) {
                         const DsparkHook::Cache& cc = act[b0 + s0 + c]->cache_[(size_t) l];
-                        kv.k[c] = cc.k;
-                        kv.v[c] = cc.v;
+                        DsparkHook::put_cache(cc, c, kv.k, kv.v, kv.ks, kv.vs);
                         const int64_t p0 = act_pos[b0 + s0 + c];
                         const int64_t win = ring ? (int64_t) d.window + 1 : p0 + blk;
                         const int64_t cells = p0 + blk - std::max<int64_t>(0, p0 - win + 1) + 64;
                         max_cells = std::max(max_cells, std::min(att_cells_, cells));
-                        gsegs[c] = {cc.k, cc.v, p0, blk, p0 + blk, win, cc.cap, true};
+                        gsegs[c] = {cc.k, cc.v, p0, blk, p0 + blk, win, cc.cap, true, cc.q8};
                     }
                     dspark_block_qk_prep_batch(q_, kb_, vb_, L.q_norm, L.k_norm, d.rms_eps, d.rope_base, meta_d_ + 2 * (b0 + s0),
                                                blk, cn, qr_, kv, cap, st);
@@ -1135,11 +1304,9 @@ model::Result DsparkBatch::draft(DsparkHook* const* hooks, const int32_t* anchor
                 dspark_pack_draft_rows(h_, blk, cn, s0, sub_nmax, hd_, st);
             }
             const DsHead head = w.head_args();
-            const size_t hq_row_b = bk::native_q8_1_bytes(kE, 1);
             const size_t lq_row_b = bk::native_q8_1_bytes(kDsRank, 1);
-            const int64_t n_pad = dspark_screen_rows((int64_t) w.n_vocab);
             bk::native_quantize_q8_1(hd_, hq_, kE, cb * sub_nmax, st);
-            dspark_head_base_batch(head, hq_, cb, sub_nmax, approx_, st);
+            dspark_head_base_batch(head, hq_, cb, sub_nmax, head_cols_, approx_, st);
             bk::bf16_gemv_fp32_mmvf_cols(hd_, w.w_h, ctx_h_, kE, kDsRnn, cb * sub_nmax, st);
             bk::bf16_gemv_fp32_mmvf_cols(frc_ + (size_t) b0 * kE, w.w_f, ctx_f_ + (size_t) b0 * kDsRnn, kE, kDsRnn, cb, st);
             for (int i = 0; i < sub_nmax; ++i) {
@@ -1148,18 +1315,9 @@ model::Result DsparkBatch::draft(DsparkHook* const* hooks, const int32_t* anchor
                                          i, sub_nmax, cb, latent_ + (size_t) b0 * kDsRank, st);
                 void* lq_step = static_cast<char*>(lat_q_) + (size_t) i * cb * lq_row_b;
                 bk::native_quantize_q8_1(latent_ + (size_t) b0 * kDsRank, lq_step, kDsRank, cb, st);
-                for (int p0 = 0; p0 < cb; p0 += max_sessions_) {
-                    const int cp = std::min(max_sessions_, cb - p0);
-                    dspark_head_pick_batch(head,
-                                           static_cast<const char*>(hq_) + (size_t) p0 * sub_nmax * hq_row_b,
-                                           static_cast<const char*>(lq_step) + (size_t) p0 * lq_row_b,
-                                           approx_ + (size_t) p0 * sub_nmax * n_pad,
-                                           i, sub_nmax, cp, head_scr_, head_scr_stride_,
-                                           prev_ + (b0 + p0),
-                                           ids_d_ + (size_t) (b0 + p0) * kDsBlock,
-                                           conf_d_ + (size_t) (b0 + p0) * kDsBlock,
-                                           w.w1, w1_row_ + (size_t) (b0 + p0) * kDsRank, st);
-                }
+                dspark_head_pick_batch(head, hq_, lq_step, approx_, i, sub_nmax, cb, lat_cols_, head_scr_, head_scr_stride_, prev_ + b0,
+                                       ids_d_ + (size_t) b0 * kDsBlock, conf_d_ + (size_t) b0 * kDsBlock, w.w1,
+                                       w1_row_ + (size_t) b0 * kDsRank, st);
             }
         }
         cudaMemcpyAsync(ids_h_, ids_d_, (size_t) B * kDsBlock * 4, cudaMemcpyDeviceToHost, st);
@@ -1178,6 +1336,7 @@ model::Result DsparkBatch::draft(DsparkHook* const* hooks, const int32_t* anchor
 }
 
 model::Result DsparkBatch::take(int slot, int pending, int32_t* ids, float* conf, int max_n, int& n) {
+    if (df2_) return df2_->take(slot, pending, ids, conf, max_n, n);
     n = 0;
     if (!synced_) {
         if (cudaStreamSynchronize((cudaStream_t) sync_stream_) != cudaSuccess)
@@ -1214,7 +1373,8 @@ void dspark_finish_flags(program::CommonOptions& o) {
     core::ModelFile file;
     std::string err;
     const core::Json* kv = !o.model.empty() && file.open(o.model, err) && file.load_meta(err) ? file.meta().get("gguf_kv") : nullptr;
-    const bool present = kv != nullptr && kv->get("inkling2.dspark.block_count") != nullptr;
+    const bool present = kv != nullptr &&
+                         (kv->get("inkling2.dspark.block_count") != nullptr || kv->get("inkling2.dflash2.block_count") != nullptr);
     // the pack's drafter offers a whole block (the window policy takes the rows that pay) unless --spec caps it
     if (!o.spec_given) o.spec = present ? (o.suffix_draft > 0 ? kDecodeRows : kDsBlock) : 0;
     if (o.spec >= 2 && !present) {

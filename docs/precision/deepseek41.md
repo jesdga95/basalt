@@ -1,6 +1,7 @@
 # DeepSeek-V4.1-Flash precision
 
-Where DeepSeek rounds and how its output compares. Method: [quality](quality.md). Guide: [DeepSeek](../models/deepseek41.md).
+Where DeepSeek rounds and how its output compares. Guide: [DeepSeek](../models/deepseek41.md).
+Method: the [quality suite](quality-suite.md) (preferred). The KLD, PPL and top-1 figures on this page were measured with [wikitext KLD](quality.md#wikitext-kld).
 
 Test setup: RTX 5090 at 400 W with an RTX 5060 Ti at 180 W, 121 GiB of RAM. Geometry: 5120 hidden, 40 layers,
 384 routed experts (top-6) plus one shared, a 128-token window, a two-level top-512 indexer, and an Engram table on two layers.
@@ -19,7 +20,7 @@ Test setup: RTX 5090 at 400 W with an RTX 5060 Ti at 180 W, 121 GiB of RAM. Geom
 | Routed experts (UD-IQ1_M) | IQ1_S, IQ2_XXS or IQ2_XS gate/up; IQ1_S, IQ2_XXS, IQ2_S or IQ2_XS down | q8_1 activations (GPU), Q8_K (CPU); fp32 scales |
 | Routed experts (UD-Q2_K_XL) | IQ2_XXS, IQ2_XS, IQ2_S or IQ3_XXS gate/up; IQ2_XXS, IQ3_XXS, IQ3_S or MXFP4 down | q8_1 activations (GPU), Q8_K (CPU; MXFP4: Q8_0); fp32 scales |
 | Attention and shared-expert projections | Q6_K, Q5_K or Q8_0 | q8_1 (decode); fp16 block-scaled int8 mma (prompt) |
-| Engram table | IQ4_NL, Q5_K or MXFP4, 256 values per row | dequantized to fp32 on the host |
+| Engram table | IQ4_NL, Q5_K, Q6_K, MXFP4 or MXFP8, 256 values per row | dequantized to fp32 on the host |
 | Compressor and indexer projections | BF16 | fp32 activations and accumulation |
 | Norms, router, hyper-connections | F32 | fp32 |
 | Window rows (the latest 128 latents) | E4M3, a power-of-two scale per 32 values (`--kv fp16`: fp16) | decoded exactly; fp32 scores, softmax and accumulation |
@@ -173,6 +174,6 @@ boosts by about half (its text is easier: base PPL 2.2717 there against 2.7314 o
 Reproduce (the base is [basalt-kld-bases](https://huggingface.co/datasets/jesdga/basalt-kld-bases)):
 
 ```sh
-basalt-bench --model DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt --gpu 0,1 --quality 100 --kld-base dsv41-bf16-base.kld -- --route-prior 0.1
+basalt-bench --model DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt --gpu 0,1 --kld 100 --kld-base dsv41-bf16-base.kld -- --route-prior 0.1
 basalt-bench --model DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt --gpu 0,1 -t conv,struct,prose --seed 1 -- --route-prior 0.1
 ```

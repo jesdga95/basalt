@@ -15,6 +15,8 @@
 //                     summed in fp16 per 32-cell tile.  Online softmax and the output in fp32.
 #pragma once
 
+#include "basalt/kernels/window_segs.hpp"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -77,10 +79,11 @@ void gqa_decode_attn_segs(const float* q, int n_head, int n_kv, const GqaSeg* se
                           uint16_t* gated16 = nullptr);
 /// gqa_decode_attn for a block drafter's rows: head width 128 or 256, row t at position pos0 + t sees positions
 /// [pos0 + t - window + 1, hi) (not causal), position p in cache cell p % cap. `block`: every row sees the first row's
-/// window, [pos0 - window + 1, hi) (a drafter whose block shares its anchor's window).
+/// window, [pos0 - window + 1, hi) (a drafter whose block shares its anchor's window). `q8`: the int8 cache instead (its
+/// codes decoded to the fp16 the fp16 path reads; not NVFP4).
 void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv, int head_dim,
                      int64_t pos0, int T, int64_t hi, int64_t window, int64_t cap, float* scratch, int64_t scratch_cells,
-                     float* out, void* stream, bool block = false);
+                     float* out, void* stream, bool block = false, KvInt8 q8 = {});
 struct GqaWindowSeg {
     const uint16_t* k_cache = nullptr;
     const uint16_t* v_cache = nullptr;
@@ -90,9 +93,14 @@ struct GqaWindowSeg {
     int64_t window = 0;
     int64_t cap = 0;
     bool block = false;
+    KvInt8 q8 = {};   ///< the int8 cache instead: every segment of a call int8 or none
 };
+/// gqa_window_attn for up to kWindowSegsMax segments of any rows in one launch (segment k's rows after segment k - 1's in
+/// q and out), each row what its segment alone gives; `scratch` holds gqa_decode_scratch_floats(scratch_cells, the rows of
+/// every segment, n_head, head_dim).  `wide` (a drafter, whose rows need not match a lone segment's bits): a launch of
+/// many segments splits each segment's keys less, so the splits depend on the segment count.
 void gqa_window_attn_segs(const float* q, int n_head, int n_kv, int head_dim, const GqaWindowSeg* segs, int n_seg,
-                          float* scratch, int64_t scratch_cells, float* out, void* stream);
+                          float* scratch, int64_t scratch_cells, float* out, void* stream, bool wide = false);
 /// The device whose SM count plans the int8 prompt attention's launch (its key splits, so its rounding); -1 (the default):
 /// the current one.  A card that reads some of the main card's layers plans as the main card, so its rows are the main card's.
 void gqa_prompt_plan_device(int device);

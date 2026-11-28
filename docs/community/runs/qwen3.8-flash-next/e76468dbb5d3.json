@@ -1,0 +1,35 @@
+{
+  "submitter": "nilspolek",
+  "date": "2026-11-26",
+  "commit": "5b8a82c6b7",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5080",
+      "vram_gib": 16,
+      "power_w": 250,
+      "pcie": "5.0 x16",
+      "h2d_gbps": 54.9
+    }
+  ],
+  "ram_gib": 62,
+  "cpu": "AMD Ryzen 9 7900, 12 cores",
+  "ram_gbps": 58.5,
+  "os": "Linux",
+  "quant": "IQ3_XXS",
+  "kv": "int8",
+  "prefill_16k_tps": 4987.4,
+  "prefill_64k_tps": 5133.3,
+  "decode_tps": 181.3,
+  "decode_conv_tps": 128.5,
+  "decode_struct_tps": 205.3,
+  "decode_prose_tps": 133.2,
+  "accept_conv_pct": 70.0,
+  "accept_struct_pct": 96.1,
+  "accept_prose_pct": 65.5,
+  "draft_len_conv": 2.4,
+  "draft_len_struct": 6.5,
+  "draft_len_prose": 1.7,
+  "engine_args": "--gpu 0 --max-context 66661 --kv int8"
+}

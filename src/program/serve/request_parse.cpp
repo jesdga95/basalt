@@ -34,6 +34,7 @@ Flow Request::parse() {
     req_penalty_present = 0.0f;
     req_penalty_last_n = 0;
     req_bias_present = false;
+    req_reply = -1;         // reply=N: the ids past the first N are the reply this request continues, the server's close tokens included
     req_gprompt = -1;       // gprompt=N: the first N ids are the prompt, the rest tokens the request has already generated
     req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
     req_relax = default_relax();   // relax=P: this request's --relaxed-drafting (0 = exact)
@@ -41,6 +42,9 @@ Flow Request::parse() {
     // the chunk teacher-forced through verify windows of T tokens, every token committed
     req_ppl = -1;
     req_ppl_t = 3;
+    // score=N [score_top=K]: the ids are a token stream scored from position N on (basalt/program/ppl_gate.hpp)
+    req_score = -1;
+    req_score_top = 20;
     req_logprobs = -1;   // logprobs=K (0..20): each sent pick's log probability and the row's K likeliest tokens
     req_clip = 0;   // clip=1 (GENT): max_new is a cap, cut to the room the context leaves after the prompt
     if (endp != nullptr) {   // GENI takes the same keys (image requests were always greedy); its
@@ -57,6 +61,7 @@ Flow Request::parse() {
             const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
             if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
             else if (key == "grammar") req_grammar_text = tok.substr(eq + 1);
+            else if (key == "reply") req_reply = std::atoll(tok.c_str() + eq + 1);
             else if (key == "gprompt") req_gprompt = std::atoll(tok.c_str() + eq + 1);
             else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
             else if (key == "temperature") req_temperature = fv;
@@ -73,6 +78,8 @@ Flow Request::parse() {
             else if (key == "clip") req_clip = std::atoi(tok.c_str() + eq + 1);
             else if (key == "ppl") req_ppl = std::atoi(tok.c_str() + eq + 1);
             else if (key == "ppl_t") req_ppl_t = std::atoi(tok.c_str() + eq + 1);
+            else if (key == "score") req_score = std::atoll(tok.c_str() + eq + 1);
+            else if (key == "score_top") req_score_top = std::atoi(tok.c_str() + eq + 1);
             // unknown keys are skipped: the ids start at the first token without '='
         }
     }
@@ -132,6 +139,7 @@ Flow Request::parse() {
                 ids.assign(it->second.ids.begin(), it->second.ids.end());
                 std::vector<int64_t> more;
                 ids_ok = *after != '+' || cli::parse_i64_list(after + 1, more, pe);
+                if (!more.empty()) req_reply = (int64_t) it->second.ids.size();   // what follows the held prompt is the reply so far
                 ids.insert(ids.end(), more.begin(), more.end());
             }
         } else {

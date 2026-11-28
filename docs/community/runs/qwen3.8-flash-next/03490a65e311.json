@@ -1,0 +1,43 @@
+{
+  "submitter": "vidpry",
+  "date": "2026-11-27",
+  "commit": "5b8a82c6b7",
+  "preset": "community-1",
+  "model": "Qwen3.8-Flash-Next",
+  "gpus": [
+    {
+      "name": "RTX 5060 Ti",
+      "vram_gib": 16,
+      "power_w": 180,
+      "pcie": "4.0 x8",
+      "h2d_gbps": 14.5
+    },
+    {
+      "name": "RTX 5060 Ti",
+      "vram_gib": 16,
+      "power_w": 180,
+      "pcie": "4.0 x8",
+      "h2d_gbps": 14.5
+    }
+  ],
+  "ram_gib": 92,
+  "cpu": "AMD Ryzen 7 5700X, 8 cores",
+  "ram_gbps": 30.8,
+  "os": "Linux",
+  "quant": "IQ4_XS",
+  "kv": "int8",
+  "prefill_16k_tps": 2158.4,
+  "prefill_64k_tps": 3378.9,
+  "decode_tps": 147.0,
+  "decode_conv_tps": 96.7,
+  "decode_struct_tps": 184.1,
+  "decode_prose_tps": 85.4,
+  "accept_conv_pct": 70.0,
+  "accept_struct_pct": 93.9,
+  "accept_prose_pct": 64.4,
+  "draft_len_conv": 2.3,
+  "draft_len_struct": 6.7,
+  "draft_len_prose": 1.8,
+  "engine_args": "--gpu 0,1 --gpu-mode peer --max-context 66661 --kv int8",
+  "notes": "Dual 5060 Ti peer on ASUS Prime X570-Pro (Ryzen 7 5700X); PCIe 4.0 x8 per card. GTX 1660 Super in box, unused."
+}

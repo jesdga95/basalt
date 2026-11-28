@@ -87,7 +87,13 @@ void Runtime::stats_tick(bool force) {
 
 Flow Runtime::dispatch() {
     if (batch_on()) {
-        if (!try_next_line(line)) {
+        // another admission is on its way: its lines come before the next round (bounded, should the request go away)
+        int hold_r = 0;
+        if (admit_hold) hold_r = next_line_within(line, kAdmitHoldMs);
+        if (hold_r < 0) { basalt::log::info("basalt serve", "input pipe closed"); return Flow::quit; }
+        const bool held = hold_r == 1;
+        admit_hold = admit_hold && held;
+        if (!held && !try_next_line(line)) {
             if (stdin_lost.load()) { basalt::log::info("basalt serve", "input pipe closed"); return Flow::quit; }
             const BusyScope busy_scope("batch window");
             const BusyClock busy(busy_s, busy_on, busy_from);
@@ -219,7 +225,11 @@ Flow Runtime::dispatch() {
         }
         admit_slot = (int) b;
         admit_max_new = mn;
-        line = std::string(bimg ? "GENI 1" : "GEN 1") + e2;
+        std::string rest(e2);
+        const size_t more = rest.find(" more=1");
+        admit_hold = more != std::string::npos;
+        if (admit_hold) rest.erase(more, 7);
+        line = std::string(bimg ? "GENI 1" : "GEN 1") + rest;
     }
     between_requests(line);
     if (line == "QUIT") return Flow::quit;

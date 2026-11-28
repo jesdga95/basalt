@@ -20,13 +20,14 @@ from serve.util import vram
 from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
 from serve.models import Dialect, dialect_for
-from serve.prompt import CTX_SLACK, PromptText, overflow_error, room_error
+from serve.prompt import CTX_SLACK, REPLY_KEY, PromptText, overflow_error, room_error
 from serve.util.text import Detokenizer, StopMatcher, control_literals, stop_strings
 from serve.engine.image_source import USAGE as IMAGE_USAGE, VIDEO as VIDEO_KIND, ImageRefused, ImageSources
 from serve.engine.vision import IMAGE_WAITING_BYTES, VIDEO_MAX_TOKENS, VIDEO_REQUEST_BYTES, Vision
 from serve.api.grammar import grammar_spec, unenforced
 from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, Channels as LogprobChannels, entry as logprob_entry
 from serve.config import GRAMMAR_DEFAULT
+from serve.monitor import Monitor
 
 
 def meminfo_mib(field: str) -> int | None:
@@ -57,6 +58,7 @@ REASONING_CLOSE = "\n</think>\n\n"
 # ANSWER_ROOM_MIN_CAP is too small to split and is left as it is.
 ANSWER_ROOM_MIN_CAP = 32
 ANSWER_RESERVE_MIN = 512
+WRAP_SOFT_MAX = 32          # tokens a budget wrap that stops the engine softly may keep past the budget
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often
 KEEPALIVE_S = 10.0          # a stream quiet this long (a held-back tool argument) gets a keep-alive
 # live tok/s is a windowed rate: a mean since the first token spikes at the start of an answer
@@ -158,6 +160,7 @@ class Service:
         self.last_request_at = None                      # last request start or finish
         self.started_at = time.time()
         self.status_lock = threading.Lock()
+        self.monitor = Monitor(self)
         self.live_lock = threading.Lock()               # one combined live line per LIVE_EVERY_S, whichever request is first
         self.live_at = 0.0
         # GPU sharing, all off by default: idle unload seconds, min free VRAM to load, a command run before loading
@@ -342,7 +345,10 @@ class Service:
             raise EngineDied("the server is stopping")
         if getattr(self.engine, "asleep", False) is True:
             self._wake()
-        if self.loaded() and not self._vision_down():
+        if self.loaded():
+            if self._vision_down():
+                print("[server] restarting the vision encoder", flush=True)
+                self.vision.restart()
             return
         if self.before_load:
             cmd = self.before_load
@@ -371,8 +377,6 @@ class Service:
         if self._vision_down():                         # first: a GPU encoder takes its VRAM before the engine sizes its cache
             print("[server] restarting the vision encoder", flush=True)
             self.vision.restart()
-        if self.loaded():
-            return
         if self.stopping.is_set():                      # shutdown began while the hook or the VRAM wait ran
             raise EngineDied("the server is stopping")
         again = bool(getattr(self.engine, "known_ctx", 0))   # a first load says nothing: the load bars do
@@ -1211,7 +1215,7 @@ class Service:
         """The text path: the engine tokenizes, so the server sends the rendered prompt as it is and settles the
         answer cap with the engine (clip: cut to the room the context leaves)."""
         text, plain = self.render_text(messages, tools, kwargs)
-        tail = force if force and kwargs.get("enable_thinking", True) is False else ""
+        tail = self.dialect.nothink_lead + force if force and kwargs.get("enable_thinking", True) is False else ""
         ctx = self.engine.max_context
         if ctx <= 0:
             if getattr(self.engine, "starting", False):
@@ -1291,7 +1295,7 @@ class Service:
         try:
             # encode under the fifo: the encoder and a running engine must not use the GPU together
             with self.fifo:
-                if getattr(self.vision, "in_engine", False):   # the encoder lives in the engine: it must be running
+                if getattr(self.vision, "in_engine", False) or self._vision_down():
                     self.ensure_loaded()
                 try:
                     if not videos:
@@ -1439,7 +1443,7 @@ class Service:
         return now
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None, session=None,
-            live=None) -> Iterator[tuple[str, object]]:
+            live=None, stream_tools: bool = True) -> Iterator[tuple[str, object]]:
         """Yield ("event", Event) as text arrives, ("ping", None) as heartbeat, then ("done", {...}).
         `force`: the opening of the call the reply must make (see prepare). `live` (serve.live.LiveRequest): the state
         this updates, and the answer-now signal that closes the thinking at its next clean point. A request with
@@ -1448,19 +1452,24 @@ class Service:
         (serve/api/logprobs.py)."""
         if live is not None:
             live.thinking = bool(thinking)
-        if not thinking and self.dialect.thinks_in_blocks and isinstance((sampling or {}).get(GRAMMAR_KEY), dict):
-            # the grammar guard lets a reply of blocks think only when the request does
-            sampling = {**sampling, GRAMMAR_KEY: dict(sampling[GRAMMAR_KEY], think=False)}
+        if not thinking and self.dialect.thinks_in_blocks and self.grammar_engine:
+            # the grammar guard lets a reply of blocks think only when the request does: a request without a grammar
+            # gets the one that only forbids thinking
+            spec = (sampling or {}).get(GRAMMAR_KEY)
+            sampling = {**(sampling or {}), GRAMMAR_KEY: dict(
+                spec if isinstance(spec, dict) else {"kind": "text", "calls": bool(tools)}, think=False)}
         budget = self.reasoning_budget(sampling) if thinking else None
+        budget_asked = budget           # the request's own budget, before the answer room
         budget_req = sampling
         budget_ready = False
         if self.sampling_defaults:     # the request's own fields win
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**self.sampling_defaults, **req_values}
-        parser = self.dialect.parser(thinking, tools, stream_tools=True)
+        parser = self.dialect.parser(thinking, tools, stream_tools=stream_tools)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         lp_channels = LogprobChannels(thinking) if (sampling or {}).get(LOGPROBS_KEY) is not None else None
         thinking_n = 0                                 # tokens written while thinking
+        answered = False                               # any content or tool event emitted (for block-structured dialects)
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
 
@@ -1604,10 +1613,11 @@ class Service:
                         live.state = "prompt"
                     prompt, thought = ids, 0            # reasoning tokens so far
                     # answer now stops an engine that takes `stop_soon` at its own pace (see the pass below)
-                    soft_stops = live is not None and "stop_soon" in inspect.signature(self.engine.generate).parameters
+                    soft_stops = "stop_soon" in inspect.signature(self.engine.generate).parameters
                     closed_early = False                # the thinking was already closed once
                     pt_settled = False                  # the engine's PT line was applied to the total cap
                     run_id, run_n = None, 0             # the token the thinking is repeating, and how often in a row
+                    reply_at = None                     # the prompt's token count where this reply's own tokens begin (once a pass continues it)
                     for ev in opening:
                         yield "event", ev
                     while True:
@@ -1617,12 +1627,15 @@ class Service:
                         more = {"stop_soon": soft} if soft is not None else {}
                         # A thinking budget caps the pass itself, so the engine stops on the budget's token and holds
                         # exactly what was kept: the next pass extends its live state instead of reading the overshoot
-                        # again through the prompt path (which rounds differently from decoding).
-                        if thinking and not budget_ready and not isinstance(ids, PromptText):
+                        # again through the prompt path (which rounds differently from decoding). A text prompt the
+                        # engine may clip learns its cap, and so its budget, from the engine's count (below).
+                        if thinking and not budget_ready and not (isinstance(ids, PromptText) and ids.clip):
                             budget = self.answer_budget(budget_req, max_new, budget)
                             budget_ready = True
                         cap = max_new - n
-                        capped = bool(budget) and parser.state == "reasoning" and budget - thought < cap
+                        may_think = parser.state == "reasoning" or (
+                            self.dialect.thinks_in_blocks and parser.state == "between" and thought == 0 and not answered)
+                        capped = bool(budget) and may_think and budget - thought < cap
                         if capped:
                             cap = max(1, budget - thought)
                         gen = self.engine.generate(prompt, cap, sampling, cancel, embeddings=emb,
@@ -1630,6 +1643,7 @@ class Service:
                             else self.engine.generate(prompt, cap, sampling, cancel, session=session, **more)
                         n_pass0 = n
                         seg, wrap, leaving = [], False, False   # this pass's tokens; budget reached; consumer left
+                        over = False                    # the budget was reached in a pass it does not cap: stopping soon
                         looped = False                  # the wrap is for a repeated token, not the budget
                         asked = False                   # the wrap is the client's answer now
                         drained = False                 # the pass ran to the engine's DONE
@@ -1646,11 +1660,22 @@ class Service:
                                 # comes back as the budget and must not replace the client's cap.
                                 if isinstance(ids, PromptText) and ids.n is not None and not pt_settled:
                                     pt_settled = True
+                                    # the engine checked this pass's cap, which a thinking budget may have lowered:
+                                    # the whole cap must fit before a token goes out, as an id prompt's does
+                                    ctx = self.engine.max_context or getattr(self.engine, "known_ctx", 0)
+                                    if not ids.clip and ctx > 0 and ids.n + CTX_SLACK + max_new > ctx:
+                                        raise overflow_error(ids.n, max_new, ctx)
                                     if ids.max_new and ids.max_new < cap:
                                         max_new = min(max_new, n_pass0 + ids.max_new)
+                                        cap = ids.max_new
+                                        if thinking and budget_ready:   # a budget set from the cap the engine cut
+                                            budget, budget_ready = budget_asked, False
                                 if thinking and not budget_ready and (not isinstance(ids, PromptText) or ids.n is not None):
                                     budget = self.answer_budget(budget_req, max_new, budget)
                                     budget_ready = True
+                                    # the pass the engine settled ends on the budget only if the budget is past its cap;
+                                    # a block dialect is still "between" before its thinking block opens (same rule as may_think)
+                                    capped = bool(budget) and may_think and budget - thought >= cap
                                 if t is None:               # heartbeat
                                     if isinstance(ids, PromptText) and ids.n is not None and st.get("prompt_tokens") != ids.n:
                                         with self.status_lock:  # the engine has counted the prompt
@@ -1665,6 +1690,11 @@ class Service:
                                             and not detok.pending()):
                                         n -= 1              # the end token is not part of the reply
                                         ended_thinking = True
+                                        break
+                                    if (force and self.dialect.thinks_in_blocks and not parser.buf
+                                            and not detok.pending() and parser.state in ("between", "content")):
+                                        n -= 1              # the end token is not part of the reply
+                                        opens = True
                                         break
                                     finish = "stop"
                                     raw_ids.append(t)
@@ -1681,6 +1711,8 @@ class Service:
                                 tail = (tail + piece)[-2:]
                                 state0 = parser.state
                                 evs = cut(parser.feed(piece))
+                                if not answered and any(ev.kind in ("content", "tool_start", "tool_call") for ev in evs):
+                                    answered = True
                                 if lp_channels is not None:
                                     lp = logprob_entry(self.tok, t) if getattr(t, "lp", None) is not None else None
                                     for item in lp_channels.token(lp, state0, parser.state, evs):
@@ -1712,13 +1744,24 @@ class Service:
                                     break
                                 if budget and parser.state == "reasoning":
                                     thought += 1
-                                    # only at a clean point: no held tag or split character; let a budget-capped pass drain its own DONE/BDONE
-                                    if thought >= budget and not parser.buf and not detok.pending() \
+                                    # only at a clean point: no held tag or split character; a pass the budget caps
+                                    # drains to its own DONE/BDONE and wraps after it (below)
+                                    if thought >= budget and not over and not parser.buf and not detok.pending() \
                                             and not (capped and n - n_pass0 >= cap):
-                                        wrap = True
+                                        if capped or soft is None or max_new - n < 2 * WRAP_SOFT_MAX:
+                                            wrap = True
+                                            break
+                                        # the pass goes on past the budget: the engine stops at its own pace and the
+                                        # tokens it still writes are kept, so the next pass extends what it holds
+                                        soft.set()
+                                        over = True
+                                    elif over and thought >= budget + WRAP_SOFT_MAX and not parser.buf and not detok.pending():
+                                        wrap = True     # the engine did not stop soon enough: the answer keeps its room
                                         break
                                 if live is not None:
-                                    live.state = "thinking" if parser.state == "reasoning" else "answering"
+                                    live.state = "thinking" if (
+                                        parser.state == "reasoning"
+                                        or (thinking and parser.state == "between" and not answered)) else "answering"
                                     if live.answer_now.is_set() and parser.state == "reasoning":
                                         if soft is not None:
                                             soft.set()      # the close follows the engine's last token
@@ -1728,7 +1771,10 @@ class Service:
                                 if force:
                                     if any(ev.kind in ("tool_start", "tool_call") for ev in evs):
                                         force = None    # the model is writing a call of its own
-                                    elif parser.state == "content" and not parser.buf and not detok.pending():
+                                    elif ((parser.state == "content"
+                                           or (self.dialect.thinks_in_blocks and state0 == "reasoning"
+                                               and parser.state == "between"))
+                                          and not parser.buf and not detok.pending()):
                                         opens = True    # at a clean point right after the thinking
                                         break
                             else:
@@ -1767,9 +1813,12 @@ class Service:
                                 st["decoded"] = (st.get("decoded") or 0) + int(run_last.get("generated") or 0)
                                 st["passes"] = (st.get("passes") or 0) + 1
                                 timed_last = run_last
-                        if isinstance(run_last, dict) and run_last is not engine_last0 and run_last.get("finish") == "error":
-                            finish = "error"          # the engine ended the request itself: the grammar allowed no token
-                            err = "the grammar allowed no token to continue the reply; the engine log has the state"
+                        if isinstance(run_last, dict) and run_last is not engine_last0 and run_last.get("finish") in ("error", "room"):
+                            finish = "error"          # the engine ended the request itself
+                            err = ("the KV pool had no room for this conversation to grow while every running request "
+                                   "waited for room; the conversation is kept, so asking again continues it"
+                                   if run_last.get("finish") == "room" else
+                                   "the grammar allowed no token to continue the reply; the engine log has the state")
                             print(f"[server] error: engine reported {err}", flush=True)
                             raise EngineError(err)
                         if reused0 is None and isinstance(run_last, dict) and run_last is not engine_last0 \
@@ -1786,7 +1835,8 @@ class Service:
                                 resumed = True
                         if drained and soft is not None and soft.is_set() and n < max_new and not cancel.is_set():
                             if parser.state == "reasoning" and not parser.buf and not detok.pending():
-                                wrap = asked = True
+                                wrap = True
+                                asked = not over
                             else:                       # a split tag or character, or the thinking ended meanwhile
                                 resumed = True
                         if not (wrap or opens or ended_thinking or resumed) or cancel.is_set():
@@ -1794,9 +1844,15 @@ class Service:
                         # budget reached or turn ended in thinking: close it and continue; the next prompt extends this
                         # one, so the engine keeps its prefix
                         forced_here = bool(force) and (ended_thinking or wrap)
+                        close_n = 0
                         if ended_thinking:
                             closed_early = True
-                            extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
+                            if self.dialect.thinks_in_blocks and force:
+                                close_ids = self.tok.encode(self.dialect.reasoning_close, parse_special=True)
+                                close_n = len(close_ids)
+                                extra = close_ids + self.tok.encode(force, parse_special=True)
+                            else:
+                                extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
                             force = None
                             if max_new - n - len(extra) < 1:
                                 finish = "stop"
@@ -1804,7 +1860,12 @@ class Service:
                             print("[server] the model ended while thinking, closing it for an answer", flush=True)
                         elif wrap:
                             budget = None
-                            extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
+                            if self.dialect.thinks_in_blocks and force:
+                                close_ids = self.tok.encode(self.dialect.reasoning_close, parse_special=True)
+                                close_n = len(close_ids)
+                                extra = close_ids + self.tok.encode(force, parse_special=True)
+                            else:
+                                extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
                             force = None
                             if max_new - n - len(extra) < 1:
                                 break                   # no room to answer: "length"
@@ -1818,10 +1879,15 @@ class Service:
                             extra = []
                         else:
                             # the thinking closed itself: the call opens after the blank line the template puts
-                            # before a call
-                            text = "\n" * max(0, self.dialect.call_newlines - (len(tail) - len(tail.rstrip("\n")))) + force
+                            # before a call (or after closing an open block on a block-structured dialect)
+                            if self.dialect.thinks_in_blocks and parser.state == "content":
+                                close_ids = self.tok.encode(self.dialect.reasoning_close, parse_special=True)
+                                close_n = len(close_ids)
+                                extra = close_ids + self.tok.encode(force, parse_special=True)
+                            else:
+                                text = "\n" * max(0, self.dialect.call_newlines - (len(tail) - len(tail.rstrip("\n")))) + force
+                                extra = self.tok.encode(text, parse_special=True)
                             force = None
-                            extra = self.tok.encode(text, parse_special=True)
                             if max_new - n - len(extra) < 1:
                                 break                   # no room for the call: "length"
                         for t in extra:
@@ -1830,6 +1896,8 @@ class Service:
                             thinking_n += parser.state == "reasoning"
                             state0 = parser.state
                             evs = cut(parser.feed(detok.push(t)))
+                            if not answered and any(ev.kind in ("content", "tool_start", "tool_call") for ev in evs):
+                                answered = True
                             if lp_channels is not None:       # written by the server: no entry of its own
                                 for item in lp_channels.token(None, state0, parser.state, evs):
                                     yield "logprobs", item
@@ -1837,17 +1905,22 @@ class Service:
                             for ev in evs:
                                 yield "event", ev
                         if live is not None:
-                            live.state = "thinking" if parser.state == "reasoning" else "answering"
+                            live.state = "thinking" if (
+                                parser.state == "reasoning"
+                                or (thinking and parser.state == "between" and not answered)) else "answering"
                         if stops is not None and stops.hit is not None:
                             finish = "stop"
                             break
                         base_len = len(prompt.ids()) if isinstance(prompt, PromptText) else len(prompt)
                         prompt = prompt + seg + extra
+                        # the engine takes no turn checkpoint inside the reply this prompt now carries
+                        reply_at = base_len if reply_at is None else reply_at
+                        sampling = {**(sampling or {}), REPLY_KEY: reply_at}
                         if has_grammar:
                             if resumed:
                                 gprompt0 = gprompt0 if gprompt0 is not None else base_len
                             elif opens or forced_here:
-                                gprompt0 = base_len + len(seg)
+                                gprompt0 = base_len + len(seg) + close_n
                             else:
                                 gprompt0 = None
                             if gprompt0 is not None and 0 < gprompt0 < len(prompt):
@@ -1947,6 +2020,8 @@ class Service:
             if emb:
                 Path(emb).unlink(missing_ok=True)
         last_evs = cut(parser.finish())
+        if stops is not None and stops.hit is not None and finish == "length":
+            finish = "stop"
         if lp_channels is not None:
             if stops is not None and stops.hit is not None:
                 lp_channels.pending.clear()             # the stop string's tokens: not in the answer

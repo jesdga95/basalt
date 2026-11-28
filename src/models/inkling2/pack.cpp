@@ -116,6 +116,27 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
         d.markov_rank = u("dspark.markov_rank");
     }
 
+    Dflash2Geometry& df = p.dflash2;
+    if (const Json* dl = k("dflash2.block_count"); dl && dl->is_number()) {
+        df.present = true;
+        df.n_layers = u("dflash2.block_count");
+        df.block = u("dflash2.block_size");
+        df.mask_id = u("dflash2.mask_token_id");
+        df.targets = ints(k("dflash2.target_layers"));
+        df.conv_kernel = u("dflash2.conv_kernel");
+        df.conv_group = u("dflash2.conv_group");
+        df.selector_rank = u("dflash2.selector_rank");
+        df.selector_top_k = u("dflash2.selector_top_k");
+        df.logit_softcap = f("dflash2.logit_softcap", 30.0);
+        df.window = u("dflash2.sliding_window");
+        df.n_head = u("dflash2.attention.head_count");
+        df.n_head_kv = u("dflash2.attention.head_count_kv");
+        df.head_dim = u("dflash2.attention.key_length");
+        df.n_ff = u("dflash2.feed_forward_length");
+        df.rope_base = f("dflash2.rope.freq_base", 1e4);
+        df.rms_eps = f("dflash2.attention.layer_norm_rms_epsilon", 1e-6);
+    }
+
     p.vision = p.file.range("vision/mmproj");
     for (const auto& [name, t] : tj->members) {
         TensorRef r;

@@ -16,6 +16,7 @@ from unittest import mock
 from serve.frontend import ChatTemplate
 from serve.engine.process import ProcessEngine
 from serve.handler import serve
+from serve.prompt import REPLY_KEY
 from serve.service import Service
 from serve.util.text import ByteTokenizer
 
@@ -39,6 +40,7 @@ fail = "--fail-window" in args        # the first window over two slots fails
 ready = int(args[args.index("--ready") + 1]) if "--ready" in args else 4096
 MULTI = int(args[args.index("--multi") + 1]) if "--multi" in args else 3
 nopp = "--nopp" in args               # no PP lines while a prompt is read: a read beside the windows reports none
+bwait = int(args[args.index("--bwait") + 1]) if "--bwait" in args else 0   # admissions beside a running slot answered BWAIT
 STEP = 0.02
 s0 = "--slot0solo" in args           # slot 0 is the solo session: GEN copies the best slot's conversation over slot 0
 CH = 4096 if s0 else 32
@@ -193,6 +195,12 @@ while True:
         if lp is not None and bytes(int(x) & 255 for x in ids).find(b"PIPELINED") >= 0:   # as a layer-split engine
             print("ERR sampling logprobs: pipelined batch groups are not supported", flush=True)
             continue
+        if bslot is not None and bwait > 0 and active:   # no KV room beside the running slots: nothing ran
+            bwait -= 1
+            if log:
+                log.write(f"BWAIT {slot}\n"); log.flush()
+            print(f"BWAIT {slot}", flush=True)
+            continue
         if bytes(int(x) & 255 for x in ids).find(b"REFUSEME") >= 0:   # refused up front, then idle (no DONE)
             print("ERR refused: images are not enabled", flush=True)
             continue
@@ -320,7 +328,7 @@ class ParallelService(unittest.TestCase):
     """The real ProcessEngine and Service over HTTP, the fake engine behind them."""
 
     def start(self, slots, fit=None, slot_cache=False, fail=False, ready=None, multi=None, drafts=False, counts=False,
-              nopp=False, reuse=False, slot0_solo=False, solo_any=False, pms=False, windows=False):
+              nopp=False, reuse=False, slot0_solo=False, solo_any=False, pms=False, windows=False, bwait=0):
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_engine.py"
         script.write_text(FAKE_BATCH, encoding="utf-8")
@@ -339,6 +347,7 @@ class ParallelService(unittest.TestCase):
         extra += ["--soloany"] if solo_any else []
         extra += ["--pms"] if pms else []
         extra += ["--windows"] if windows else []
+        extra += ["--bwait", str(bwait)] if bwait else []
         with mock.patch.object(subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
             self.engine = ProcessEngine("basalt", extra)
@@ -456,6 +465,40 @@ class ParallelService(unittest.TestCase):
         go(second)
         a.join(30)
         return res
+
+    def test_an_admission_without_kv_room_waits_for_a_slot_to_end(self):
+        # BWAIT: the engine had no KV room for the second request beside the first; it asks again after the first's
+        # BDONE and is served
+        self.start(2, bwait=1)
+        res = self.race("first question LONGREPLY", "second question")
+        self.assertEqual(res["first question LONGREPLY"][0], "ok, " + "la " * 15 + "done.")
+        self.assertEqual(res["second question"][0], "ok, done.")
+        log = self.log.read_text().splitlines()
+        self.assertIn("BWAIT", [x.split()[0] for x in log])
+        self.assertEqual([x.split()[0] for x in log].count("BGEN"), 2, log)
+
+    def test_a_request_without_kv_room_is_not_passed_by_a_newer_one(self):
+        # BWAIT: the second request waits for room beside the first; the third, which arrives while it waits and finds a
+        # free slot, goes after the second, not before it
+        self.start(3, bwait=1)
+        out = {}
+
+        def go(t):
+            out[t] = self.chat(t)["choices"][0]["message"]["content"]
+        texts = ["first question LONGREPLY", "second", "third one, with a longer prompt"]
+        threads = [threading.Thread(target=go, args=(t,)) for t in texts]
+        for th in threads:
+            th.start()
+            time.sleep(0.15)
+        for th in threads:
+            th.join(30)
+        self.assertEqual(out[texts[1]], "ok, done.")
+        self.assertEqual(out[texts[2]], "ok, done.")
+        log = self.log.read_text().splitlines()
+        self.assertIn("BWAIT", [x.split()[0] for x in log])
+        lens = [int(x.split()[2]) for x in log if x.startswith("BGEN")]
+        self.assertEqual(len(lens), 3, log)
+        self.assertLess(lens[1], lens[2], log)
 
     def test_a_long_prompt_gives_way_to_a_short_one(self):
         """A long solo prompt read gives way at a chunk boundary to a short request, then continues and is answered."""
@@ -1231,6 +1274,7 @@ class RestartRaces(unittest.TestCase):
         e.ctl = threading.Lock()
         e.slot_cv = threading.Condition()
         e.admission = AdmissionQueue()
+        e.slot_ends = 0
         e.batch = 2
         e.max_context = 4096
         e.info = {"slot0_solo": 1}
@@ -1306,6 +1350,7 @@ class RestartRaces(unittest.TestCase):
         e.ctl = threading.Lock()
         e.slot_cv = threading.Condition()
         e.admission = AdmissionQueue()
+        e.slot_ends = 0
         e.batch = 2
         e.max_context = 4096
         e.info = {"slot0_solo": 1}
@@ -1435,6 +1480,38 @@ class RestartRaces(unittest.TestCase):
         self.assertEqual(passes[0], 5)
         self.assertGreaterEqual(len(passes), 2)
         self.assertIn("final answer", "".join(ev.text for ev in events if ev.kind == "content"))
+
+    def test_continuation_pass_tells_the_engine_where_the_reply_begins(self):
+        """A pass that continues the reply (the thinking budget closed) names the first prompt's length, so the engine takes
+        no turn checkpoint inside the reply: it would push the turn boundary the chat's next turn needs out of a chain of one."""
+        tok = ByteTokenizer()
+        tpl = ChatTemplate.from_file(Path(__file__).resolve().parents[2] / "serve/chat_template.jinja")
+        seen = []
+
+        class Engine:
+            max_context = 4096
+            last = None
+
+            def generate(self, prompt, max_new, sampling, cancel, session=None, **kw):
+                seen.append((len(prompt), dict(sampling or {}).get(REPLY_KEY)))
+                if len(seen) == 1:
+                    yield from b"a" * max_new
+                else:
+                    yield from b"final answer"
+                    yield 257
+
+        svc = Service(Engine(), tok, tpl)
+        ids = svc.encode_prompt([{"role": "user", "content": "hi"}], None, {"enable_thinking": True})
+        list(svc.run(ids, True, None, 64, {"temperature": 0.0, "reasoning_budget_tokens": 5}, threading.Event()))
+        self.assertEqual(seen[0], (len(ids), None))
+        self.assertGreaterEqual(len(seen), 2)
+        self.assertTrue(all(reply == len(ids) for _, reply in seen[1:]), seen)
+        self.assertGreater(seen[1][0], len(ids))
+
+    def test_reply_key_reaches_the_engine_line(self):
+        from serve.engine.process import ProcessEngine
+        self.assertIn(" reply=37", ProcessEngine.sampling_keys({REPLY_KEY: 37}))
+        self.assertNotIn("reply=", ProcessEngine.sampling_keys({}))
 
 
 class ConcurrencyLifecycleResources(unittest.TestCase):
@@ -1650,6 +1727,7 @@ class ConcurrencyLifecycleResources(unittest.TestCase):
         e.ctl = threading.Lock()
         e.slot_cv = threading.Condition()
         e.admission = AdmissionQueue()
+        e.slot_ends = 0
         e.batch = 2
         e.max_context = 64
         e.info = {"slot0_solo": 1}

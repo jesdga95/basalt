@@ -212,7 +212,20 @@ def fetch(out, only):
     same = isinstance(inv, dict) and inv.get("repo") == REPO
     rows = inv["tensors"] if same else inventory(out)
     os.makedirs(tdir, exist_ok=True)
-    manifest = []
+    manifest_path = os.path.join(out, "mtp-manifest.json")
+    existing = {}
+    if same and os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, encoding="utf-8") as f:
+                old = json.load(f)
+            if isinstance(old, list):
+                row_names = {r["name"] for r in rows}
+                for entry in old:
+                    if isinstance(entry, dict) and entry.get("name") in row_names and isinstance(entry.get("file"), str):
+                        if os.path.isfile(os.path.join(out, entry["file"])):
+                            existing[entry["name"]] = entry
+        except (OSError, ValueError):
+            existing = {}
     chunk = 64 << 20
     for r in rows:
         if only and only not in r["name"]:
@@ -244,8 +257,9 @@ def fetch(out, only):
                 sys.exit("%s: sha256 %s is not the checkpoint's %s - the download source sends wrong data (a mirror "
                          "that ignores Range requests?)" % (r["name"], digest, want))
             print("%s: wrong bytes (sha256 %s...), fetching it again" % (r["name"], digest[:12]), file=sys.stderr)
-        manifest.append(dict(r, file=os.path.relpath(path, out), sha256=digest))
-    with open(os.path.join(out, "mtp-manifest.json"), "w", encoding="utf-8") as f:
+        existing[r["name"]] = dict(r, file=os.path.relpath(path, out), sha256=digest)
+    manifest = [existing[r["name"]] for r in rows if r["name"] in existing]
+    with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=1)
 
 

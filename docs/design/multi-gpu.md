@@ -248,7 +248,7 @@ card runs its cuBLAS algorithm (`gemm.cu`); a normal run keeps each card's own, 
 | split, every model | single card where the model fits at the check's context; otherwise the same split with both stages on one GPU (`split_same`) | bitwise: KLD 0, greedy identical |
 | tensor | single card | KLD and top-1 the same or better within the gate's noise; not bitwise (partial sums meet with one BF16 rounding) |
 
-KLD runs use `/mnt/nvme/kld/*-bf16-base.kld` through the decode path (rule 5); traces go in a scratch directory. Step 3: the 27B stage and
+KLD figures here are from [wikitext KLD](../precision/quality.md#wikitext-kld), with `/mnt/nvme/kld/*-bf16-base.kld` through the decode path (rule 5); the preferred quality check is the [quality suite](../precision/quality-suite.md); traces go in a scratch directory. Step 3: the 27B stage and
 Inkling's split are bitwise vs one card; DeepSeek's peer vs one card is its CPU vs GPU expert rounding (KLD 0.01; BF16 gate 0.2805, 0.2794).
 
 ## Tensor (reserved)

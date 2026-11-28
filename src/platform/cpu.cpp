@@ -229,6 +229,14 @@ std::vector<std::vector<int>> cpu_l3_groups() {
     return groups;
 }
 
+bool pin_thread_to_cpus(std::thread& th, const std::vector<int>& cpus) {
+    (void) th;
+    (void) cpus;
+    return false;
+}
+
+int current_cpu() { return -1; }
+
 #else
 // --------------------------------------------------------------------------------------------- Linux
 
@@ -470,6 +478,16 @@ std::vector<std::vector<int>> cpu_l3_groups() {
     }
     return groups;
 }
+
+bool pin_thread_to_cpus(std::thread& th, const std::vector<int>& cpus) {
+    if (cpus.empty()) return false;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int c : cpus) CPU_SET(c, &set);
+    return pthread_setaffinity_np(th.native_handle(), sizeof set, &set) == 0;
+}
+
+int current_cpu() { return sched_getcpu(); }
 
 #endif
 

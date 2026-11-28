@@ -722,7 +722,7 @@ int main(int argc, char** argv) {
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
     std::mt19937 rng(18);
-    for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 42, 40, 12, 13, 7, 8}) {
+    for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 42, 39, 40, 12, 13, 7, 8}) {
         check_mmvq(t, 2560, 67, s, rng);   // the model's n_embd; 67 rows: a partial block of 4 rows
         check_mmvq(t, 1024, 5, s, rng);
     }
@@ -743,6 +743,8 @@ int main(int argc, char** argv) {
     // the UD file's real pairs at its real expert shape: bitwise, and against the double reference
     for (auto [gu, dt] : {std::pair<int, int>{16, 39}, {17, 39}, {22, 39}, {18, 21}, {22, 21}})
         check_grouped_ref(gu, dt, 5120, 2304, s, rng);
+    check_grouped(39, 39, 2048, 2048, s, rng);                               // ERNIE 5.5 MXFP4 gate/up + down
+    check_grouped_ref(39, 39, 2048, 2048, s, rng);
     check_mxfp4_edge_scales(s, rng);   // the MXFP4 dequantizer at the E8M0 exponent edges
     check_mmvq(21, 2304, 67, s, rng);                                       // IQ3_S rows at the down row length
     check_mmvq_mma(s, rng);

@@ -271,7 +271,7 @@ int main(int argc, char** argv) {
     };
     auto seg_kv = [&](const Window& w, int l, bool int8) {
         if (!int8) return;
-        k::qsa_dec_kv_post_seg(kv_args(O[1], true, 0), seg_table(w, l), w.R, S_, sc, cs);
+        k::qsa_dec_kv_post_seg(kv_args(O[1], true, 0), seg_table(w, l), w.R, S_, sc, int8, cs);
     };
     auto seg_rest = [&](const Window& w, int l, bool int8) {
         const k::QsaSegTable t = seg_table(w, l);

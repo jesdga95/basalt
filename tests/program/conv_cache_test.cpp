@@ -12,7 +12,9 @@
 //   3. a mount advances a checkpoint's stamp and the rotation then takes a different leaf;
 //   4. a one-slot budget has no room for root and leaf, so the pin is off and the oldest leaves (the
 //      newest point stays, as before);
-//   5. the policy is pure: the same stamps, the same victim.
+//   5. the policy is pure: the same stamps, the same victim;
+//   6. a pool shared by every chain: sized by its bytes, never past what the chains can hold, and its victim the least
+//      recently used checkpoint across the chains, a chain's root only when nothing else is left.
 #include "basalt/program/conv_cache.hpp"
 
 #include <cstdint>
@@ -20,6 +22,8 @@
 #include <vector>
 
 using basalt::program::conv_cache::eviction_victim;
+using basalt::program::conv_cache::pool_checkpoints;
+using basalt::program::conv_cache::pool_victim;
 
 namespace {
 int g_fail = 0;
@@ -61,6 +65,25 @@ int main() {
         const size_t a = eviction_victim(stamps.data(), stamps.size(), 4);
         const size_t b = eviction_victim(stamps.data(), stamps.size(), 4);
         check(a == 1 && b == 1, "ties among equally stale leaves: the earlier index, deterministically");
+    }
+    {
+        const uint64_t mib = 1ull << 20;
+        check(pool_checkpoints(4096 * mib, 128 * mib, 6, 64) == 31, "a 4 GiB pool of 128 MiB checkpoints: 32 fit, one for the save");
+        check(pool_checkpoints(4096 * mib, 128 * mib, 6, 0) == 6, "one chain: never past --prompt-cache");
+        check(pool_checkpoints(4096 * mib, 128 * mib, 6, 2) == 16, "two slots: two chains of --prompt-cache, two per slot");
+        check(pool_checkpoints(200 * mib, 128 * mib, 6, 8) == 0, "a pool of fewer than two checkpoints: 0");
+        check(pool_checkpoints(0, 0, 6, 4) == 20, "checkpoints of no bytes: the chains' own limit");
+        check(pool_checkpoints(4096 * mib, 128 * mib, 0, 4) == 0, "--prompt-cache 0: none");
+    }
+    {
+        const std::vector<std::vector<uint64_t>> chains = {{1, 9, 12}, {}, {2, 5}, {3}};
+        const auto v = pool_victim(chains);
+        check(v.first == 2 && v.second == 1, "across chains: the least recently used checkpoint that is no root");
+        const std::vector<std::vector<uint64_t>> roots = {{4}, {}, {2}, {3}};
+        const auto r = pool_victim(roots);
+        check(r.first == 2 && r.second == 0, "only roots left: the least recently used root");
+        const auto e = pool_victim({{}, {}});
+        check(e.first == 2, "every chain empty: none");
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;

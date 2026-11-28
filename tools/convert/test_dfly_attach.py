@@ -89,6 +89,30 @@ class DflyAttachTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             dfly_attach.add_dfly(self.args(undo_dir=str(self.t / "undo2")))
 
+    def test_truncated_safetensors_and_size_mismatch_are_refused(self):
+        write_safetensors(self.st, self.names)
+        full = self.st.read_bytes()
+        # Truncated tensor payload (1 byte missing)
+        self.st.write_bytes(full[:-1])
+        with self.assertRaises(SystemExit):
+            dfly_attach.add_dfly(self.args())
+        # Truncated inside header
+        self.st.write_bytes(full[:20])
+        with self.assertRaises(SystemExit):
+            dfly_attach.add_dfly(self.args())
+        # Mismatched shape vs data_offsets byte count
+        head, data = {}, b""
+        for i, n in enumerate(self.names):
+            raw = bf16(6, i)
+            shape = [2, 4] if i == 0 else [2, 3]
+            head[n] = {"dtype": "BF16", "shape": shape, "data_offsets": [len(data), len(data) + len(raw)]}
+            data += raw
+        h = json.dumps(head).encode()
+        self.st.write_bytes(struct.pack("<Q", len(h)) + h + data)
+        with self.assertRaises(SystemExit):
+            dfly_attach.add_dfly(self.args())
+        self.assertFalse((self.t / "undo").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,7 @@ Like --dspark: no other section moves, and --roll-back restores the pack bit for
 from __future__ import annotations
 
 import json
+import math
 import struct
 from pathlib import Path
 
@@ -22,18 +23,31 @@ def die(msg: str):
 
 def read_header(path: Path) -> tuple[dict, int]:
     """The safetensors header (without __metadata__) and the file offset where the tensor data starts."""
+    size = path.stat().st_size
     with path.open("rb") as f:
         raw = f.read(8)
         if len(raw) != 8:
             die(f"{path}: not a safetensors file")
         (n,) = struct.unpack("<Q", raw)
-        if n > 64 << 20:
-            die(f"{path}: not a safetensors file")
+        if n > 64 << 20 or 8 + n > size:
+            die(f"{path}: truncated or not a safetensors file")
         try:
             head = json.loads(f.read(n))
         except ValueError:
             die(f"{path}: not a safetensors file")
+    if not isinstance(head, dict):
+        die(f"{path}: not a safetensors file")
     head.pop("__metadata__", None)
+    end = 0
+    for k, v in head.items():
+        if not isinstance(v, dict) or "data_offsets" not in v or len(v["data_offsets"]) != 2:
+            die(f"{path}: {k} has a bad safetensors header entry")
+        lo, hi = v["data_offsets"]
+        if not isinstance(lo, int) or not isinstance(hi, int) or not 0 <= lo <= hi:
+            die(f"{path}: {k} has bad data offsets {lo}..{hi}")
+        end = max(end, hi)
+    if 8 + n + end > size:
+        die(f"{path}: truncated, its header covers {8 + n + end} bytes but the file has {size}")
     return head, 8 + n
 
 
@@ -70,7 +84,10 @@ def dfly_record(path: Path, hf_config: dict | None) -> dict:
         if t["dtype"] != "BF16":
             die(f"{path}: {name} is {t['dtype']}; the engine reads the drafter's BF16 tensors")
         lo, hi = t["data_offsets"]
-        tensors[name[len(PREFIX):]] = {"dtype": "BF16", "shape": t["shape"], "offset": base + lo, "bytes": hi - lo}
+        shape = t["shape"]
+        if hi - lo != math.prod(shape) * 2:
+            die(f"{path}: {name} has {hi - lo} bytes, expected {math.prod(shape) * 2} for BF16 {shape}")
+        tensors[name[len(PREFIX):]] = {"dtype": "BF16", "shape": shape, "offset": base + lo, "bytes": hi - lo}
     if not tensors:
         die(f"{path} holds no {PREFIX}* tensors")
     want = wanted(layers)

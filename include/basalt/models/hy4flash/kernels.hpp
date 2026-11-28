@@ -85,6 +85,18 @@ void mla_query(const void* w_kb, const float* q, const float* kv_raw, const floa
 /// for h <= heads (each head an "expert" of an MMQ product).
 void head_major_ids(int32_t* ids, int32_t* bounds, int heads, int rows, void* stream);
 
+/// One Q8_0 matrix of a multi-matrix decode launch (`q8x_mmvq`): same bits as kernels::native_q8_0_mmvq.
+constexpr int kQ8xMats = 4;
+struct Q8xMat {
+    const void* w = nullptr;
+    const void* x = nullptr;
+    float* y = nullptr;
+    int n_out = 0;
+};
+/// Up to kQ8xMats Q8_0 matrices of the same width `n_in` (3072 or 6144) in one PDL launch (ncols 1..8),
+/// bit-for-bit identical to calling kernels::native_q8_0_mmvq on each matrix.
+void q8x_mmvq(const Q8xMat* mats, int n, int n_in, int ncols, void* stream);
+
 /// x[i] *= sigmoid(g[i]).
 void mul_sigmoid(const float* g, float* x, int n, void* stream);
 
@@ -191,6 +203,12 @@ struct EngramArgs {
     int n_embd = 3072;
     float eps = 1.1920929e-07f;   ///< of the gate's two norms (the stream and the key) and the value's: FP32's machine epsilon
 };
+
+/// Dequantizes packed F8_E4M3 Engram rows `raw` [n_tok][n_cols][W] on the device, applies per-(row, col) RMSNorm
+/// (eps = 1.1920929e-07f) and per-element scale `norm_w` [n_cols][W] and row validity mask `valid` [n_tok], writing
+/// fp32 `out` [n_tok][n_cols][W] bit-for-bit identically to the host loop.
+void engram_norm_e4m3(const uint8_t* raw, const float* norm_w, const float* valid, int n_tok, int n_cols, int W,
+                      float* out, void* stream);
 
 /// The Engram step on the four streams x[t][4][n] of n_tok rows, in place. kv: the fused projection [t][5][n] (four keys, one value)
 /// before its bias kv_b [5][n]; gate_w and hc_scale [4][n]; pre_gamma [n]. valid[t]: 0 leaves row t as it is.

@@ -119,6 +119,11 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
             if (v != "on" && v != "off") { basalt::log::error("basalt", "--grammar: on or off"); return 2; }
             o.grammar = v == "on";
         }
+        else if (a == "--kv-pool") {
+            const std::string v = next("--kv-pool");
+            if (v != "on" && v != "off") { basalt::log::error("basalt", "--kv-pool: on or off"); return 2; }
+            o.kv_pool = v == "on";
+        }
         else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") { o.vision = true; o.vision_in_engine = true; }
@@ -127,7 +132,7 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         else if (a == "--conversation-cache-dir") o.conversation_cache_dir = next("--conversation-cache-dir");
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-disk-mib" ||
-                 a == "--conversation-cache-min-tokens" || a == "--ram-reserve-mib") {
+                 a == "--conversation-cache-min-tokens" || a == "--ram-reserve-mib" || a == "--checkpoint-pool-mib") {
             const std::string value = next(a.c_str());
             int64_t number = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
@@ -142,6 +147,7 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
             else if (a == "--conversation-cache-disk-mib") o.conversation_cache_disk_mib = number;
             else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = (int) number;
             else if (a == "--ram-reserve-mib") o.ram_reserve_mib = number;
+            else if (a == "--checkpoint-pool-mib") o.checkpoint_pool_mib = number;
             else o.conversation_cache_slots = (int) number;
         }
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
@@ -184,6 +190,10 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         basalt::log::warn("basalt", "RAM guard off (--ram-reserve-mib 0): low RAM can stop the engine or the machine");
     if (adapter != nullptr)
         if (const std::optional<int> code = adapter->finish_flags(o)) return code;
+    if (adapter != nullptr && o.batch > adapter->max_slots()) {
+        basalt::log::error("basalt", "--batch %d: %s batches at most %d slots", o.batch, adapter->arch(), adapter->max_slots());
+        return 2;
+    }
     if (!o.lossy.empty()) {
         basalt::log::warn("basalt", "lossy flags enabled, these flags will affect the accuracy of the served model");
         for (const auto& f : o.lossy) basalt::log::warn("basalt", "%s", f.effect.c_str());
