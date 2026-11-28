@@ -10,7 +10,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <cstdlib>
+#include <atomic>
 #include <stdexcept>
 
 namespace basalt::models::hy4flash {
@@ -648,6 +648,7 @@ __global__ void head_major_ids_kernel(int32_t* ids, int32_t* bounds, int heads, 
 template <typename C>
 void prepare_impl(const float* q, const float* q_abs, const float* kv_raw, const float* kv_norm, const MlaArgs& a, int pos0,
                   int n_tok, int ring, float* qcur, C* cache, void* stream) {
+    if (n_tok <= 0) return;
     prepare_kernel<C><<<dim3(a.heads + 1, n_tok), kThreads, 0, (cudaStream_t) stream>>>(q, q_abs, kv_raw, kv_norm, a, pos0, ring, qcur, cache);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
@@ -658,38 +659,45 @@ template <> struct RowOf<uint16_t> { using T = RowF16; };
 template <> struct RowOf<uint8_t> { using T = RowFp8; };
 
 // 16-head groups a block of the tensor-core kernel takes: 2 when the heads come in 32s
-int mma_groups(int heads) {
-    static const int force = [] { const char* e = std::getenv("HY4_MMA_GROUPS"); return e ? std::atoi(e) : 0; }();   // DIAG
-    if (force == 1 || force == 2) return heads % (16 * force) == 0 ? force : 1;
-    return heads % 32 == 0 ? 2 : 1;
-}
+int mma_groups(int heads) { return heads % 32 == 0 ? 2 : 1; }
 
 int chunks_of(int max_cells) { return std::max(1, (max_cells + mqa::kChunk - 1) / mqa::kChunk); }
 size_t counters_bytes(int heads) { return ((size_t) kAttTok * (heads / 8) * 4 + 255) & ~(size_t) 255; }
 
 int sm_count() {
-    static int sms = 0;
-    if (!sms) {
-        int dev = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    static std::atomic<int> sms[64];
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return 0;
+    if (dev >= 0 && dev < 64) {
+        int v = sms[dev].load(std::memory_order_relaxed);
+        if (v > 0) return v;
+        if (cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && v > 0) {
+            sms[dev].store(v, std::memory_order_relaxed);
+            return v;
+        }
+        return 0;
     }
-    return sms;
+    int v = 0;
+    return cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess ? v : 0;
 }
 
 template <typename C>
 void attend_impl(const float* qcur, const C* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
                  int max_cells, void* work, float* o_lat, void* stream) {
+    if (n_tok <= 0) return;
     if (a.rank != mqa::kLatent || a.rope != 64 || a.heads % 8) throw std::invalid_argument("mla_attend: a 512 + 64 row and heads in eights");
     cudaStream_t st = (cudaStream_t) stream;
     if constexpr (!std::is_same_v<C, float>) {
         if (n_tok > kAttTok && a.heads % 16 == 0) {   // a chunk of rows; a window keeps the kernel below
             const int g = mma_groups(a.heads);
-            static bool raised[2] = {false, false};
-            if (!raised[g - 1]) {
-                if (g == 2) cudaFuncSetAttribute(attend_mma_kernel<C, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mma_smem<2>());
-                else cudaFuncSetAttribute(attend_mma_kernel<C, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mma_smem<1>());
-                raised[g - 1] = true;
+            static std::atomic<bool> raised[64][2];
+            int dev = 0;
+            const bool have_dev = cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 64;
+            if (!have_dev || !raised[dev][g - 1].load(std::memory_order_acquire)) {
+                const cudaError_t se =
+                    g == 2 ? cudaFuncSetAttribute(attend_mma_kernel<C, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mma_smem<2>())
+                           : cudaFuncSetAttribute(attend_mma_kernel<C, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mma_smem<1>());
+                if (have_dev && se == cudaSuccess) raised[dev][g - 1].store(true, std::memory_order_release);
             }
             if (g == 2)
                 attend_mma_kernel<C, 2><<<dim3(a.heads / 32, n_tok), 256, mma_smem<2>(), st>>>(qcur, cache, r.firsts, r.counts, r.cells, r.cells_stride,
@@ -742,6 +750,7 @@ void query_impl(const void* w_kb, const float* q, const float* kv_raw, const flo
 }  // namespace
 
 void head_major_ids(int32_t* ids, int32_t* bounds, int heads, int rows, void* stream) {
+    if (heads <= 0 || rows < 0) return;
     const int n = std::max(heads * rows, heads + 1);
     head_major_ids_kernel<<<(n + 255) / 256, 256, 0, (cudaStream_t) stream>>>(ids, bounds, heads, rows);
     if (!stream) cudaStreamSynchronize(nullptr);
@@ -749,6 +758,7 @@ void head_major_ids(int32_t* ids, int32_t* bounds, int heads, int rows, void* st
 
 void q8_0_heads_gemv(const void* w, const float* x, int x_head_stride, int x_tok_stride, int heads, int rows, int k, int n_tok,
                      float* y, void* stream) {
+    if (heads <= 0 || rows <= 0 || n_tok <= 0) return;
     if ((k != 512 && k != 192) || ((uintptr_t) w & 15)) throw std::invalid_argument("q8_0_heads_gemv: rows of 512 or 192, 16-byte aligned");
     const int nb = k / 32;
     const auto kern = nb == 16 ? heads_gemv_kernel<16> : heads_gemv_kernel<6>;   // v_b's rows (the latent), k_b's (the query's nope part)

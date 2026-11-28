@@ -237,12 +237,14 @@ __global__ void engram_kernel(const float* __restrict__ kv, const float* __restr
 }  // namespace
 
 void mul_sigmoid(const float* g, float* x, int n, void* stream) {
+    if (n <= 0) return;
     bk::launch_pdl(mul_sigmoid_kernel, dim3((unsigned) ((n + 255) / 256)), dim3(256), 0, (cudaStream_t) stream, g, x, n);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
 void f32_gemm_rows(const float* x, const float* w, int rows, int cols, float scale, int n_tok, float* y, void* stream) {
     if (cols % 4) throw std::invalid_argument("f32_gemm_rows: cols");
+    if (rows <= 0 || n_tok <= 0) return;
     rows_gemv_kernel<<<dim3((rows + 7) / 8, n_tok), 256, 0, (cudaStream_t) stream>>>(x, w, rows, cols, scale, y);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
@@ -314,6 +316,7 @@ __global__ void __launch_bounds__(512) add_norm_hc_post_kernel(const float* __re
 void add_norm_hc_post(const float* a, const float* b, const float* w, float eps, const float* x, const float* coef, int coef_stride,
                       int n_tokens, int E, float* out, void* stream) {
     if (E != 3072) throw std::invalid_argument("add_norm_hc_post: the model's width is 3072");
+    if (n_tokens <= 0) return;
     // a decode window's few rows spread over 4 blocks each (one round of loads a thread, on 4x the SMs); a prompt chunk's rows
     // fill the card already, so a block takes a whole row and the norm is read once a row
     const unsigned slices = n_tokens <= 8 ? 4 : 1;
@@ -324,7 +327,7 @@ void add_norm_hc_post(const float* a, const float* b, const float* w, float eps,
 // a sliding-window layer's row spans from the window's first position, read on the card (so a captured graph replays them for any
 // position): firsts, counts, fill and positions, `arows` apart
 __global__ void swa_meta_kernel(const int32_t* __restrict__ pos0, int R, int window, int arows, int32_t* __restrict__ meta) {
-    const int t = threadIdx.x;
+    const int t = (int) (blockIdx.x * blockDim.x + threadIdx.x);
     if (t >= R) return;
     const int pos = *pos0 + t, first = pos + 1 - window > 0 ? pos + 1 - window : 0;
     meta[t] = first;
@@ -334,15 +337,19 @@ __global__ void swa_meta_kernel(const int32_t* __restrict__ pos0, int R, int win
 }
 
 void swa_meta(const int32_t* pos0, int R, int window, int arows, int32_t* meta, void* stream) {
-    swa_meta_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(pos0, R, window, arows, meta);
+    if (R < 0 || R > arows || window <= 0) throw std::invalid_argument("swa_meta: invalid bounds");
+    if (R == 0) return;
+    swa_meta_kernel<<<(unsigned) ((R + 31) / 32), 32, 0, (cudaStream_t) stream>>>(pos0, R, window, arows, meta);
 }
 
 void add_vectors(const float* a, const float* b, float* out, int n, void* stream) {
+    if (n <= 0) return;
     bk::launch_pdl(add_kernel, dim3((unsigned) ((n + 255) / 256)), dim3(256), 0, (cudaStream_t) stream, a, b, out, n);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
 void weighted_sum_window(const float* const* rows, const float* w, int n_tok, int K, int n, float* out, void* stream) {
+    if (n_tok <= 0 || n <= 0) return;
     wsum_kernel<<<dim3((n + 255) / 256, n_tok), 256, 0, (cudaStream_t) stream>>>(rows, w, K, n, out);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
@@ -372,11 +379,13 @@ void swiglu_split_clamped(const float* gu, float* h, int64_t rows, int n_ff, flo
 }
 
 void weighted_sum_tokens(const float* rows, const int32_t* map, const float* w, int n_tok, int K, int n, float* out, void* stream) {
+    if (n_tok <= 0 || n <= 0) return;
     wsum_tokens_kernel<<<dim3((n + 255) / 256, n_tok), 256, 0, (cudaStream_t) stream>>>(rows, map, w, K, n, out);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
 void fill_streams(const float* e, int n, int n_tok, float* x, void* stream) {
+    if (n_tok <= 0 || n <= 0) return;
     fill_kernel<<<dim3((n + 255) / 256, n_tok), 256, 0, (cudaStream_t) stream>>>(e, n, x);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
@@ -393,6 +402,7 @@ void engram_norm_e4m3(const uint8_t* raw, const float* norm_w, const float* vali
 
 void engram_apply(const float* kv, const float* kv_b, const float* gate_w, const float* pre_gamma, const float* hc_scale,
                   const float* valid, int n_tok, const EngramArgs& a, float* x, void* stream) {
+    if (n_tok <= 0) return;
     engram_kernel<<<dim3(4, n_tok), kEngramThreads, 0, (cudaStream_t) stream>>>(kv, kv_b, gate_w, pre_gamma, hc_scale, valid, a, x);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
