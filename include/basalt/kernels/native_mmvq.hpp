@@ -65,8 +65,10 @@ struct Q80Segments {
 };
 void native_q8_0_mmvq_segments(const void* weights, const Q80Segments& seg, int n_in, int ncols, void* stream);
 
-// Bitwise-identical Q8_0 MMVQ over plane-separated weights (wgemm::q8_planes: int8 codes [total_rows][n_in], then
-// fp16 scales [total_rows][n_in / 32]). Aligned code loads; shares the code plane zero-copy with prefill::q8.
+// Q8_0 MMVQ over plane-separated weights (wgemm::q8_planes: int8 codes [total_rows][n_in], then fp16 scales
+// [total_rows][n_in / 32]; shares the code plane zero-copy with prefill::q8), n_in a multiple of 128. One summation order
+// at every column count (each block's exact integer dot, then one fp32 chain over the blocks in order), so a column's
+// bits never depend on the columns beside it; segments give the same bits as their own calls.
 void native_q8_planes_mmvq(const void* planes, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
                            void* stream, float softcap = 0.0f);
 void native_q8_planes_mmvq_segments(const void* planes, int total_rows, const Q80Segments& seg, int n_in, int ncols,

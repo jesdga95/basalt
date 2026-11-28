@@ -26,6 +26,10 @@ download or any re-quantizing.
 - **Tensor type 44, `F8_E4M3`, no version change:** one E4M3 code per value with the matrix's FP32 scale as a separate
   `<name>.scale` tensor (F32 [1]), as NVIDIA's FP8 checkpoints store them. The Qwen3.8-27B pack's projections use it. An engine
   from before it refuses such a tensor by name ("the dense kernels read ...").
+- **Engram row types, no version change:** the `engram` section holds rows of IQ4_NL, Q5_K, Q6_K, MXFP4 or MXFP8
+  (type 43: one E8M0 scale, then 32 E4M3 codes per 32 values, as Unsloth's standalone table stores it), with the
+  geometry in `meta.engram` (`type_id`, `row_values`, `row_bytes`). An engine from before the wider set refuses an
+  unknown `type_id`.
 - **Added `dspark/gguf`, optional, no version change:** a DeepSeek pack's DSpark drafter. The engine ignores sections it
   does not name, so an engine from before it runs such a pack plain, and a pack without it runs plain on any engine.
 - **Trimmed `meta`:** no `sampling` (the server reads the GGUF metadata's `general.sampling.*` keys), no `profile` or

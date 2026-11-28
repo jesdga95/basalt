@@ -5,6 +5,7 @@
 #include "basalt/kernels/nvfp4_planes.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/window_gemm.hpp"
+#include "basalt/prefill/fp4_dense.hpp"
 #include "basalt/models/inkling2/dflash2_kernels.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 
@@ -16,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <random>
 #include <vector>
 
@@ -279,7 +281,7 @@ void test_top16_and_selector() {
     uint8_t* scr_d = zeros<uint8_t>(dflash2_top16_scratch_bytes(rows, kVocab));
     int32_t* cand_d = zeros<int32_t>((size_t) rows * 2 * kDf2TopK);
     float* tail_lse_d = zeros<float>((size_t) rows * 2);
-    dflash2_top16(logits_d, nullptr, false, nullptr, rows, kVocab, cap, scr_d, cand_d, tail_lse_d, nullptr);
+    dflash2_top16(logits_d, nullptr, false, nullptr, rows, kVocab, kVocab, cap, scr_d, cand_d, tail_lse_d, nullptr);
     const auto cand_h = host(cand_d, (size_t) rows * 2 * kDf2TopK);
     const auto tail_h = host(tail_lse_d, (size_t) rows * 2);
 
@@ -398,7 +400,86 @@ void test_top16_and_selector() {
 
 }  // namespace
 
-int main() {
+// The batched drafter's head screen on the FP4 block-scaled tensor cores (fp4_dense over the head's NVFP4 planes, the
+// normed draft rows rounded to NVFP4): against double sums over the Q8 head it was made from (the screen hands its top
+// candidates to dflash2_top16, which rescores them on the Q8 head), and a row's logits bitwise the same in calls of 1, 64
+// and 320 rows. `bench`: us a call at 200064 rows for 4, 64, 256 and 320 draft rows.
+void test_head_screen(bool bench) {
+    namespace fd = basalt::prefill::fp4_dense;
+    constexpr int kE = kWidth;
+    const int V = 128 * 64, D = 320;
+    std::vector<uint8_t> q8((size_t) V * (kE / 32) * 34);
+    std::vector<double> wdeq((size_t) V * kE);
+    std::uniform_int_distribution<int> q(-127, 127);
+    for (int r = 0; r < V; ++r)
+        for (int b = 0; b < kE / 32; ++b) {
+            uint8_t* blk = q8.data() + ((size_t) r * (kE / 32) + b) * 34;
+            const float d = 0.002f + 0.0001f * (float) (b % 7);
+            const __half h = __float2half(d);
+            std::memcpy(blk, &h, 2);
+            for (int j = 0; j < 32; ++j) {
+                const int8_t v = (int8_t) q(rng);
+                blk[2 + j] = (uint8_t) v;
+                wdeq[(size_t) r * kE + b * 32 + j] = (double) __half2float(h) * v;
+            }
+        }
+    uint8_t* d_q8 = dev(q8);
+    void* planes = zeros<uint8_t>(basalt::kernels::nvfp4p::bytes(V, kE));
+    float* scale = zeros<float>(1);
+    basalt::kernels::nvfp4p::from_q8(d_q8, V, kE, planes, scale, nullptr);
+    const std::vector<float> x = randn((size_t) D * kE, 1.f);
+    float* dx = dev(x);
+    void* act = zeros<uint8_t>(fd::act_bytes(D, kE));
+    float* gs = zeros<float>(D);
+    float* logits = zeros<float>((size_t) D * V);
+    fd::quantize(dx, D, kE, kE, act, gs, nullptr);
+    fd::product(planes, scale, V, kE, act, gs, D, logits, V, false, nullptr);
+    const std::vector<float> got = host(logits, (size_t) 4 * V);
+    std::vector<double> ref((size_t) 4 * V);
+    for (int t = 0; t < 4; ++t)
+        for (int r = 0; r < V; ++r) {
+            double acc = 0;
+            for (int k = 0; k < kE; ++k) acc += wdeq[(size_t) r * kE + k] * x[(size_t) t * kE + k];
+            ref[(size_t) t * V + r] = acc;
+        }
+    check_close("head screen (W4A4) vs the Q8 head, double", got, ref, 0.15);
+    // a row's bits at 1 and 64 rows a call, against the 320-row call
+    const std::vector<float> all = host(logits, (size_t) D * V);
+    bool same = true;
+    for (const int n : {1, 64}) {
+        float* l2 = zeros<float>((size_t) n * V);
+        void* a2 = zeros<uint8_t>(fd::act_bytes(n, kE));
+        float* g2 = zeros<float>(n);
+        fd::quantize(dx, n, kE, kE, a2, g2, nullptr);
+        fd::product(planes, scale, V, kE, a2, g2, n, l2, V, false, nullptr);
+        same = same && host(l2, (size_t) n * V) == std::vector<float>(all.begin(), all.begin() + (size_t) n * V);
+    }
+    std::printf("  %-44s %s\n", "head screen: rows at 1 / 64 / 320 a call", same ? "bitwise PASS" : "FAIL");
+    if (!same) ++failures;
+    if (bench) {
+        const int VB = 200064;
+        void* pb = zeros<uint8_t>(basalt::kernels::nvfp4p::bytes(VB, kE));
+        cudaMemset(pb, 0x22, basalt::kernels::nvfp4p::bytes(VB, kE));   // finite codes and scales
+        float* lb = zeros<float>((size_t) D * VB);
+        for (const int n : {4, 64, 256, 320}) {
+            cudaEvent_t e0, e1;
+            cudaEventCreate(&e0);
+            cudaEventCreate(&e1);
+            fd::product(pb, scale, VB, kE, act, gs, n, lb, VB, false, nullptr);
+            cudaEventRecord(e0);
+            for (int i = 0; i < 20; ++i) fd::product(pb, scale, VB, kE, act, gs, n, lb, VB, false, nullptr);
+            cudaEventRecord(e1);
+            cudaEventSynchronize(e1);
+            float ms = 0;
+            cudaEventElapsedTime(&ms, e0, e1);
+            const double us = 1e3 * ms / 20;
+            std::printf("  bench head screen %d x %d: %.1f us, %.0f TFLOP/s, %.0f GB/s of planes\n", VB, n, us,
+                        2.0 * VB * kE * n / (us * 1e6), (double) basalt::kernels::nvfp4p::bytes(VB, kE) / (us * 1e3));
+        }
+    }
+}
+
+int main(int argc, char** argv) {
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
         std::printf("inkling2_dflash2_parity: no CUDA device, skipping\n");
@@ -408,5 +489,6 @@ int main() {
     test_pack_tap_and_split_fc();
     test_conv2_and_qk_prep();
     test_top16_and_selector();
+    test_head_screen(argc > 1 && std::string(argv[1]) == "--bench");
     return failures ? 1 : 0;
 }

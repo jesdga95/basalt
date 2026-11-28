@@ -208,6 +208,71 @@ class Hy4FlashTest(unittest.TestCase):
         self.assertFalse((self.t / "out.basalt").exists())
         self.assertFalse((self.t / "out.basalt.partial").exists())
 
+    def test_mmproj_preserves_meta_vision_and_license_quantized_by(self):
+        from gguf_reader import GGUFFile
+        g0 = GGUFFile(self.gguf)
+        raw = self.gguf.read_bytes()
+        gw = GGUFWriter()
+        for k, v in g0.metadata.items():
+            if isinstance(v, int) and not isinstance(v, bool):
+                gw.add(k, v, "u32")
+            elif isinstance(v, list) and v and isinstance(v[0], int):
+                ty = "array:u64" if any(k.endswith(s) for s in ("multipliers", "offsets", "sizes")) else "array:u32"
+                gw.add(k, v, ty)
+            else:
+                gw.add(k, v)
+        gw.add("general.quantized_by", "Someone")
+        for t in g0.tensors:
+            nb = t.expected_bytes()
+            gw.add_raw(t.name, t.shape, t.type_name, raw[g0.data_start + t.offset:g0.data_start + t.offset + nb])
+        q_gguf = gw.write(self.t / "hy-qby.gguf")
+        mmproj = self.t / "mmproj.gguf"
+        mmproj.write_bytes(b"GGUF" + b"\0" * 16 + b"hy_v4_flash" + b"\0" * 100)
+        convert.convert(self.args(gguf=[str(q_gguf)], mmproj=str(mmproj)))
+        m = ModelFile(str(self.t / "out.basalt"))
+        meta = json.loads(m.read("meta"))
+        self.assertEqual(meta["vision"]["mmproj"], "vision/mmproj")
+        self.assertEqual(meta["vision"]["mmproj_bytes"], mmproj.stat().st_size)
+        self.assertEqual(meta["license"]["quantized_by"], "Someone")
+        self.assertEqual(meta["license"]["text"], "Tencent Hy License, Version 1.0\n")
+
+    def test_sections_from_copies_dfly_avoids_duplicate_mtp_and_supports_dry_run(self):
+        import dfly_attach
+        # Add dfly config keys to hf config.json and attach a valid dfly drafter to a base pack with vision/mmproj.
+        cfg = json.loads((self.hf / "config.json").read_text())
+        cfg.update({"dfly_num_hidden_layers": 2, "dfly_mask_token_id": 1,
+                    "dfly_target_kv_layers": [1, 2], "dfly_target_index_layer": [1, 2]})
+        (self.hf / "config.json").write_text(json.dumps(cfg))
+        mmproj = self.t / "mmproj.gguf"
+        mmproj.write_bytes(b"GGUF" + b"\0" * 16 + b"hy_v4_flash" + b"\0" * 100)
+        base_path = self.t / "base.basalt"
+        convert.convert(self.args(mmproj=str(mmproj), out=str(base_path)))
+        dfly = self.t / "dfly.safetensors"
+        names = [dfly_attach.PREFIX + n for n in sorted(dfly_attach.wanted(2))]
+        head = {n: {"dtype": "BF16", "shape": [2], "data_offsets": [4 * i, 4 * i + 4]} for i, n in enumerate(names)}
+        hj = json.dumps(head).encode()
+        dfly.write_bytes(len(hj).to_bytes(8, "little") + hj + b"\1\2\3\4" * len(names))
+        dfly_attach.add_dfly(type("A", (), dict(into=str(base_path), dfly=str(dfly),
+                                                undo_dir=str(self.t / "undo"), roll_back=False))())
+
+        # --sections-from --dry-run must succeed cleanly and write nothing.
+        new_path = self.t / "new.basalt"
+        convert.convert(self.args(sections_from=str(base_path), out=str(new_path), dry_run=True))
+        self.assertFalse(new_path.exists())
+
+        # Real --sections-from must copy dfly and vision without duplicating mtp/dense.
+        convert.convert(self.args(sections_from=str(base_path), out=str(new_path)))
+        base_m, new_m = ModelFile(str(base_path)), ModelFile(str(new_path))
+        self.assertIn("dfly", new_m.names())
+        self.assertEqual(new_m.read("dfly"), dfly.read_bytes())
+        self.assertEqual(new_m.read("vision/mmproj"), mmproj.read_bytes())
+        base_meta, new_meta = json.loads(base_m.read("meta")), json.loads(new_m.read("meta"))
+        self.assertEqual(new_meta["dfly2"], base_meta["dfly2"])
+        self.assertEqual(new_meta["vision"], base_meta["vision"])
+        self.assertEqual(set(new_meta["sections_from"]["copied"]), {"vision/mmproj", "dfly"})
+        for sec in new_m.names():
+            self.assertTrue(new_m.verify(sec), sec)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,7 +3,9 @@
     python3 -m pytest tools/test_llm_review.py
 """
 import json
+import os
 import sys
+import tempfile
 import threading
 import unittest
 from unittest import mock
@@ -12,6 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import code_review as cr  # noqa: E402
+import community_apply as apply_  # noqa: E402
 import llm_review as llm  # noqa: E402
 
 
@@ -58,7 +61,7 @@ class Client(unittest.TestCase):
         with Server() as s:
             say('{"verdict": "auto_merge", "reason": "plain"}')
             v = llm.community_review([{"notes": "x"}], ["ok"], cfg=s.cfg)
-            self.assertEqual(v, {"verdict": "auto_merge", "reason": "plain"})
+            self.assertEqual(v, {"verdict": "auto_merge", "reason": "plain", "reviewed": True})
             req = Handler.seen[0]
             self.assertEqual((req["path"], req["auth"]), ("/v1/chat/completions", "Bearer sekrit"))
             self.assertEqual(req["body"]["temperature"], 0)
@@ -97,7 +100,9 @@ class Client(unittest.TestCase):
             for b in bad:
                 with self.subTest(b=b):
                     say(b)
-                    self.assertEqual(llm.community_review([], [], cfg=s.cfg)["verdict"], "needs_human")
+                    v = llm.community_review([], [], cfg=s.cfg)
+                    self.assertEqual(v["verdict"], "needs_human")
+                    self.assertFalse(v["reviewed"])
 
     def test_api_failures_are_needs_human(self):
         with Server() as s:
@@ -106,6 +111,7 @@ class Client(unittest.TestCase):
                     say(body, code)
                     v = llm.community_review([], [], cfg=s.cfg)
                     self.assertEqual(v["verdict"], "needs_human")
+                    self.assertFalse(v["reviewed"])
                     self.assertNotIn("sekrit", v["reason"])
 
     def test_timeout_is_needs_human(self):
@@ -113,13 +119,43 @@ class Client(unittest.TestCase):
             say("", "hang")
             v = llm.community_review([], [], chat_fn=lambda cfg, m: llm.chat(cfg, m, timeout=0.3), cfg=s.cfg)
             self.assertEqual(v["verdict"], "needs_human")
+            self.assertFalse(v["reviewed"])
 
     def test_missing_key_is_needs_human_without_a_request(self):
         with Server() as s:
             with self.assertRaises(llm.LLMError):
                 llm.config_from_env({"LLM_BASE_URL": s.cfg["base"], "LLM_DEFAULT_MODEL": "m"})
             self.assertEqual(Handler.seen, [])
-        self.assertEqual(llm.community_review([], [], cfg=None, chat_fn=None)["verdict"], "needs_human")  # no env here
+        v = llm.community_review([], [], cfg=None, chat_fn=None)  # no env here
+        self.assertEqual(v["verdict"], "needs_human")
+        self.assertFalse(v["reviewed"])
+
+    def test_error_fallback_sets_reviewed_false_and_avoids_missing_model_crash(self):
+        gate = {"status": "pass", "new_rows": [{"notes": "x"}], "notes": ["ok"], "reasons": []}
+        with tempfile.TemporaryDirectory() as d:
+            gj, oj = Path(d, "gate.json"), Path(d, "out.json")
+            gj.write_text(json.dumps(gate), encoding="utf-8")
+            with mock.patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(llm.main(["llm_review.py", str(gj), str(oj)]), 0)
+            out = json.loads(oj.read_text(encoding="utf-8"))
+        self.assertEqual(out["outcome"], "needs_human")
+        self.assertFalse(out["reviewed"])
+        self.assertNotIn("model", out)
+        p = apply_.plan(out, "live")
+        self.assertIn("posted by an automated check.</sub>", p["comment"])
+        self.assertNotIn("LLM review ()", p["comment"])
+        # Even if reviewed=True arrives with a missing or blank model name, apply never crashes or prints empty parens.
+        for model_extra in ({}, {"model": ""}, {"model": "   "}):
+            p2 = apply_.plan({"outcome": "needs_human", "comment": "check", "reviewed": True, **model_extra}, "live")
+            self.assertIn("posted by an automated check.</sub>", p2["comment"])
+            self.assertNotIn("LLM review ()", p2["comment"])
+
+    def test_ui_screenshot_workflow_guards_bot_comments(self):
+        wf = (Path(__file__).resolve().parent.parent / ".github" / "workflows" / "ui-screenshot.yml").read_text(encoding="utf-8")
+        self.assertIn("BOT_LOGIN:", wf)
+        self.assertIn("in bot_logins", wf)
+        self.assertIn(".startswith(marker)", wf)
+        self.assertNotIn('if marker in (c["body"]', wf)
 
     def test_http_base_must_be_https(self):
         with self.assertRaises(llm.LLMError):

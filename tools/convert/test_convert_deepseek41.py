@@ -10,16 +10,19 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import convert  # noqa: E402
-from gguf_reader import BLOCK_GEOMETRY  # noqa: E402
+import verify_pack  # noqa: E402
 from gguf_writer import GGUFWriter  # noqa: E402
 from model_file import SECTION_ALIGN, ModelFile  # noqa: E402
 
 N_EXPERT, N_LAYERS, ROWS = 4, 2, 5
 TOKENS = ["a", "b", "c", "d"]
-BLOCK = {"IQ1_S": 50, "IQ2_XXS": 66, "Q6_K": 210, "IQ4_NL": 18, "Q5_K": 176, "MXFP4": 17}
-# the Engram types the engine reads, and the row bytes of a row of 256 values the pack records for each
-ENGRAM_ROW_BYTES = {"IQ4_NL": 144, "Q5_K": 176, "MXFP4": 136}
-GGML_TYPE = {"IQ4_NL": 20, "Q5_K": 13, "MXFP4": 39}
+CHAT_TEMPLATE = "{{ messages }}"
+BLOCK = {"IQ1_S": 50, "IQ2_XXS": 66, "Q6_K": 210, "IQ4_NL": 18, "Q5_K": 176, "MXFP4": 17, "F8_E4M3_RAW": 33}
+# the Engram types the engine reads: the values in a block, the bytes of a row of 256 values the pack records for each,
+# and the ggml type. F8_E4M3_RAW is type 43 as the standalone MXFP8 table stores it (a scale, then 32 codes).
+ENGRAM_BLOCK_VALUES = {"IQ4_NL": 32, "Q5_K": 256, "Q6_K": 256, "MXFP4": 32, "F8_E4M3_RAW": 32}
+ENGRAM_ROW_BYTES = {"IQ4_NL": 144, "Q5_K": 176, "Q6_K": 210, "MXFP4": 136, "F8_E4M3_RAW": 264}
+GGML_TYPE = {"IQ4_NL": 20, "Q5_K": 13, "Q6_K": 14, "MXFP4": 39, "F8_E4M3_RAW": 43}
 GU = ["IQ1_S", "IQ2_XXS"]          # gate/up type per layer
 DOWN = ["IQ2_XXS", "IQ1_S"]        # down type per layer
 
@@ -64,6 +67,7 @@ class DeepSeek41Test(unittest.TestCase):
         g.add(P + "engram.vocab_size", 16, "u32")
         g.add(P + "engram.token_map", [0, 1, 2, 3], "array:u32")
         g.add("tokenizer.ggml.tokens", TOKENS)
+        g.add("tokenizer.chat_template", CHAT_TEMPLATE)
         self.raw = {}
 
         def raw(name, shape, ty, n_blocks):
@@ -72,7 +76,7 @@ class DeepSeek41Test(unittest.TestCase):
             g.add_raw(name, shape, ty, data)
 
         raw("token_embd.weight", [256, 3], "Q6_K", 3)
-        raw("per_layer_token_embd.weight", [256, ROWS], table_type, ROWS * 256 // BLOCK_GEOMETRY[table_type][0])
+        raw("per_layer_token_embd.weight", [256, ROWS], table_type, ROWS * 256 // ENGRAM_BLOCK_VALUES[table_type])
         for l in range(N_LAYERS):
             g.add_f32(f"blk.{l}.ffn_gate_inp.weight", rng.standard_normal((8, N_EXPERT)))
             g.add_f32(f"blk.{l}.attn_norm.weight", rng.standard_normal(8))
@@ -119,25 +123,53 @@ class DeepSeek41Test(unittest.TestCase):
                          ("engram", 0, self.engram_type, [256, ROWS]))
         self.assertEqual(t["bytes"], ROWS * ENGRAM_ROW_BYTES[self.engram_type])
 
-    def test_a_q5_k_or_mxfp4_engram_table_converts_as_published(self):
-        for ty, rb in (("Q5_K", 176), ("MXFP4", 136)):
+    def test_every_engram_row_type_converts_as_published(self):
+        for ty, rb in ENGRAM_ROW_BYTES.items():
             with self.subTest(type=ty):
                 gguf = self.write_model(self.t / f"tbl-{ty}-00001-of-00001.gguf", ty)
                 out = self.t / f"out-{ty}.basalt"
                 convert.convert(self.args(gguf=[str(gguf)], out=str(out)))
                 m = ModelFile(str(out))
                 table = self.raw["per_layer_token_embd.weight"]
-                self.assertEqual(len(table), ROWS * rb)          # one 176-byte super-block, or eight 17-byte blocks
+                self.assertEqual(len(table), ROWS * rb)          # one super-block, or eight 17-, 18- or 33-byte blocks
                 self.assertEqual(m.read("engram"), table)        # byte for byte, requantized by no one
                 e = json.loads(m.read("meta"))["engram"]
                 self.assertEqual((e["type"], e["type_id"], e["row_values"], e["row_bytes"], e["bytes"]),
                                  (ty, GGML_TYPE[ty], 256, rb, ROWS * rb))
 
+    def test_verify_compares_the_engram_table_of_every_row_type(self):
+        """--verify hashes each tensor against its source: the table at its own byte count, not its GGUF geometry's."""
+
+        def tokenizer_files(first, out_dir):     # what --verify reads next to tokenizer.json
+            d = Path(out_dir) / "tokenizer"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "tokenizer.json").write_bytes(b"{}")
+            (d / "vocab.json").write_text(json.dumps({t: i for i, t in enumerate(TOKENS)}))
+            (d / "merges.txt").write_text("")
+            (d / "token_type.json").write_text("{}")
+            (d / "chat_template.jinja").write_text(CHAT_TEMPLATE)
+            return sorted(d.iterdir())
+
+        orig, convert.export_tokenizer = convert.export_tokenizer, tokenizer_files
+        try:
+            for ty in ENGRAM_ROW_BYTES:
+                with self.subTest(type=ty):
+                    gguf = self.write_model(self.t / f"v-{ty}-00001-of-00001.gguf", ty)
+                    out = self.t / f"v-{ty}.basalt"
+                    convert.convert(self.args(gguf=[str(gguf)], out=str(out)))
+                    self.assertTrue(verify_pack.verify(str(out), str(gguf)), ty)
+        finally:
+            convert.export_tokenizer = orig
+
     def test_an_engram_type_the_engine_cannot_read_is_refused(self):
-        gguf = self.write_model(self.t / "q6k-00001-of-00001.gguf", "Q6_K")   # 210 bytes a row: no row decoder for it
+        # Q4_K is 144 bytes a 256-value block: the shard holds whole blocks, so the table's type is what refuses it
+        g = GGUFWriter()
+        g.add("general.architecture", "deepseek41")
+        g.add_raw("per_layer_token_embd.weight", [256, ROWS], "Q4_K", bytes(ROWS * 144))
+        p = g.write(self.t / "q4k-00001-of-00001.gguf")
         with self.assertRaises(SystemExit) as cm:
-            convert.convert(self.args(gguf=[str(gguf)]))
-        self.assertIn("IQ4_NL, Q5_K or MXFP4", str(cm.exception))
+            convert.convert(self.args(gguf=[str(p)]))
+        self.assertIn("IQ4_NL, Q5_K, Q6_K, MXFP4 or MXFP8", str(cm.exception))
 
     def test_gguf_section_holds_the_quantized_tensors_but_not_the_table(self):
         convert.convert(self.args())

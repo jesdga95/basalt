@@ -2,6 +2,7 @@
 #pragma once
 
 #include "../cli/tokens.hpp"
+#include "batch_plan.hpp"
 #include "console_stats.hpp"
 #include "basalt/core/checkpoint_transfer.hpp"
 #include "basalt/core/conversation_cache.hpp"
@@ -111,7 +112,17 @@ public:
     virtual void between_requests(const std::string& line) = 0;
     virtual Flow run_request() = 0;
     virtual void solo_draft_back(bool) {}
-    virtual bool capture_admit(uint64_t need, uint64_t floor) = 0;
+    /// Whether a capture or a read of `need` bytes of RAM may go ahead: only while the RAM guard reads its level as ok,
+    /// and with `floor` left free after it (the disk tier's floor sits above the guard's). `verdict` gets the check
+    /// that decided and the host RAM available at that instant.
+    bool capture_admit(uint64_t need, uint64_t floor, basalt::core::Admission* verdict = nullptr);
+    /// The refusal of a capture of `tokens` tokens (a snapshot of `snapshot_bytes`): counted, and said in the log once
+    /// per episode, at warn level, while admission stays closed. `what` names the step ("parking", "disk write").
+    void refuse_parking(const basalt::core::Admission& why, const char* what, size_t tokens, uint64_t snapshot_bytes);
+    /// A capture was admitted: an episode of refusals ends, with one summary line.
+    void parking_admitted();
+    /// capture_admit, then refuse_parking or parking_admitted by its verdict.
+    bool admit_parking(uint64_t need, uint64_t floor, const char* what, size_t tokens, uint64_t snapshot_bytes);
     virtual bool park_current(size_t held, int64_t kept) = 0;
     virtual bool copy_from_slot(int b, const ConvCheckpoint* at, std::string& e) = 0;
     /// Waits for the checkpoint save still on its way to the host, if any; a save that failed drops its checkpoint.  Every
@@ -189,11 +200,26 @@ public:
     int ckd_peer_dev = -1;
     /// A checkpoint of `to` tokens already in the chain is used again (and keeps the higher `source`): true.
     bool touch_check(int64_t to, ConvCheckpoint::Source source);
-    /// Adds a checkpoint to the chain; the least recently used one goes first past --prompt-cache.
+    /// Adds a checkpoint to the chain; the least recently used one goes first past --prompt-cache, and past the pool
+    /// (check_pool) the least recently used one of every chain.
     void keep_check(ConvCheckpoint&& c);
+    /// Session `s`'s running state at `to` (the conversation `ids[0..to)`, its pictures `imgs`) into `c`: snapshotted on
+    /// the device now, it moves to the host while the work goes on (ckd).
+    bool capture_check(basalt::model::ModelSession& s, int64_t to, ConvCheckpoint::Source source, const int32_t* ids,
+                       std::vector<ImgKey> imgs, ConvCheckpoint& c);
+    /// Past the pool (check_pool x check_bytes, or more checkpoints than the chains hold), the least recently used
+    /// checkpoint of every chain goes.
+    void trim_check_pool();
+    /// The checkpoints of the largest running state every chain holds together: the pool --checkpoint-pool-mib fits
+    /// (conv_cache::pool_checkpoints), set by the runtime once it knows that state's bytes (check_bytes).  Shorter
+    /// conversations' checkpoints take their own bytes: the chains hold up to check_pool x check_bytes, and at most
+    /// conv_cache::pool_most checkpoints.
+    size_t check_pool{};
+    uint64_t check_bytes{};
     uint64_t check_clock{};
     bool cvec_cached{};
     std::optional<basalt::core::ConversationCache> conversations;
+    basalt::core::RefusalEpisodes parking_refusals;
     // the disk tier under it (--conversation-cache-dir): what leaves the session or the RAM cache is written there,
     // and a prompt that starts with a stored conversation reads it back, after a restart too
     basalt::core::ConversationStore disk{};
@@ -231,7 +257,9 @@ public:
         bool media = false;   ///< its pictures are placed by the request that reads it: a held conversation meets it only as an exact prefix
     };
     std::map<uint64_t, HeldPrompt> prompts{};
-    static constexpr size_t kPromptsMax = 64;
+    /// Prompts held at once at most: past it the oldest goes (a request that never freed its prompt). Every slot's request
+    /// holds one and may hold its continuation's beside it, and queued requests hold theirs.
+    size_t prompts_cap() const { return 64 + 4 * bs.size(); }
     /// The tokens an idle slot's conversation holds for its next turn; null when it holds none (or is decoding).
     const std::vector<int32_t>* idle_ids(int b) const;
     struct SlotMeet {
@@ -298,11 +326,18 @@ public:
         int pen_n = 0;                 ///< the request's penalty window (penalty_last_n; 0: no penalties)
         int64_t windows = 0;   ///< the request's windows in this slot, for BDONE
         int64_t drafts_accepted = 0, drafts_offered = 0;   ///< the request's draft tokens, for BDONE
+        // a short prompt the slot reads in its windows (Request::defer_read): the prompt tokens after `x`, fed as forced
+        // rows, then the turn checkpoint at the prompt's last token when `pend_check`
+        std::vector<int32_t> pend;
+        bool pend_check = false;
     };
     std::vector<BSlot> bs{};
     // ---- --batch: the slots' rounds (batch_round.cpp), the same for every model
     /// The session slot `b` decodes in.
     virtual basalt::model::ModelSession& slot_session(int b) = 0;
+    /// Slot `b`'s running state at its position, as its conversation's turn checkpoint (a prompt it read in its windows):
+    /// the slot keeps it and its shortest one, as an admission leaves it (select_slot_checkpoints).
+    bool slot_turn_checkpoint(int b);
     /// False while active slot `b` sits out the next round (its model cannot run its window yet); it keeps its place.
     virtual bool slot_ready(int b) { (void) b; return true; }
     /// One window of every ready active slot: the windows share batch_rows() rows, each group runs as one batch
@@ -348,6 +383,10 @@ public:
     int admit_slot{};
     int solo_slot{};
     long long admit_max_new{};
+    // BGEN ... more=1: the server has another request waiting for admission, so the next round waits for its lines
+    // (up to kAdmitHoldMs) instead of running between the two admissions
+    bool admit_hold{};
+    static constexpr int kAdmitHoldMs = 20;
     // a slot's conversation held in RAM (`hold_slot`) while its KV cells back the request that continues it, when the
     // two do not fit side by side; copy_from_slot restores from it
     struct SlotHeld {

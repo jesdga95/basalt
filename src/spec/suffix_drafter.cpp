@@ -18,19 +18,35 @@ uint64_t mix(uint64_t x) {
 
 SuffixDrafter::SuffixDrafter(int min_match, int max_match, size_t capacity_tokens)
     : min_match_(std::max(3, min_match)), max_match_(std::max(min_match_, max_match)) {
-    size_t cap = 1;
-    while (cap < capacity_tokens * 2) cap <<= 1;          // load factor <= 0.5 at the nominal capacity
+    while (max_cap_ < capacity_tokens * 2) max_cap_ <<= 1;   // load factor <= 0.5 at the nominal capacity
+    size_t cap = std::min(max_cap_, kFirstCap);
     table_.assign(cap, Slot{});
     long_.assign(cap, Slot{});
     mask_ = cap - 1;
-    hist_.reserve(capacity_tokens);
 }
 
 void SuffixDrafter::reset() {
     hist_.clear();
     for (const uint32_t d : dirty_) (d & kLongBit ? long_ : table_)[d & ~kLongBit] = Slot{};   // only what was filled
     dirty_.clear();
+    used_[0] = used_[1] = 0;
     last_match_ = 0;
+}
+
+void SuffixDrafter::grow() {
+    const size_t cap = std::min(max_cap_, (mask_ + 1) * 2);
+    if (cap == mask_ + 1) return;
+    std::vector<Slot> old[2] = {std::move(table_), std::move(long_)};
+    table_.assign(cap, Slot{});
+    long_.assign(cap, Slot{});
+    mask_ = cap - 1;
+    std::vector<uint32_t> was = std::move(dirty_);
+    dirty_.clear();
+    used_[0] = used_[1] = 0;
+    for (const uint32_t d : was) {   // in the order they were filled, so each key probes as it did
+        const Slot& s = old[d & kLongBit ? 1 : 0][d & ~kLongBit];
+        *find_slot(d & kLongBit ? long_ : table_, s.key, true) = s;
+    }
 }
 
 void SuffixDrafter::sync(const int32_t* tokens, size_t n) {
@@ -63,6 +79,7 @@ SuffixDrafter::Slot* SuffixDrafter::find_slot(std::vector<Slot>& table, uint64_t
             if (!insert) return nullptr;
             s.key = key;
             dirty_.push_back((uint32_t) i | (&table == &long_ ? kLongBit : 0u));
+            ++used_[&table == &long_ ? 1 : 0];
             return &s;
         }
     }
@@ -74,6 +91,7 @@ void SuffixDrafter::append(const int32_t* tokens, size_t n) {
         hist_.push_back(tokens[i]);
         const size_t end = hist_.size() - 1;
         if (end < 2) continue;
+        if (std::max(used_[0], used_[1]) * 2 >= mask_ + 1) grow();   // up to max_cap_, the load factor stays <= 0.5
         push(find_slot(table_, key_at(end), true), end);
         if (end >= (size_t) LONG_ORDER - 1) push(find_slot(long_, long_key_at(end), true), end);
     }

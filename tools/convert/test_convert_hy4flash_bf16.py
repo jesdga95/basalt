@@ -320,6 +320,78 @@ class Hy4FlashBf16Test(unittest.TestCase):
         m = self.build()
         self.assertEqual(m.section("experts")[1], 2 * N_EXPERT * (3 * ROWS * 72 + 16))
 
+    def test_added_token_dict_and_license_quantized_by(self):
+        # HF tokenizer_config.json may store AddedToken dicts; GGUF general.quantized_by must survive hf_meta merge.
+        from gguf_reader import GGUFFile
+        g0 = GGUFFile(self.gguf)
+        gw = GGUFWriter()
+        for k, v in g0.metadata.items():
+            if isinstance(v, list) and not v:
+                gw.add(k, v, "array:string")
+            elif isinstance(v, int) and not isinstance(v, bool):
+                gw.add(k, v, "u32")
+            elif isinstance(v, list) and isinstance(v[0], int):
+                ty = "array:u64" if any(k.endswith(s) for s in ("multipliers", "offsets", "sizes")) else "array:u32"
+                gw.add(k, v, ty)
+            else:
+                gw.add(k, v)
+        gw.add("general.quantized_by", "Someone")
+        raw_gguf = self.gguf.read_bytes()
+        for t in g0.tensors:
+            nb = t.expected_bytes()
+            gw.add_raw(t.name, t.shape, t.type_name, raw_gguf[g0.data_start + t.offset:g0.data_start + t.offset + nb])
+        q_gguf = gw.write(self.t / "hy-qby.gguf")
+        (self.hf / "tokenizer_config.json").write_text(json.dumps({
+            "bos_token": {"__type": "AddedToken", "content": "a"},
+            "eos_token": {"__type": "AddedToken", "content": "b"},
+            "pad_token": {"__type": "AddedToken", "content": "c"},
+        }))
+        m = self.build(gguf=[str(q_gguf)])
+        meta = json.loads(m.read("meta"))
+        self.assertEqual(meta["license"]["quantized_by"], "Someone")
+        self.assertEqual(meta["license"]["text"], "Tencent Hy License, Version 1.0\n")
+
+    def test_cross_shard_experts_and_early_dfly_validation(self):
+        from unittest import mock
+        from gguf_reader import GGUFFile
+        # Split tensors across two shards so layer 1's gate expert is in shard 1 and up/down experts are in shard 2.
+        g0 = GGUFFile(self.gguf)
+        raw_gguf = self.gguf.read_bytes()
+        g1, g2 = GGUFWriter(), GGUFWriter()
+        for k, v in g0.metadata.items():
+            if isinstance(v, list) and not v:
+                g1.add(k, v, "array:string")
+            elif isinstance(v, int) and not isinstance(v, bool):
+                g1.add(k, v, "u32")
+            elif isinstance(v, list) and isinstance(v[0], int):
+                ty = "array:u64" if any(k.endswith(s) for s in ("multipliers", "offsets", "sizes")) else "array:u32"
+                g1.add(k, v, ty)
+            else:
+                g1.add(k, v)
+        for i, gw in enumerate((g1, g2)):
+            gw.add("split.no", i, "u32")
+            gw.add("split.count", 2, "u32")
+            gw.add("split.tensors.count", len(g0.tensors), "u32")
+        for t in g0.tensors:
+            nb = t.expected_bytes()
+            blob = raw_gguf[g0.data_start + t.offset:g0.data_start + t.offset + nb]
+            dst = g2 if t.name in ("blk.1.ffn_up_exps.weight", "blk.1.ffn_down_exps.weight") else g1
+            dst.add_raw(t.name, t.shape, t.type_name, blob)
+        s1 = g1.write(self.t / "sharded-00001-of-00002.gguf")
+        s2 = g2.write(self.t / "sharded-00002-of-00002.gguf")
+        out = self.t / "sharded.basalt"
+        convert.convert_bf16(self.args(gguf=[str(s1)], out=str(out)))
+        self.assertTrue(verify_pack.verify(str(out), [str(s1), str(s2)], 2))
+
+        # Invalid --dfly must be rejected before Pool creation / heavy conversion work starts.
+        bad_dfly = self.t / "bad_dfly.safetensors"
+        bad_dfly.write_bytes(self.dfly.read_bytes()[:-1])
+        with mock.patch("hy4flash_bf16.multiprocessing.Pool", side_effect=AssertionError("pool must not start")):
+            with self.assertRaises(SystemExit):
+                convert.convert_bf16(self.args(dfly=str(bad_dfly), out=str(self.t / "never.basalt")))
+        self.assertFalse((self.t / "never.basalt").exists())
+        self.assertFalse((self.t / "never.basalt.partial").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

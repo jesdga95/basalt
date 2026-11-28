@@ -10,20 +10,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from serve import ROOT
-from serve.engine.flags import flag_index
 from serve.engine.image_source import parse_url_host
 from serve.engine.vision import VIDEO_MAX_TOKENS, VISION_MODES, VISION_USAGE, vision_mode
 from serve.util.console import tagged
 
 
-MIN_SLOT_CONTEXT = 256          # the least context a slot is given when --max-context is shared
 CONFIG_VERSION = 2                          # the config file's "version"; a file without one is this format's first
-PARALLEL_MAX = 8                            # the engine's batch slots
+PARALLEL_MAX = 64                           # the most batch slots; each engine refuses a start above its own
 CONFIG_PATHS = ("model", "tokenizer", "image-dir")       # relative to the config file
 # a model entry's own, and what it may also inherit from the top-level "engine"; other server options are the server's
 ENTRY_OPTIONS = frozenset({"model", "alias"})
 MODEL_OPTIONS = frozenset({
-    "gpu", "gpu-mode", "gpu-share", "vision", "parallel", "slot-full-context", "idle-sleep", "idle-unload", "min-free-vram-mib", "fit-max-tokens",
+    "gpu", "gpu-mode", "gpu-share", "vision", "parallel", "kv-pool", "idle-sleep", "idle-unload", "min-free-vram-mib", "fit-max-tokens",
     "grammar", "reasoning-effort", "reasoning-budget-tokens", "thinking-loop-tokens", "answer-room", "temperature", "top-p", "top-k", "min-p",
     "presence-penalty", "frequency-penalty", "repetition-penalty", "penalty-last-n", "seed", "video-max-tokens"})
 GRAMMAR_DEFAULT = True                      # the `grammar` option when neither the file nor the command line sets it
@@ -293,20 +291,8 @@ def parse_settings(ap: argparse.ArgumentParser, cli: list[str], server_argv=(), 
             if flag in file_words or flag in cli_words:
                 raise ValueError(f"parallel and engine {flag} both set: use parallel")
         (cli_words if a_cli.parallel else file_words).extend(["--batch", str(a.parallel)])
-        if not a.slot_full_context:
-            # --max-context is shared by the slots, as in llama.cpp: each holds an equal part (the solo path, used while
-            # a request is alone, has the same length, so a request never outgrows its slot). Without the flag the
-            # engine's default is shared, once the server has asked the engine for it (split_default).
-            src = cli_words if "--max-context" in cli_words or "--max-context" not in file_words else file_words
-            at = flag_index(src, "--max-context")
-            if at is not None and at + 1 >= len(src):
-                raise ValueError("--max-context needs a value")
-            if at is None:
-                a.split_default = True
-            else:
-                ctx = int(src[at + 1])
-                src[at + 1] = str(slot_share(ctx, a.parallel))
-                a.shared_context = ctx                     # the total, for the startup line
+    if not a.kv_pool:   # every slot's KV its own, fixed at start at the whole --max-context
+        (cli_words if a_cli.kv_pool is False else file_words).extend(["--kv-pool", "off"])
     return a, file_argv + cli, file_words, cli_words
 
 
@@ -345,36 +331,26 @@ def engine_item(group: list[str]) -> str:
     return f"{name}={','.join(values)}{unit}" if values else name
 
 
-def start_items(file_words: list[str], cli_words: list[str], shared: tuple[int, int] | None = None,
-                grammar: tuple[bool, str] | None = None, debug: bool = False) -> list[str]:
+def start_items(file_words: list[str], cli_words: list[str], grammar: tuple[bool, str] | None = None,
+                debug: bool = False) -> list[str]:
     """The engine words from --config and the command line as key=value items for a model's startup line, a flag given
-    twice shown once with the value that wins. `shared` is (total, slots) when --max-context was divided among the slots;
-    `grammar` is (on, origin), None when left at its default. The conversation folder shows only with --debug."""
+    twice shown once with the value that wins. `grammar` is (on, origin), None when left at its default. The
+    conversation folder shows only with --debug."""
     groups = engine_groups(file_words) + engine_groups(cli_words)
     last = {g[0]: i for i, g in enumerate(groups)}
     items = []
     for i, g in enumerate(groups):
         if last[g[0]] != i or (g[0] == "--conversation-cache-dir" and not debug):
             continue
-        item = engine_item(g)
-        if shared and g[0] == "--max-context":
-            item += f" ({shared[0]}/{shared[1]} slots)"
-        items.append(item)
+        items.append(engine_item(g))
     if grammar is not None:
         items.append(f"grammar={'on' if grammar[0] else 'off'}")
     return items
 
 
-def slot_share(total: int, parallel: int) -> int:
-    """Each of `parallel` slots' part of a shared --max-context."""
-    return max(MIN_SLOT_CONTEXT, total // parallel)
-
-
-def slots_text(parallel: int, per_slot: int, shared: int | None) -> str:
-    """The startup slot line: the slots and the context each really gets; a shared --max-context also names the
-    whole-context option."""
-    text = f"slots {parallel} \u00d7 {per_slot} ctx"
-    return text + (f" (slot-full-context: {shared} each)" if shared else "")
+def slots_text(parallel: int, per_slot: int, pool: bool) -> str:
+    """The startup slot line: the slots and the context each one can reach (the KV pool) or holds (--no-kv-pool)."""
+    return f"slots {parallel} \u00d7 {'up to ' if pool else ''}{per_slot} ctx"
 
 
 def with_spec(items: list[str], spec) -> list[str]:
@@ -575,12 +551,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--alias", help="the model name the API reports (default: the name stored in the model file)")
     ap.add_argument("--parallel", type=parallel_count, metavar="N",
                     help=f"requests served at once, 1..{PARALLEL_MAX} (default 1: one at a time); more requests wait "
-                         "their turn. --max-context is shared: each slot holds that divided by N (so 4 slots of 262144 "
-                         "need --max-context 1048576, or --slot-full-context). The slots' KV cache comes out of the "
-                         "expert cache")
-    ap.add_argument("--slot-full-context", action="store_true",
-                    help="with --parallel, give every slot the whole --max-context instead of an equal part: N slots "
-                         "cost N times the KV cache")
+                         "their turn. Every slot can reach the whole --max-context: a model with a KV pool backs the "
+                         "slots' cells from it as their conversations grow (the start log states its size), any other, "
+                         "or any with --no-kv-pool, gives each slot the whole context's cache")
+    ap.add_argument("--kv-pool", action=argparse.BooleanOptionalAction, default=True,
+                    help="back every slot's KV cells from one pool as its conversation grows (on by default, for a model "
+                         "that has one); --no-kv-pool gives each slot its own KV for the whole --max-context, fixed at "
+                         "start: N slots cost N times the KV cache")
     ap.add_argument("--config", metavar="FILE",
                     help="a JSON file {\"server\": {...}, \"engine\": {...}, \"models\": [{\"model\": FILE, ...}]}: settings "
                          "named without the dashes. \"server\" holds what the server shares, \"engine\" what applies to "
