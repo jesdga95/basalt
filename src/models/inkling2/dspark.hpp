@@ -106,6 +106,7 @@ public:
     const float* embed_norm = nullptr;
 
     struct SharedScratch {
+        bool ready = false;
         int64_t att_cells = 0;
         float *mix = nullptr, *kb = nullptr, *vb = nullptr;
         int32_t *pos3 = nullptr, *ring_bounds = nullptr, *pos3b = nullptr;
@@ -187,7 +188,7 @@ public:
     void note(int64_t pos0, int rows);
     model::Result draft_begin(int32_t anchor, int64_t pos, int n, void* stream);
     model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const model::ModelSession::DraftNeed& need, void* stream);
-    /// Conversations: the sliding-window layers' rings are running state, the full layers' cells go with the target's.
+    /// Conversations: the sliding-window layers' rings and the Markov feature ring are running state, the full layers' cells go with the target's.
     size_t running_bytes() const;
     void running_state(int64_t pos, bool save, core::RunningState& st) const;
     bool running_restored(int64_t pos, const uint8_t* head);
@@ -267,6 +268,7 @@ private:
     int pending_ = 0;
     DsparkBatch* batch_owner_ = nullptr;
     int batch_slot_ = -1;
+    void* draft_stream_ = nullptr;
     // --diag-dump
     std::FILE* dump_ = nullptr;
     int dumped_ = 0;
@@ -296,7 +298,7 @@ private:
     std::vector<void*> allocs_, pinned_;
     // the head's draft rows a pass holds: every slot at kBatchDrafts drafts, or kMaxDraftSessions at a whole block's
     static constexpr int kBatchDrafts = 4;
-    int max_sessions_ = 0, max_dr_rows_ = 0, max_rows_ = 0, tap_rows_ = 0;
+    int max_sessions_ = 0, max_all_sessions_ = 0, max_dr_rows_ = 0, max_rows_ = 0, tap_rows_ = 0;
     int64_t att_cells_ = 0;
     float* tap_ = nullptr;
     // commit_batch scratch [max_rows]

@@ -1619,6 +1619,10 @@ bool InklingModel::give_room(uint64_t bytes) noexcept {
     return back;
 }
 
+namespace {
+constexpr uint64_t kElasticKeep = 512 * kMiB;
+}  // namespace
+
 // [vision] ENC runs between requests and windows: once every stream is idle, nothing reads the experts until refill.
 bool InklingModel::lend_room(uint64_t bytes, std::string& err) {
     const auto t0 = std::chrono::steady_clock::now();
@@ -1629,7 +1633,8 @@ bool InklingModel::lend_room(uint64_t bytes, std::string& err) {
     // the region beside the card's spare and the reserve the card holds now (a reserve it could not meet stays unmet)
     // (the copies go by the counted room, the layers below by the card's own free memory: those come back byte for byte)
     const uint64_t room0 = room();
-    const uint64_t want = bytes + std::min<uint64_t>(held_free(kCardSpare), std::max<uint64_t>(room0, kCardSpare));
+    if (lend_keep_ == 0) lend_keep_ = std::max<uint64_t>(room0, 1);
+    const uint64_t want = bytes + std::min<uint64_t>(held_free(kElasticKeep), std::max<uint64_t>(room0, kElasticKeep));
     size_t free_b = 0, total_b = 0;
     basalt::core::gpu_mem_info(&free_b, &total_b);
     if (has_spill_ && room0 < want && promoted() > 0) {
@@ -1689,7 +1694,15 @@ void InklingModel::refill() {
     const int64_t before = copies() ? promoted() : 0;
     if (copies() && !lent_) {
         const int64_t before_total = card_copies();
-        promote(held_free(kCardSpare));
+        // back to the room the card had before the lend (a grow may have left less than the start spare), never below
+        // the reserve a VRAM request holds; subtract late_room() because promote() adds it
+        uint64_t keep = held_free(kElasticKeep);
+        if (lend_keep_) {
+            const uint64_t late = late_room();
+            const uint64_t prior = lend_keep_ > late ? lend_keep_ - late : 0;
+            keep = std::max(prior, reserve_);
+        }
+        promote(keep);
         note_shortage("image encoder refill");
         log_copy_change("image encoder refill", before_total);
     }
@@ -1700,6 +1713,7 @@ void InklingModel::refill() {
                           (long long) lend_copies_, layers, (double) back / (double) kGiB, lend_ms_, ms, (long long) (promoted() - before));
     lend_ms_ = 0;
     lend_copies_ = 0;
+    lend_keep_ = 0;
 }
 
 }  // namespace basalt::models::inkling2

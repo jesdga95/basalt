@@ -356,6 +356,7 @@ private:
     };
     std::vector<LentRange> lent_ranges_;
     int64_t lend_copies_ = 0;   ///< card copies demoted for the encoder
+    uint64_t lend_keep_ = 0;    ///< counted room before the first lend since the last refill (0: none)
     std::vector<size_t> wide_out_;   ///< the copies a long read's wider chunk sent back (take_room), until give_room
     // gpu-mode peer: the second card's experts, layer by layer in expert order in one cache (peer_first_ the layer's first slot)
     std::unique_ptr<core::PeerExperts> peer_;

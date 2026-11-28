@@ -276,20 +276,31 @@ model::Result DsparkWeights::finish(const void* head_q8, const uint16_t* emb, co
         // the block's products rounded from their Q8_0 to NVFP4 planes in place (the planes are shorter), through a copy of
         // each: the drafts' precision only, every draft is verified exactly; about half the bytes a block reads
         const uint64_t ff = (uint64_t) geo.n_ff;
-        void* tmp = nullptr;
-        if (cudaMalloc(&tmp, q8_bytes(ff, kE)) != cudaSuccess) throw std::runtime_error("out of device memory rounding its products");
+        struct TmpBuf {
+            void* p = nullptr;
+            cudaStream_t st = nullptr;
+            ~TmpBuf() {
+                if (!p) return;
+                (void) cudaStreamSynchronize(st);
+                cudaFree(p);
+            }
+        } tmp{nullptr, s};
+        if (cudaMalloc(&tmp.p, q8_bytes(std::max<uint64_t>(ff, (uint64_t) kQ), kE)) != cudaSuccess)
+            throw std::runtime_error("out of device memory rounding its products");
         for (DsparkLayer& L : layer) {
             bk::wgemm::q8_planes(L.k_ctx, kKV, kE, L.k_ctx_p, s);
             bk::wgemm::q8_planes(L.v_ctx, kKV, kE, L.v_ctx_p, s);
             const struct { void* w; uint64_t rows, K; } m[kFp4Mats] = {
                 {L.wq, kQ, kE}, {L.wk, kKV, kE}, {L.wv, kKV, kE}, {L.wo, kE, kQ}, {L.gate, ff, kE}, {L.up, ff, kE}, {L.down, kE, ff}};
             for (int i = 0; i < kFp4Mats; ++i) {
-                cudaMemcpyAsync(tmp, m[i].w, q8_bytes(m[i].rows, m[i].K), cudaMemcpyDeviceToDevice, s);
-                bk::nvfp4p::from_q8(tmp, (int64_t) m[i].rows, (int64_t) m[i].K, m[i].w, L.fp4_scale + i, s);
+                if (cudaMemcpyAsync(tmp.p, m[i].w, q8_bytes(m[i].rows, m[i].K), cudaMemcpyDeviceToDevice, s) != cudaSuccess)
+                    throw std::runtime_error("copying its products failed");
+                bk::nvfp4p::from_q8(tmp.p, (int64_t) m[i].rows, (int64_t) m[i].K, m[i].w, L.fp4_scale + i, s);
             }
         }
         const cudaError_t e = cudaStreamSynchronize(s);
-        cudaFree(tmp);
+        cudaFree(tmp.p);
+        tmp.p = nullptr;
         if (e != cudaSuccess) throw std::runtime_error("rounding its products failed");
     } catch (const std::exception& e) {
         return {model::Status::Error, std::string("inkling2: the drafter: ") + e.what()};
@@ -325,7 +336,7 @@ uint64_t dspark_session_bytes(const Pack& pack) {
     const DsparkGeometry& d = pack.dspark;
     if (!d.present) return 0;
     const uint64_t E = kE;
-    uint64_t n = (kFrRing * E + 3 * kDsRank + E + kDsBlock) * 4 + 1024;
+    uint64_t n = (kFrRing * E + 3 * kDsRank + E + kDsBlock) * 4 + 4096;
     for (int l = 0; l < d.n_layers; ++l)
         if (d.swa[(size_t) l]) n += 2ull * (uint64_t) ring_cells(d) * kKV * 2;
     return n;
@@ -349,55 +360,66 @@ const DsparkWeights::SharedScratch* DsparkWeights::ensure_shared_scratch(int64_t
     auto* self = const_cast<DsparkWeights*>(this);
     SharedScratch& s = self->shared_scr_;
     const int64_t want_cells = std::max(ring_cells(geo), full_cells(context));
-    if (s.mix != nullptr && s.att_cells >= want_cells) return &s;
+    if (s.ready && s.att_cells >= want_cells) return &s;
     const size_t E = kE, V = (size_t) n_vocab, ff = (size_t) geo.n_ff, R = kDsBlock;
+    const size_t allocs0 = self->allocs_.size();
+    const uint64_t bytes0 = self->bytes_;
+    SharedScratch next = s;
     bool ok = true;
     auto alloc_z = [&](size_t bytes) -> void* {
         void* p = self->dev(bytes, ok);
         if (p) cudaMemset(p, 0, std::max<size_t>(bytes, 16));
         return p;
     };
-    auto f = [&](size_t n) { return (float*) alloc_z(n * 4); };
-    if (s.mix == nullptr) {
-        s.mix = f(3 * kSlice * E);
-        s.pos3 = (int32_t*) alloc_z(kSlice * 3 * 4);
-        s.ring_bounds = (int32_t*) alloc_z(2 * 4);
+    auto f = [&](size_t count) { return (float*) alloc_z(count * 4); };
+    if (!next.ready) {
+        next.mix = f(3 * kSlice * E);
+        next.pos3 = (int32_t*) alloc_z(kSlice * 3 * 4);
+        next.ring_bounds = (int32_t*) alloc_z(2 * 4);
         if (ok) {
             const int32_t rb[2] = {0, (int32_t) ring_cells(geo)};
-            if (basalt::core::device_copy(s.ring_bounds, rb, sizeof(rb), cudaMemcpyHostToDevice) != cudaSuccess) ok = false;
+            if (basalt::core::device_copy(next.ring_bounds, rb, sizeof(rb), cudaMemcpyHostToDevice) != cudaSuccess) ok = false;
         }
-        s.kb = f(kSlice * kKV);
-        s.vb = f(kSlice * kKV);
-        s.act = alloc_z(bk::native_q8_1_bytes(kE, kSlice));
-        s.x = f(R * E);
-        s.h = f(R * E);
-        s.q = f(R * kQ);
-        s.qr = f(R * kQ);
-        s.attn = f(R * kQ);
-        s.act_a = alloc_z(bk::wgemm::act_bytes(kQ));
-        s.act_h = alloc_z(bk::wgemm::act_bytes((int64_t) ff));
+        next.kb = f(kSlice * kKV);
+        next.vb = f(kSlice * kKV);
+        next.act = alloc_z(bk::native_q8_1_bytes(kE, kSlice));
+        next.x = f(R * E);
+        next.h = f(R * E);
+        next.q = f(R * kQ);
+        next.qr = f(R * kQ);
+        next.attn = f(R * kQ);
+        next.act_a = alloc_z(bk::wgemm::act_bytes(kQ));
+        next.act_h = alloc_z(bk::wgemm::act_bytes((int64_t) ff));
         size_t pf = 0, tk = 0;
         ws_need(geo, pf, tk);
-        s.ws.partial = f(std::max<size_t>(pf, 1));
-        s.ws.tickets = (int32_t*) alloc_z(std::max<size_t>(tk, 1) * 4);
-        s.ws.partial_floats = pf;
-        s.ws.tickets_n = tk;
-        s.pos3b = (int32_t*) alloc_z(R * 3 * 4);
-        s.approx = f((size_t) kDsDrafts * dspark_screen_rows((int64_t) V));
-        s.hq = alloc_z(bk::native_q8_1_bytes(kE, kDsDrafts));
-        s.ctx_h = f((size_t) kDsDrafts * kDsRnn);
-        s.ctx_f = f(kDsRnn);
-        s.lat_q = alloc_z(bk::native_q8_1_bytes(kDsRank, kDsDrafts));
-        s.head_scr = alloc_z(dspark_head_scratch_bytes((int64_t) V));
+        next.ws.partial = f(std::max<size_t>(pf, 1));
+        next.ws.tickets = (int32_t*) alloc_z(std::max<size_t>(tk, 1) * 4);
+        next.ws.partial_floats = pf;
+        next.ws.tickets_n = tk;
+        next.pos3b = (int32_t*) alloc_z(R * 3 * 4);
+        next.approx = f((size_t) kDsDrafts * dspark_screen_rows((int64_t) V));
+        next.hq = alloc_z(bk::native_q8_1_bytes(kE, kDsDrafts));
+        next.ctx_h = f((size_t) kDsDrafts * kDsRnn);
+        next.ctx_f = f(kDsRnn);
+        next.lat_q = alloc_z(bk::native_q8_1_bytes(kDsRank, kDsDrafts));
+        next.head_scr = alloc_z(dspark_head_scratch_bytes((int64_t) V));
     }
-    if (ok && s.att_cells < want_cells) {
-        s.att_scr = f(bk::gqa_decode_scratch_floats(want_cells, kDsBlock, kHeads, kHeadDim));
-        if (ok) s.att_cells = want_cells;
+    if (ok && next.att_cells < want_cells) {
+        next.att_scr = f(bk::gqa_decode_scratch_floats(want_cells, kDsBlock, kHeads, kHeadDim));
+        if (ok) next.att_cells = want_cells;
     }
     if (!ok) {
+        while (self->allocs_.size() > allocs0) {
+            cudaFree(self->allocs_.back());
+            self->allocs_.pop_back();
+        }
+        self->bytes_ = bytes0;
+        (void) cudaGetLastError();
         err = "out of device memory for the shared drafter scratch";
         return nullptr;
     }
+    next.ready = true;
+    s = next;
     return &s;
 }
 
@@ -456,7 +478,8 @@ bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context
     {
         auto align256 = [](size_t b) { return (std::max<size_t>(b, 16) + 255) & ~(size_t) 255; };
         size_t need = align256(kFrRing * E * 4) + align256(2 * kDsRank * 4) + align256(kDsRank * 4) +
-                      align256(4) + align256(kDsBlock * 4) + align256(kDsBlock * 4);
+                      align256(4) + align256(kDsRank * 2) + align256(kDsBlock * 4) + align256(kDsBlock * 4) +
+                      align256(E * 4) + align256(2 * 4);
         for (int l = 0; l < d.n_layers; ++l) {
             const bool ring = d.swa[(size_t) l];
             if (ring) need += 2 * align256((size_t) ring_cells(d) * kKV * 2);
@@ -773,7 +796,14 @@ bool DsparkHook::stage_graph(int k, int n, void* stream) {
             (void) cudaGetLastError();
             return false;
         }
-        stage(k, n, stream);
+        try {
+            stage(k, n, stream);
+        } catch (...) {
+            cudaStreamEndCapture(st, &graph);
+            if (graph) cudaGraphDestroy(graph);
+            (void) cudaGetLastError();
+            throw;
+        }
         const cudaError_t ce = cudaStreamEndCapture(st, &graph);
         const cudaError_t ci = ce == cudaSuccess ? cudaGraphInstantiateWithFlags(&g, graph, 0) : ce;
         if (graph) cudaGraphDestroy(graph);
@@ -793,6 +823,7 @@ model::Result DsparkHook::draft_begin(int32_t anchor, int64_t pos, int n, void* 
     pending_ = 0;
     batch_owner_ = nullptr;
     batch_slot_ = -1;
+    draft_stream_ = nullptr;
     n = std::min(n, kDsDrafts);
     // the Markov head's context is the row before the anchor's: kept for the last kFrRing positions run
     if (n < 1 || pos < 1 || pos - 1 >= hi_ || pos - 1 < std::max(lo_, hi_ - kFrRing) || pos + kDsBlock > backed_cells_)
@@ -825,6 +856,7 @@ model::Result DsparkHook::draft_begin(int32_t anchor, int64_t pos, int n, void* 
         return {model::Status::Error, std::string("inkling2: the drafter: ") + e.what()};
     }
     pending_ = n;
+    draft_stream_ = stream;
     block_pos_ = pos;
     block_anchor_ = anchor;
     return {};
@@ -841,19 +873,24 @@ model::Result DsparkHook::draft_end(int32_t* ids, float* conf, int max_n, int& n
         const int slot = batch_slot_, pend = pending_;
         batch_owner_ = nullptr;
         batch_slot_ = -1;
+        draft_stream_ = nullptr;
         pending_ = 0;
         return owner->take(slot, pend, ids, conf, max_n, n);
     }
-    if (cudaStreamSynchronize((cudaStream_t) stream) != cudaSuccess)
+    void* sync_st = draft_stream_ ? draft_stream_ : stream;
+    const int pend = pending_;
+    draft_stream_ = nullptr;
+    pending_ = 0;
+    if (cudaStreamSynchronize((cudaStream_t) sync_st) != cudaSuccess)
         return {model::Status::Error, std::string("inkling2: the drafter: ") + cudaGetErrorString(cudaGetLastError())};
-    n = std::min(pending_, max_n);
+    n = std::min(pend, max_n);
     for (int i = 0; i < n; ++i) {
         ids[i] = ids_h_[i];
         conf[i] = conf_h_[i];
     }
     if (dump_ && dumped_ < kDumpBlocks) {   // 'B', pos, anchor, drafts, the block's final rows, each draft's logits, the drafts and chances
         const size_t V = (size_t) w_->n_vocab;
-        const int32_t m = pending_;
+        const int32_t m = pend;
         std::vector<float> hf((size_t) kDsBlock * kE), base((size_t) m * V);
         basalt::core::device_copy(hf.data(), h_, hf.size() * 4, cudaMemcpyDeviceToHost);
         basalt::core::device_copy(base.data(), dump_logits_, base.size() * 4, cudaMemcpyDeviceToHost);
@@ -879,13 +916,12 @@ model::Result DsparkHook::draft_end(int32_t* ids, float* conf, int max_n, int& n
         std::fflush(dump_);
         ++dumped_;
     }
-    pending_ = 0;
     return {};
 }
 
 size_t DsparkHook::running_bytes() const {
     if (df2_) return df2_->running_bytes();
-    size_t n = 0;
+    size_t n = fr_ ? (size_t) kFrRing * kE * sizeof(float) : 0;
     for (const Cache& c : cache_)
         if (c.ring) n += 2 * (size_t) c.cap * kKV * 2;
     return n;
@@ -896,6 +932,7 @@ void DsparkHook::running_state(int64_t pos, bool save, core::RunningState& st) c
         df2_->running_state(pos, save, st);
         return;
     }
+    if (fr_) st.regions.push_back({fr_, (size_t) kFrRing * kE * sizeof(float)});
     for (const Cache& c : cache_) {
         if (!c.ring) continue;
         st.regions.push_back({c.k, (size_t) c.cap * kKV * 2});
@@ -905,6 +942,15 @@ void DsparkHook::running_state(int64_t pos, bool save, core::RunningState& st) c
 
 bool DsparkHook::running_restored(int64_t pos, const uint8_t* head) {
     if (df2_) return df2_->running_restored(pos, head);
+    if (!w_) return true;
+    static_assert(kFrRing > kDecodeRows, "fr_ ring must hold a full decode window rewind margin");
+    pending_ = 0;
+    batch_owner_ = nullptr;
+    batch_slot_ = -1;
+    draft_stream_ = nullptr;
+    const int64_t p = std::max<int64_t>(0, pos);
+    lo_ = std::max<int64_t>(0, p - (kFrRing - kDecodeRows));
+    hi_ = p;
     return true;
 }
 
@@ -981,7 +1027,7 @@ bool DsparkHook::save_cells(std::vector<core::ConversationKv>& kv, int64_t posit
     if (df2_) return df2_->save_cells(positions, stream);
     if (!w_) return true;
     if (positions < 0 || positions > backed_cells_) return false;
-    cudaStreamSynchronize((cudaStream_t) stream);
+    if (cudaStreamSynchronize((cudaStream_t) stream) != cudaSuccess) return false;
     const auto down = [&](const void* dev, core::ConversationBuffer& to) {
         return to.visit(0, to.size(), [&](uint8_t* p, size_t n, size_t at) {
             return basalt::core::device_copy(p, (const uint8_t*) dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess;
@@ -1014,8 +1060,14 @@ bool DsparkHook::save_cells(std::vector<core::ConversationKv>& kv, int64_t posit
 bool DsparkHook::restore_cells(const std::vector<core::ConversationKv>& kv, size_t& at, int64_t positions, void* stream) {
     if (df2_) return df2_->restore_cells(kv.size(), at, positions, stream);
     if (!w_) return at == kv.size();
+    lo_ = 0;
+    hi_ = 0;
+    pending_ = 0;
+    batch_owner_ = nullptr;
+    batch_slot_ = -1;
+    draft_stream_ = nullptr;
     if (positions < 0 || positions > backed_cells_) return false;
-    cudaStreamSynchronize((cudaStream_t) stream);
+    if (cudaStreamSynchronize((cudaStream_t) stream) != cudaSuccess) return false;
     const auto up = [&](void* dev, const core::ConversationBuffer& from, size_t run) {
         return from.visit(0, run, [&](const uint8_t* p, size_t n, size_t off) {
             return basalt::core::device_copy((uint8_t*) dev + off, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
@@ -1077,6 +1129,7 @@ bool DsparkBatch::init(const DsparkWeights* w, int max_sessions, int max_rows, i
     bool ok = true;
     auto f = [&](size_t n) { return (float*) dev(n * 4, ok); };
     max_sessions_ = S;
+    max_all_sessions_ = S_all;
     max_dr_rows_ = max_dr_rows;
     max_rows_ = max_rows;
     tap_rows_ = std::max(tap_rows, kSlice);
@@ -1186,7 +1239,7 @@ model::Result DsparkBatch::draft(DsparkHook* const* hooks, const int32_t* anchor
     }
     if (!w_) return {model::Status::NotImplemented, "inkling2: the pack has no drafter"};
     if (count <= 0) return {};
-    if (count > (int) bk::kWindowSegsMax) {
+    if (count > max_all_sessions_) {
         for (int i = 0; i < count; ++i)
             if (model::Result r = hooks[i]->draft_begin(anchors[i], pos[i], n[i], stream); !r.ok()) return r;
         return {};
@@ -1200,6 +1253,7 @@ model::Result DsparkBatch::draft(DsparkHook* const* hooks, const int32_t* anchor
         hk.pending_ = 0;
         hk.batch_owner_ = nullptr;
         hk.batch_slot_ = -1;
+        hk.draft_stream_ = nullptr;
         const int ni = std::min(n[i], kDsDrafts);
         const int64_t pi = pos[i];
         if (ni < 1 || pi < 1 || pi - 1 >= hk.hi_ || pi - 1 < std::max(hk.lo_, hk.hi_ - kFrRing) ||
