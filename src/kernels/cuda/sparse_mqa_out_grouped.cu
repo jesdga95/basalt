@@ -20,7 +20,7 @@
 // FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
 // AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// DeepSeek wo_a for decode: all 8 groups (and every token) of the block-diagonal projection in one launch.
+// Grouped sparse-MQA wo_a for decode: all 8 groups (and every token) of the block-diagonal projection in one launch.
 // Each output row runs the arithmetic of native_q5_k_mmvq / native_q6_k_mmvq / native_q8_0_mmvq with one column
 // (same q8_1 activation, same per-block order, same cross-warp and shuffle reduction), so the results are bitwise equal.
 #include "basalt/kernels/dp4a.hpp"

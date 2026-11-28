@@ -48,7 +48,7 @@ if(BUILD_TESTING)
   target_link_libraries(ds4_meta_test PRIVATE deepseek4_pack warnings)
   basalt_cpu_test(NAME ds4_meta_test COMMAND ds4_meta_test)
 
-  foreach(_name compress indexer_compress indexer_project indexer_select)
+  foreach(_name compress indexer_compress indexer_project indexer_select prefill_attn)
     add_executable(ds4_${_name}_parity src/models/deepseek4/${_name}_parity.cpp)
     target_include_directories(ds4_${_name}_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_gpu_include_directories})
     target_link_libraries(ds4_${_name}_parity PRIVATE deepseek4_kernels core ${_gpu_runtime_target})
