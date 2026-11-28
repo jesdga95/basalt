@@ -49,22 +49,29 @@ double probe_h2d_gbps(std::string* samples) {
         return -1.0;
     }
     std::memset(h, 0, kBytes);   // fault the pages in before timing
-    cudaMemcpyAsync(d, h, kBytes, cudaMemcpyHostToDevice);   // warmup: context up, copy engine primed
     float ms[kBursts] = {};
     // the bursts run back to back on the stream, an event between each two
     cudaEvent_t ev[kBursts + 1];
     int n_ev = 0;
     while (n_ev <= kBursts && cudaEventCreate(&ev[n_ev]) == cudaSuccess) ++n_ev;
     bool ok = n_ev == kBursts + 1;
+    bool queued = false;
     if (ok) {
-        cudaEventRecord(ev[0]);
-        for (int b = 0; b < kBursts; ++b) {
-            cudaMemcpyAsync(d, h, kBytes, cudaMemcpyHostToDevice);
-            cudaEventRecord(ev[b + 1]);
+        // warmup: context up, copy engine primed
+        if (cudaMemcpyAsync(d, h, kBytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+            queued = true;
+        } else {
+            ok = false;
         }
-        ok = cudaEventSynchronize(ev[kBursts]) == cudaSuccess;
+        if (ok) ok = cudaEventRecord(ev[0]) == cudaSuccess;
+        for (int b = 0; b < kBursts && ok; ++b) {
+            ok = cudaMemcpyAsync(d, h, kBytes, cudaMemcpyHostToDevice) == cudaSuccess &&
+                 cudaEventRecord(ev[b + 1]) == cudaSuccess;
+        }
+        if (ok) ok = cudaEventSynchronize(ev[kBursts]) == cudaSuccess;
         for (int b = 0; b < kBursts && ok; ++b) ok = cudaEventElapsedTime(&ms[b], ev[b], ev[b + 1]) == cudaSuccess;
     }
+    if (queued && !ok) (void) cudaStreamSynchronize(nullptr);
     for (int i = 0; i < n_ev; ++i) cudaEventDestroy(ev[i]);
     double bw = -1.0;
     if (samples != nullptr) samples->clear();

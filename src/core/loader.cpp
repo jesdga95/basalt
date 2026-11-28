@@ -310,6 +310,9 @@ struct Loader::Impl {
             cudaEventCreateWithFlags(&s.ev[0], cudaEventDisableTiming) != cudaSuccess ||
             cudaEventCreateWithFlags(&s.ev[1], cudaEventDisableTiming) != cudaSuccess) {
             (void) cudaGetLastError();
+            if (s.ev[1] != nullptr) (void) cudaEventDestroy(s.ev[1]);
+            if (s.ev[0] != nullptr) (void) cudaEventDestroy(s.ev[0]);
+            if (s.stream != nullptr) (void) cudaStreamDestroy(s.stream);
             return nullptr;
         }
         return &m.emplace(d, s).first->second;
@@ -341,6 +344,9 @@ struct Loader::Impl {
                 s = Slot{};
             }
         workers.clear();
+        pinned = false;
+        cap = 0;
+        out_cap = 0;
     }
 
     void release(uint8_t* p) {
@@ -367,6 +373,7 @@ struct Loader::Impl {
 
     // `n` workers' slots for pieces of up to `piece` bytes: sized to the plan, so a small phase takes small buffers
     bool staging(int n, uint64_t piece, uint64_t out_piece, bool want_pinned, std::string& err) {
+        if (n <= 0) return true;
         want_pinned = want_pinned || pinned;   // pinned memory serves host reads too
         if ((int) workers.size() >= n && pinned == want_pinned && piece <= cap && out_piece <= out_cap) return true;
         if (pinned != want_pinned || piece > cap || out_piece > out_cap) free_staging();
@@ -379,10 +386,12 @@ struct Loader::Impl {
                 if (s.raw == nullptr && !alloc(s.raw_alloc, s.raw, cap + 2 * kAlign)) {
                     err = std::string("no ") + (pinned ? "pinned " : "") + "memory for the file read staging (" +
                           std::to_string(workers.size() * 2 * (cap + 2 * kAlign) >> 20) + " MiB): free memory or load again";
+                    free_staging();
                     return false;
                 }
                 if (out_cap > 0 && s.out == nullptr && !alloc(s.out_alloc, s.out, out_cap)) {
                     err = "no memory for the file read staging";
+                    free_staging();
                     return false;
                 }
             }

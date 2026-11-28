@@ -8,15 +8,34 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cinttypes>
-#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 namespace basalt::core {
 namespace {
+
+bool add_u64(uint64_t a, uint64_t b, uint64_t& out) {
+    if (b > std::numeric_limits<uint64_t>::max() - a) return false;
+    out = a + b;
+    return true;
+}
+
+bool mul_u64(uint64_t a, uint64_t b, uint64_t& out) {
+    if (a != 0 && b > std::numeric_limits<uint64_t>::max() / a) return false;
+    out = a * b;
+    return true;
+}
+
+bool align_up_u64(uint64_t v, uint64_t align, uint64_t& out) {
+    if (align == 0 || v > std::numeric_limits<uint64_t>::max() - (align - 1)) return false;
+    out = (v + align - 1) / align * align;
+    return true;
+}
 
 double now_ms() {
     using namespace std::chrono;
@@ -101,7 +120,11 @@ bool WeightTable::pool_bytes(const PackFiles& pack, uint64_t& out, std::string& 
             continue;
         if (skip->count(name)) continue;
         const uint64_t a = align > 0 ? (uint64_t) align : 256;
-        compact += (dst_bytes + a - 1) / a * a;
+        uint64_t aligned = 0;
+        if (!align_up_u64(dst_bytes, a, aligned) || !add_u64(compact, aligned, compact)) {
+            err = "dense index byte total overflows in " + path;
+            return false;
+        }
     }
     if (pool == 0) { err = "no '# align ... pool ...' header in " + path; return false; }
     out = skip ? compact : pool;
@@ -110,6 +133,7 @@ bool WeightTable::pool_bytes(const PackFiles& pack, uint64_t& out, std::string& 
 
 bool WeightTable::pool_bytes_by_layer(const PackFiles& pack, int64_t n_layers, std::vector<uint64_t>& per_layer,
                                       uint64_t& shared, std::string& err, const std::set<std::string>* skip) {
+    if (n_layers < 0) { err = "negative layer count"; return false; }
     IndexText f;
     if (!f.open(pack.index, err)) { err = "cannot open " + pack.index.path + (err.empty() ? "" : " (" + err + ")"); return false; }
     per_layer.assign((size_t) n_layers, 0);
@@ -130,10 +154,17 @@ bool WeightTable::pool_bytes_by_layer(const PackFiles& pack, int64_t n_layers, s
             continue;
         if (skip != nullptr && skip->count(name)) continue;
         const uint64_t a = align > 0 ? (uint64_t) align : 256;
-        const uint64_t bytes = (dst_bytes + a - 1) / a * a;
+        uint64_t bytes = 0;
+        if (!align_up_u64(dst_bytes, a, bytes)) {
+            err = "dense index byte total overflows in " + pack.index.path;
+            return false;
+        }
         const long l = std::strncmp(name, "blk.", 4) == 0 ? std::strtol(name + 4, nullptr, 10) : -1;
-        if (l >= 0 && l < n_layers) per_layer[(size_t) l] += bytes;
-        else shared += bytes;
+        uint64_t& bucket = (l >= 0 && l < n_layers) ? per_layer[(size_t) l] : shared;
+        if (!add_u64(bucket, bytes, bucket)) {
+            err = "dense index byte total overflows in " + pack.index.path;
+            return false;
+        }
     }
     return true;
 }
@@ -214,7 +245,11 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
         for (size_t i = 0; i < rows.size(); ++i) {
             if (skip->count(rows[i].name)) { skipped[i] = true; continue; }
             rows[i].dst_off = at;
-            at += (rows[i].dst_bytes + a - 1) / a * a;
+            uint64_t aligned = 0;
+            if (!align_up_u64(rows[i].dst_bytes, a, aligned) || !add_u64(at, aligned, at)) {
+                err = rows[i].name + ": compacted arena size overflows";
+                return false;
+            }
         }
         pool = at;
     }
@@ -239,6 +274,13 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
     const double t_read0 = now_ms();
     for (size_t row_i = 0; row_i < rows.size(); ++row_i) {
         const IndexRow& r = rows[row_i];
+        uint64_t row_elems = 0;
+        if (r.ne0 < 0 || r.ne1 < 0 ||
+            !mul_u64((uint64_t) r.ne0, (uint64_t) (r.ne1 > 0 ? r.ne1 : 1), row_elems) ||
+            row_elems > (uint64_t) std::numeric_limits<int64_t>::max()) {
+            err = r.name + ": invalid tensor dimensions in dense index";
+            return false;
+        }
         if (skipped[row_i]) {
             WeightRef wr;
             wr.data = nullptr;
@@ -246,7 +288,7 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
             wr.bytes = r.dst_bytes;
             wr.ne0 = r.ne0;
             wr.ne1 = r.ne1;
-            wr.elements = r.ne0 * (r.ne1 > 0 ? r.ne1 : 1);
+            wr.elements = (int64_t) row_elems;
             wr.kind = r.kind;
             wr.code_bits = r.code_bits;
             wr.code_bias = r.code_bias;
@@ -264,6 +306,11 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
             table_[r.name] = wr;
             ++report_.tensors;
             continue;
+        }
+        if (r.dst_off > arena_bytes || r.dst_bytes > arena_bytes - r.dst_off ||
+            (r.dst_bytes > 0 && dst_base == nullptr)) {
+            err = r.name + ": runs past the end of the arena";
+            return false;
         }
         if (r.code_bits != 0 && r.dst_bytes == 0) {
             // a row that carries a shape only - the GGUF form must serve it
@@ -290,8 +337,8 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
             // A quantized tensor: codes, then scales, then the optional offset plane, each contiguous in the
             // source span in that order (the converter verifies the contiguity and refuses otherwise).
             segs[n_segs++] = Seg{0, r.codes_bytes, 0, r.codes_bytes, Conv::Copy};
+            const uint64_t src_scale_bytes = r.scales_fp16 ? r.scales_bytes / 2 : r.scales_bytes;
             if (r.scales_bytes) {
-                const uint64_t src_scale_bytes = r.scales_fp16 ? r.scales_bytes / 2 : r.scales_bytes;
                 if (r.scales_fp16 && (r.scales_bytes % 2 || src_scale_bytes * 2 != r.scales_bytes)) {
                     err = r.name + ": an fp16 scale plane of an odd byte count";
                     bad = true;
@@ -300,9 +347,14 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
                                      r.scales_fp16 ? Conv::WidenF16 : Conv::Copy};
             }
             if (r.offset_bytes) {
-                const uint64_t after = r.codes_bytes + (r.scales_fp16 ? r.scales_bytes / 2 : r.scales_bytes);
-                segs[n_segs++] = Seg{after, r.offset_bytes, r.codes_bytes + r.scales_bytes, r.offset_bytes,
-                                     Conv::Copy};
+                uint64_t after_src = 0, after_dst = 0;
+                if (!add_u64(r.codes_bytes, src_scale_bytes, after_src) ||
+                    !add_u64(r.codes_bytes, r.scales_bytes, after_dst)) {
+                    err = r.name + ": quantized plane offset overflows";
+                    bad = true;
+                } else {
+                    segs[n_segs++] = Seg{after_src, r.offset_bytes, after_dst, r.offset_bytes, Conv::Copy};
+                }
             }
         } else {
             // Everything else is one run whose transform is the row's kind.  The two promoted types shrink
@@ -311,23 +363,30 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
             if (r.raw16) c = Conv::Copy;
             else if (r.kind == WeightKind::Bf16InF32) c = Conv::Bf16High;
             else if (r.kind == WeightKind::F16InF32) c = Conv::ToF16;
-            const uint64_t elems = (uint64_t) r.ne0 * (uint64_t) (r.ne1 > 0 ? r.ne1 : 1);
-            if (c != Conv::Copy && (r.src_bytes != elems * 4 || r.dst_bytes != elems * 2)) {
+            uint64_t want_src = 0, want_dst = 0;
+            if (c != Conv::Copy &&
+                (!mul_u64(row_elems, 4, want_src) || !mul_u64(row_elems, 2, want_dst) ||
+                 r.src_bytes != want_src || r.dst_bytes != want_dst)) {
                 // A promoted type is 4 B/elem in and 2 B/elem out, and nothing else.  If those two numbers do
                 // not say so, the shape and the byte counts disagree and the element count this loop would
                 // use to walk the source is not the element count the pack wrote.
                 char buf[320];
                 std::snprintf(buf, sizeof buf,
                               "%s: a promoted tensor of %llu elements is %llu B in and %llu B out, not %llu/%llu",
-                              r.name.c_str(), (unsigned long long) elems, (unsigned long long) r.src_bytes,
-                              (unsigned long long) r.dst_bytes, (unsigned long long) (elems * 4),
-                              (unsigned long long) (elems * 2));
+                              r.name.c_str(), (unsigned long long) row_elems, (unsigned long long) r.src_bytes,
+                              (unsigned long long) r.dst_bytes, (unsigned long long) want_src,
+                              (unsigned long long) want_dst);
                 err = buf;
                 bad = true;
             }
             segs[n_segs++] = Seg{0, r.src_bytes, 0, r.dst_bytes, c};
         }
-        for (int i = 0; i < n_segs; ++i) { sum_src += segs[i].src_bytes; sum_dst += segs[i].dst_bytes; }
+        for (int i = 0; i < n_segs && !bad; ++i) {
+            if (!add_u64(sum_src, segs[i].src_bytes, sum_src) || !add_u64(sum_dst, segs[i].dst_bytes, sum_dst)) {
+                err = r.name + ": segment byte sum overflows";
+                bad = true;
+            }
+        }
         // The segment list is this loop's own idea of the layout, and it is the ONLY thing standing between a
         // mis-sized plane and a wrong byte offset.  It is checked against both recorded totals, not trusted.
         if (!bad && (sum_src != r.src_bytes || sum_dst != r.dst_bytes)) {
@@ -348,13 +407,20 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
                 err = r.name + ": an fp16 plane with an odd source byte count";
                 return false;
             }
-            if (cur_size != 0 && r.src_off + s.src_off + s.src_bytes > cur_size) {
+            if (s.dst_off > r.dst_bytes || s.dst_bytes > r.dst_bytes - s.dst_off) {
+                err = r.name + ": segment runs past the end of its destination tensor";
+                return false;
+            }
+            uint64_t src_rel = 0, src_end = 0, file_off = 0, file_end = 0;
+            if (!add_u64(r.src_off, s.src_off, src_rel) || !add_u64(src_rel, s.src_bytes, src_end) ||
+                !add_u64(cur_base, src_rel, file_off) || !add_u64(file_off, s.src_bytes, file_end) ||
+                (cur_size != 0 && src_end > cur_size)) {
                 err = r.name + ": runs past the end of its section";
                 return false;
             }
             LoadItem it;
             it.file = cur_plan_file;
-            it.off = cur_base + r.src_off + s.src_off;
+            it.off = file_off;
             it.bytes = s.src_bytes;
             it.dev = dst_base + r.dst_off + s.dst_off;
             it.device = load_dev;
@@ -369,7 +435,7 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
         wr.bytes = r.dst_bytes;
         wr.ne0 = r.ne0;
         wr.ne1 = r.ne1;
-        wr.elements = r.ne0 * (r.ne1 > 0 ? r.ne1 : 1);
+        wr.elements = (int64_t) row_elems;
         wr.kind = r.kind;
         wr.code_bits = r.code_bits;
         wr.code_bias = r.code_bias;
