@@ -61,10 +61,11 @@ A targeted `t=1` replay compared all 255 rows in each of 14 selected chunks (5, 
 remaining high-KLD positions. This rules out window size and run-to-run variation as causes of those tails;
 they are reproducible Basalt/reference divergences and form the corrected parity baseline.
 
-A later 100-chunk gate on the tree that carries the admission policy and 6-slot prompt staging, at
-`--resident-budget-gib 145 --expert-cache 1000`, scored PPL `3.9965 +/- 0.0599`, mean KLD `0.15568`, p99 `1.9971`, max
-`7.7249` and top-1 `87.92%`, with 57.4% VRAM / 11.7% PCIe / 31.0% CPU lookups; the model page carries it beside the
-default cache size's measurements.
+A later 100-chunk gate on the tree that carries the admission policy and 6-slot prompt staging scored, with the card's own
+default cache size (`--resident-budget-gib 145`), PPL `3.9807 +/- 0.0595`, mean KLD `0.15465`, p99 `2.0187`, max `7.8189`
+and top-1 `88.04%` (61.0% VRAM / 10.3% PCIe / 28.7% CPU), and at a pinned `--expert-cache 1000` PPL `3.9965 +/- 0.0599`,
+mean KLD `0.15568`, top-1 `87.92%` (57.4% / 11.7% / 31.0%). The opt-in lossy flags on the same tree and cache scored PPL
+`4.1431 +/- 0.0626`, mean KLD `0.20570` and top-1 `85.50%`; the model page carries the speeds beside them.
 
 The run loaded the full 137.1 GiB RAM expert tier (256/256 experts per layer), with zero experts in
 the file tier; the GPU held 34/256 experts per layer in an 18.20 GiB cache. The final 8-chunk continuation

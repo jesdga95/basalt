@@ -37,14 +37,16 @@ RTX 5090 (32 GiB VRAM, 475 W power limit) + 247 GiB DDR5 RAM (`--resident-budget
 | `pp16384` | 2,290-2,300 | Engine (`2,271` / `2,281` wall) |
 | `tg conv / struct / prose` (lossless) | 36-38 / 42-44 / 38 | 70% VRAM, 11% PCIe, 19% CPU |
 | `tg conv / struct / prose` (`--expert-cache 1000`) | 35-36 / 41-42 / 36 | 23/256 a layer, 2.9 GiB of VRAM left idle: 67% VRAM, 12% PCIe, 21% CPU |
-| `tg conv / struct / prose` (`--route-prior 0.5 --route-tail-skip 4`) | 34 / 43 / 35 | Opt-in lossy routing, at the older 29/256 cache |
+| `tg conv / struct / prose` (`--route-prior 0.5 --route-tail-skip 4`) | 47-50 / 56-58 / 49-50 | Opt-in lossy: 27% fewer routed experts, mean KLD `0.20570` against `0.15465`, top-1 `85.50%` against `88.04%` |
 
-The 100-chunk `--kv fp8` Wikitext-2 KLD gate against `dsv4visionexp-source-base.kld` ran on this tree at
-`--resident-budget-gib 145 --expert-cache 1000` (the table's pinned row): 25,500 rows, PPL `3.9965 +/- 0.0599` (base `4.3379`,
-`ln(PPL/base) -0.08199`), mean KLD `0.15568`, median `0.03208`, p99 `1.9971`, max `7.7249`, top-1 `87.92%`, with 57.4%
-VRAM / 11.7% PCIe / 31.0% CPU lookups. The earlier gate (`3.9836` / `0.15429`) held 34 experts a layer; the 0.3% PPL and
-0.9% KLD difference is what this gate gives across placements, and top-1 is the same. Vision (`ds4_vision_tower_test`,
-`ds4_vision_reserve_test`) and DSpark attach (`tools/convert/test_dspark_deepseek4_attach.py`) pass.
+The 100-chunk `--kv fp8` Wikitext-2 KLD gate against `dsv4visionexp-source-base.kld` ran on this tree at the table's
+default (`--resident-budget-gib 145`, no `--expert-cache`): 25,500 rows, PPL `3.9807 +/- 0.0595` (base `4.3379`,
+`ln(PPL/base) -0.08595`), mean KLD `0.15465`, median `0.03152`, p99 `2.0187`, max `7.8189`, top-1 `88.04%`, 61.0% VRAM /
+10.3% PCIe / 28.7% CPU lookups. The pinned 1,000-expert cache scored PPL `3.9965 +/- 0.0599`, mean KLD `0.15568`, top-1
+`87.92%` (57.4% / 11.7% / 31.0%), and the earlier gate (`3.9836` / `0.15429` / `87.92%`) held 34 experts a layer: the three
+sit within the placement spread this gate gives, which is why the flags-off/lossy pair below is the comparison to read.
+Vision (`ds4_vision_tower_test`, `ds4_vision_reserve_test`) and DSpark attach
+(`tools/convert/test_dspark_deepseek4_attach.py`) pass.
 
 Conversation checkpoints now snapshot the sliding-window rings and rolling attention/indexer compressor state; compressed
 attention and CSA index rows use the shared positional-cell save/restore path. A two-chunk Wikitext gate exercised save,
@@ -86,6 +88,21 @@ against `2,319` and `2,312`: +6% prose and +4% struct, inside the conv spread, 1
 the extra copies take. The default was already the fast path; the pinned size was the slower one. Fifty tokens a second
 would need a 20 ms pass, and its 499 MB of miss traffic alone is 15 ms at this link, so that target needs fewer routed
 experts a token (the opt-in lossy flags) or a faster link, not another placement.
+
+## Lossy routing
+
+`--route-prior 0.5 --route-tail-skip 4` (opt-in; the start warns, `basalt-bench` marks the run LOSSY) drops the routed
+experts no GPU holds when every entry that names them ranks 4th or lower. It pays only once the card holds the experts it
+keeps: at the default cache (27 of 256 a layer) it routes 27% fewer experts (conv 217,605 against 298,002, prose 206,075
+against 281,919), raises the hit rate to 69-75% and lowers the PCIe share to 7-10%. Two arms measured conv `49.5` and
+`46.8`, struct `58.0` and `56.3`, prose `50.0` and `48.8` tok/s against `37.6`/`35.6`, `43.7`/`41.9` and `38.2`/`38.1` with
+the flags off; pp16384 was `2,297`/`2,282` against `2,290`/`2,300`. That is the 50 tok/s decode this page was working
+towards.
+
+The 100-chunk Wikitext-2 gate prices it on the same tree and cache: PPL `4.1431 +/- 0.0626` against `3.9807 +/- 0.0595`,
+mean KLD `0.20570` against `0.15465`, median `0.04654`, p99 `2.3270`, max `9.0908`, top-1 `85.50%` against `88.04%` - a
+third more mean divergence and 2.5 points of top-1 for 4% perplexity and a 21% shorter decode half in the gate's own
+timing (6,042 against 7,700 ms a chunk). The flags stay opt-in and off by default.
 
 ## KV caches and `--kv`
 
@@ -189,7 +206,9 @@ staged only while encoding; `--vision dynamic` must return encoder memory to the
 - **What is left for decode speed.** The pass's expert copies are at the measured link rate (33.6 against 33.0 GB/s), so
   the remaining lever is residency, and the tier already takes it: four more slots a layer (23 to 27) buys 3-6% (the
   table), and past that the card is full at 27-28 of 256 experts a layer. Two more levers are measured and closed:
-  per-layer slot weights (above) and the bus/CPU split of the misses (`bus_share` at 75% measured neutral).
+  per-layer slot weights (above) and the bus/CPU split of the misses (`bus_share` at 75% measured neutral). Past that,
+  fewer routed experts a token is the only lever left, and the opt-in lossy flags reach 47-50 tok/s for the quality priced
+  above. Nothing here is a default.
 
 ## Milestones and gates
 
