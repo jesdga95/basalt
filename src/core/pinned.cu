@@ -30,9 +30,14 @@ uint64_t fnv1a64(const uint8_t* p, uint64_t n, uint64_t seed) {
 namespace {
 std::vector<uint64_t> uniform_bounds(uint64_t bytes, uint64_t slice) {
     std::vector<uint64_t> b;
-    if (slice == 0) return b;
-    for (uint64_t off = 0; off + slice <= bytes; off += slice) b.push_back(off);
-    if (!b.empty()) b.push_back(b.back() + slice);
+    if (bytes == 0 || slice == 0) return b;
+    uint64_t off = 0;
+    while (off < bytes) {
+        b.push_back(off);
+        if (bytes - off <= slice) break;
+        off += slice;
+    }
+    b.push_back(bytes);
     return b;
 }
 }  // namespace
@@ -80,9 +85,11 @@ PinnedArena::~PinnedArena() {
     if (base) {
         if (locked_bytes) basalt::platform::unlock_resident((uint8_t*) base + (slice_bytes ? registered_bytes : 0), locked_bytes);
         if (slice_bytes) {
-            for (uint64_t off : slice_starts) cudaHostUnregister((uint8_t*) base + off);
-        } else if (!platform::kBoundHostRegistration || registered_bytes > 0) {
-            cudaHostUnregister(base);
+            for (uint64_t off : slice_starts) {
+                if (cudaHostUnregister((uint8_t*) base + off) != cudaSuccess) (void) cudaGetLastError();
+            }
+        } else if (registered_bytes > 0) {
+            if (cudaHostUnregister(base) != cudaSuccess) (void) cudaGetLastError();
         }
         basalt::platform::free_region(mapping_base ? mapping_base : base, mapping_bytes ? mapping_bytes : capacity);
         base = nullptr;

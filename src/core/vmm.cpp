@@ -204,10 +204,18 @@ unsigned long long map(uint8_t* va, uint64_t bytes, bool* out_of_memory) {
 
 bool unmap(uint8_t* va, uint64_t bytes, unsigned long long handle) {
     const Fns& v = fns();
-    if (!v.ok || handle == 0) return false;
-    const bool a = v.unmap(reinterpret_cast<CUdeviceptr>(va), (size_t) bytes) == CUDA_SUCCESS;
-    const bool b = v.release((CUmemGenericAllocationHandle) handle) == CUDA_SUCCESS;
-    return a && b;
+    if (!v.ok || va == nullptr || bytes == 0 || handle == 0) return false;
+    const CUresult ru = v.unmap(reinterpret_cast<CUdeviceptr>(va), (size_t) bytes);
+    if (ru != CUDA_SUCCESS) {
+        basalt::log::warn("basalt memory", "cuMemUnmap failed (%d) for %llu B", (int) ru, (unsigned long long) bytes);
+        return false;
+    }
+    const CUresult rr = v.release((CUmemGenericAllocationHandle) handle);
+    if (rr != CUDA_SUCCESS) {
+        basalt::log::warn("basalt memory", "cuMemRelease failed (%d) after unmapping %llu B", (int) rr,
+                          (unsigned long long) bytes);
+    }
+    return true;
 }
 
 unsigned long long create(uint64_t bytes) {

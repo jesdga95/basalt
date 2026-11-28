@@ -41,6 +41,7 @@ private:
     };
     uint8_t* base_ = nullptr;
     uint64_t reserved_ = 0, backed_ = 0, gran_ = 0, step_ = 0;
+    int device_ = -1;
     bool unusable_ = false;   // a map, clear or release could not be confirmed: the range's backing is not known
     bool out_of_memory_ = false;
     bool plain_ = false;   // one cudaMalloc, no virtual memory
