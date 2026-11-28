@@ -135,7 +135,7 @@ target_link_libraries(artifact INTERFACE platform warnings)
 # `model` is the registry and the adapter interface (shared code may use it). Each model is its own library under
 # src/models/<arch>/; `models` is the composition root that registers them. tools/check_model_layering.sh keeps
 # shared code from including src/models and models from including each other.
-add_library(model STATIC src/model/registry.cpp src/model/rope_flags.cpp src/model/route_flags.cpp src/model/start.cpp src/model/batch_check.cpp src/model/gpu_check.cpp src/model/multi_gpu.cpp src/model/peer_hooks.cpp src/model/split_hooks.cpp)
+add_library(model STATIC src/model/registry.cpp src/model/rope_flags.cpp src/model/route_flags.cpp src/model/start.cpp src/model/batch_check.cpp src/model/gpu_check.cpp src/model/multi_gpu.cpp src/model/stage_tuner.cpp src/model/peer_hooks.cpp src/model/split_hooks.cpp)
 target_compile_definitions(model PRIVATE BASALT_KNOWN_MODELS="${_basalt_known}" BASALT_BUILT_MODELS="${_basalt_built}")
 target_include_directories(model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(model PUBLIC artifact warnings)
@@ -1662,6 +1662,12 @@ target_include_directories(multi_gpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/in
 target_link_libraries(multi_gpu_test PRIVATE warnings)
 basalt_cpu_test(NAME multi_gpu_test COMMAND multi_gpu_test)
 set_tests_properties(multi_gpu_test PROPERTIES TIMEOUT 60)
+
+add_executable(stage_tuner_test tests/model/stage_tuner_test.cpp src/model/stage_tuner.cpp)
+target_include_directories(stage_tuner_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(stage_tuner_test PRIVATE warnings)
+basalt_cpu_test(NAME stage_tuner_test COMMAND stage_tuner_test)
+set_tests_properties(stage_tuner_test PROPERTIES TIMEOUT 60)
 add_executable(gpu_check_test tests/model/gpu_check_test.cpp src/model/gpu_check.cpp)
 target_include_directories(gpu_check_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(gpu_check_test PRIVATE warnings)
