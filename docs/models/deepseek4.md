@@ -37,14 +37,14 @@ RTX 5090 (32 GiB VRAM, 475 W power limit) + 247 GiB DDR5 RAM (`--resident-budget
 | `pp16384` | 2,290-2,300 | Engine (`2,271` / `2,281` wall) |
 | `tg conv / struct / prose` (lossless) | 36-38 / 42-44 / 38 | 70% VRAM, 11% PCIe, 19% CPU |
 | `tg conv / struct / prose` (`--expert-cache 1000`) | 35-36 / 41-42 / 36 | 23/256 a layer, 2.9 GiB of VRAM left idle: 67% VRAM, 12% PCIe, 21% CPU |
-| `tg conv / struct / prose` (`--route-prior 0.5 --route-tail-skip 4`) | 47-50 / 56-58 / 49-50 | Opt-in lossy: 27% fewer routed experts, mean KLD `0.20570` against `0.15465`, top-1 `85.50%` against `88.04%` |
+| `tg conv / struct / prose` (`--route-tail-skip 3`, the lossy preset) | 55-60 / 70-76 / 57 | Opt-in: 41% fewer routed experts, mean KLD `0.29460` against `0.15465`, top-1 `82.11%` against `88.04%` |
 
 The 100-chunk `--kv fp8` Wikitext-2 KLD gate against `dsv4visionexp-source-base.kld` ran on this tree at the table's
 default (`--resident-budget-gib 145`, no `--expert-cache`): 25,500 rows, PPL `3.9807 +/- 0.0595` (base `4.3379`,
 `ln(PPL/base) -0.08595`), mean KLD `0.15465`, median `0.03152`, p99 `2.0187`, max `7.8189`, top-1 `88.04%`, 61.0% VRAM /
 10.3% PCIe / 28.7% CPU lookups. The pinned 1,000-expert cache scored PPL `3.9965 +/- 0.0599`, mean KLD `0.15568`, top-1
 `87.92%` (57.4% / 11.7% / 31.0%), and the earlier gate (`3.9836` / `0.15429` / `87.92%`) held 34 experts a layer: the three
-sit within the placement spread this gate gives, which is why the flags-off/lossy pair below is the comparison to read.
+sit within the placement spread this gate gives, which is why the per-flag comparisons below are the ones to read.
 Vision (`ds4_vision_tower_test`, `ds4_vision_reserve_test`) and DSpark attach
 (`tools/convert/test_dspark_deepseek4_attach.py`) pass.
 
@@ -81,28 +81,54 @@ figure: different fixture, and a trace is not the benchmark.
 Those copies already run at the link's own rate: `basalt-bench --hardware` measures this machine's pinned host-to-device
 copy at 33.0 GB/s and the pass moves its blobs at 33.6 GB/s, so no scheduling change makes the same bytes arrive sooner.
 Only fewer miss bytes shorten the pass, and the card's shares are the lever: a pinned 1,000-expert cache is 23 of 256
-experts a layer and leaves 2.9 GiB of VRAM free, while the tier's own sizing (no `--expert-cache`) fills it to 27. That
-is the whole of it: 23 to 27 slots a layer measured conv `37.6` and `35.6` against `35.7` and `35.4` tok/s, struct `43.7`
+experts a layer and leaves 2.9 GiB of VRAM free, while the tier's own sizing (no `--expert-cache`) fills it to 27-28, the
+free memory at start deciding which. That is the whole of it: 23 to 27 slots a layer measured conv `37.6` and `35.6` against `35.7` and `35.4` tok/s, struct `43.7`
 and `41.9` against `41.7` and `40.7`, prose `38.2` and `38.1` against `35.9` and `35.8`, and pp16384 `2,290` and `2,300`
 against `2,319` and `2,312`: +6% prose and +4% struct, inside the conv spread, 1% off on the prompt, which uses the room
 the extra copies take. The default was already the fast path; the pinned size was the slower one. Fifty tokens a second
 would need a 20 ms pass, and its 499 MB of miss traffic alone is 15 ms at this link, so that target needs fewer routed
-experts a token (the opt-in lossy flags) or a faster link, not another placement.
+experts a token (the opt-in lossy preset below) or a faster link, not another placement.
 
 ## Lossy routing
 
-`--route-prior 0.5 --route-tail-skip 4` (opt-in; the start warns, `basalt-bench` marks the run LOSSY) drops the routed
-experts no GPU holds when every entry that names them ranks 4th or lower. It pays only once the card holds the experts it
-keeps: at the default cache (27 of 256 a layer) it routes 27% fewer experts (conv 217,605 against 298,002, prose 206,075
-against 281,919), raises the hit rate to 69-75% and lowers the PCIe share to 7-10%. Two arms measured conv `49.5` and
-`46.8`, struct `58.0` and `56.3`, prose `50.0` and `48.8` tok/s against `37.6`/`35.6`, `43.7`/`41.9` and `38.2`/`38.1` with
-the flags off; pp16384 was `2,297`/`2,282` against `2,290`/`2,300`. That is the 50 tok/s decode this page was working
-towards.
+Two opt-in flags (`basalt/model/route_flags.hpp`; off by default, each one given named in the start's warning and the run's
+LOSSY mark). `--route-tail-skip R` neither copies nor computes an expert no GPU holds when every entry of the decode
+window that names it ranks R or lower (0-based of this model's six routes): its entries get weight 0, the others keep
+theirs. `--route-prior LAMBDA` picks the window's six as if every expert a GPU holds scored LAMBDA higher; the weights stay
+the router's own. Both pay only once the card holds the experts it keeps, which is why they were worth measuring again
+after the admission policy and the card-filling cache: at 28 of 256 experts a layer they cut the experts routed to a token,
+where before they mostly moved work to the CPU.
 
-The 100-chunk Wikitext-2 gate prices it on the same tree and cache: PPL `4.1431 +/- 0.0626` against `3.9807 +/- 0.0595`,
-mean KLD `0.20570` against `0.15465`, median `0.04654`, p99 `2.3270`, max `9.0908`, top-1 `85.50%` against `88.04%` - a
-third more mean divergence and 2.5 points of top-1 for 4% perplexity and a 21% shorter decode half in the gate's own
-timing (6,042 against 7,700 ms a chunk). The flags stay opt-in and off by default.
+Measured this pass at the card's own cache (`--resident-budget-gib 145`, no `--expert-cache`), two arms a fixture and the
+100-chunk Wikitext-2 gate on every arm that could ship, RTX 5090 at 475 W. `conv` and `prose` decide; `struct` is advisory because it swings
+a few tok/s between arms on this machine:
+
+| arm | conv tok/s | prose tok/s | struct tok/s | routed/token (conv) | PPL | mean KLD | top-1 |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: |
+| flags off | 37.6 / 35.6 | 38.2 / 38.1 | 43.7 / 41.9 | 298,002 | 3.9807 | 0.15465 | 88.04% |
+| `--route-prior 0.5` | 37.8 / 36.9 | 38.7 / 37.7 | 44.7 / 42.2 | 298,310 | 3.9807 | 0.15465 | 88.04% |
+| `--route-tail-skip 5` | 42.4 / 41.5 | 42.7 / 44.3 | 49.0 / 47.1 | 258,504 | - | - | - |
+| `--route-tail-skip 4` | 46.6 / 48.2 | 49.4 / 50.1 | 57.6 / 58.2 | 217,299 | 4.1404 | 0.20600 | 85.58% |
+| **`--route-tail-skip 3`** (preset) | **54.9 / 59.7** | **57.2 / 57.1** | 69.7 / 75.8 | 175,408 | 4.6074 | 0.29460 | 82.11% |
+| prior 0.5 + tail-skip 4 | 49.5 / 46.8 | 50.0 / 48.8 | 58.0 / 56.3 | 217,605 | 4.1431 | 0.20570 | 85.50% |
+
+**The prior carries nothing.** At 0.5 it does not change the pick at all: its gate reproduced all 25,500 flags-off rows
+bitwise (max |dNLL| and |dKLD| 0.000000, the same 6,579,000 routed experts), its speed is the flags-off speed, and adding
+it to `--route-tail-skip 4` measured the same routed count (4,539,000), the same KLD to within 0.0003 and the same speed.
+With 28 of 256 experts held, the score gap inside the router's top six is wider than the 0.5 the flag adds, so it never
+binds. It is not part of the preset, and yesterday's pair result was `--route-tail-skip 4` with a flag that did nothing.
+
+**The tail-skip carries the speed and the cost, and its depth is the knob:** R=5 (the mildest, which drops only a
+sixth-ranked miss) measures 42 tok/s, R=4 47, R=3 55. Only R=3 holds both deciding fixtures at or above 50 tok/s in both
+arms, so `--route-tail-skip 3` is the preset. Its price is the steepest row on the table: mean KLD `0.29460` against
+`0.15465`, top-1 `82.11%` against `88.04%`, p99 `3.0290`, max `10.5874`, for 41% fewer experts routed a token and a third
+shorter decode half in the gate's own timing (5,144 against 7,700 ms a chunk).
+
+**R=4 is the cheaper step and misses the target.** It costs half the divergence (KLD `0.20600`, top-1 `85.58%`, p99
+`2.3935`, 5,898 ms a chunk) but measures conv `46.6`/`48.2` - 2 to 3 tok/s short in both arms - and prose `49.4`/`50.1`,
+so it cannot be called 50 tok/s. R=5 is milder still and 5 tok/s further off. The pair above is R=4's routing (the same
+4,539,000 routed experts) and is not kept. With no flag nothing changed: this pass altered no code, and the flags-off rows
+are the lossless numbers this page already carried.
 
 ## KV caches and `--kv`
 
@@ -207,8 +233,8 @@ staged only while encoding; `--vision dynamic` must return encoder memory to the
   the remaining lever is residency, and the tier already takes it: four more slots a layer (23 to 27) buys 3-6% (the
   table), and past that the card is full at 27-28 of 256 experts a layer. Two more levers are measured and closed:
   per-layer slot weights (above) and the bus/CPU split of the misses (`bus_share` at 75% measured neutral). Past that,
-  fewer routed experts a token is the only lever left, and the opt-in lossy flags reach 47-50 tok/s for the quality priced
-  above. Nothing here is a default.
+  fewer routed experts a token is the only lever left: the opt-in preset `--route-tail-skip 3` reaches 55-60 conv and 57
+  prose for the quality priced above, and R=4 is the cheaper step that falls short of 50. Nothing here is a default.
 
 ## Milestones and gates
 

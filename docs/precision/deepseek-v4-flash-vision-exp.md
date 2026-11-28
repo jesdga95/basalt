@@ -64,8 +64,10 @@ they are reproducible Basalt/reference divergences and form the corrected parity
 A later 100-chunk gate on the tree that carries the admission policy and 6-slot prompt staging scored, with the card's own
 default cache size (`--resident-budget-gib 145`), PPL `3.9807 +/- 0.0595`, mean KLD `0.15465`, p99 `2.0187`, max `7.8189`
 and top-1 `88.04%` (61.0% VRAM / 10.3% PCIe / 28.7% CPU), and at a pinned `--expert-cache 1000` PPL `3.9965 +/- 0.0599`,
-mean KLD `0.15568`, top-1 `87.92%` (57.4% / 11.7% / 31.0%). The opt-in lossy flags on the same tree and cache scored PPL
-`4.1431 +/- 0.0626`, mean KLD `0.20570` and top-1 `85.50%`; the model page carries the speeds beside them.
+mean KLD `0.15568`, top-1 `87.92%` (57.4% / 11.7% / 31.0%). The opt-in flags were then priced one at a time on the same tree and cache: `--route-prior 0.5` reproduces the flags-off
+rows bitwise (mean KLD `0.15465`, top-1 `88.04%`), `--route-tail-skip 4` scored PPL `4.1404 +/- 0.0625`, mean KLD
+`0.20600`, top-1 `85.58%`, and `--route-tail-skip 3`, the preset, `4.6074 +/- 0.0719`, `0.29460` and `82.11%`. The model
+page carries the speeds and the reasoning beside them.
 
 The run loaded the full 137.1 GiB RAM expert tier (256/256 experts per layer), with zero experts in
 the file tier; the GPU held 34/256 experts per layer in an 18.20 GiB cache. The final 8-chunk continuation
@@ -192,4 +194,5 @@ The 100-chunk `--kv fp8` Wikitext-2 gate against `dsv4visionexp-source-base.kld`
 `0.15429`, median `0.03136`, p99 `1.9900`, max `7.2995`, and top-1 agreement `87.92%` (`prompt ms/chunk 1568`,
 `decode ms/chunk 11596`, `60.9% VRAM / 15.4% PCIe / 23.7% CPU`). At 475 W, `basalt-bench` measured `pp16384` at `1,884`
 tok/s, lossless `tg` at `23 / 24-27 / 24-25` tok/s (`conv / struct / prose`), and opt-in lossy `tg`
-(`--route-prior 0.5 --route-tail-skip 4`) at `34 / 43 / 35` tok/s.
+(`--route-prior 0.5 --route-tail-skip 4`) at `34 / 43 / 35` tok/s. That pair was later split: the prior was measured inert
+on this model and the preset is `--route-tail-skip 3` alone (see the model page).
