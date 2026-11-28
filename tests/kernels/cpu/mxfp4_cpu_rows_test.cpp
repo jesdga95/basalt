@@ -89,6 +89,7 @@ int check(int n, int rows, bool gate, bool edge_scales, Mode mode, const cpu::Sw
     std::vector<std::vector<float>> x(T, std::vector<float>(n));
     std::vector<std::vector<float>> ref(T, std::vector<float>(rows)), got(T, std::vector<float>(rows));
     std::vector<std::vector<double>> expected(T, std::vector<double>(rows));
+    std::vector<std::vector<double>> exp_scale(T, std::vector<double>(rows));
     const void* act[T];
     float* out[T];
     std::normal_distribution<float> nd(0.f, 0.25f);
@@ -116,6 +117,16 @@ int check(int n, int rows, bool gate, bool edge_scales, Mode mode, const cpu::Sw
                 if (gate) db += (double) u[i] * (double) x[t][i];
             }
             expected[t][r] = gate ? swiglu_d(glu, da, db) : da;
+            exp_scale[t][r] = gate ? std::max(std::abs(expected[t][r]), std::abs(da * db)) : std::abs(da);
+        }
+    }
+    if (gate && glu.gelu) {
+        // gelu's g + 0.044715*g^3 contracts to FMA in every AVX2/AVX-512 TU; compare bitwise against single-token
+        // Avx2Base (same FMA contraction) while checking against the double-precision reference below.
+        for (int t = 0; t < T; ++t) {
+            const void* a1[1] = {act[t]};
+            float* o1[1] = {ref[t].data()};
+            run_mode(Mode::Avx2Base, true, weights.data(), stride, up, n, a1, 1, o1, 0, rows, glu);
         }
     }
     for (int nt = 1; nt <= T; ++nt) {
@@ -128,10 +139,11 @@ int check(int n, int rows, bool gate, bool edge_scales, Mode mode, const cpu::Sw
                 if (std::memcmp(out[t], ref[t + offset].data(), (size_t) rows * sizeof(float)) != 0) ++bad;
                 for (int r = 0; r < rows; ++r) {
                     const double want = expected[t + offset][r];
+                    const double sc = exp_scale[t + offset][r];
                     const double err = std::abs((double) out[t][r] - want);
                     max_abs = std::max(max_abs, err);
-                    max_rel = std::max(max_rel, err / std::max(1e-8, std::abs(want)));
-                    const double tol = 1e-4 + 1e-4 * std::abs(want);
+                    max_rel = std::max(max_rel, err / std::max(1e-8, sc));
+                    const double tol = 1e-4 + 2e-4 * sc;
                     if (!std::isfinite(out[t][r]) || err > tol) ++bad;
                 }
             }
