@@ -121,12 +121,12 @@ int check(int n, int rows, bool gate, bool edge_scales, Mode mode, const cpu::Sw
         }
     }
     if (gate && glu.gelu) {
-        // gelu's g + 0.044715*g^3 contracts to FMA in every AVX2/AVX-512 TU; compare bitwise against single-token
-        // Avx2Base (same FMA contraction) while checking against the double-precision reference below.
+        // gelu's g + 0.044715*g^3 contracts to FMA inside AVX2/AVX-512 TUs; compare bitwise against this mode's
+        // single-token run (token-count, offset and row-slice invariance) while checking against double precision below.
         for (int t = 0; t < T; ++t) {
             const void* a1[1] = {act[t]};
             float* o1[1] = {ref[t].data()};
-            run_mode(Mode::Avx2Base, true, weights.data(), stride, up, n, a1, 1, o1, 0, rows, glu);
+            run_mode(mode, true, weights.data(), stride, up, n, a1, 1, o1, 0, rows, glu);
         }
     }
     for (int nt = 1; nt <= T; ++nt) {
