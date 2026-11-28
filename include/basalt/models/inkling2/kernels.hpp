@@ -158,7 +158,11 @@ void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scrat
 /// Initialize the INT8 MMA plans and the INT8 slice count for the current device during model load.
 void attention_decode_int8_init();
 
-enum class Int8MmaPlan { Auto, TwoStageRing, ThreeStageRing, OneStagePingPong, NarrowRing, Direct };
+/// RegisterRing, RegisterPingPong: a window's tiles staged through registers, without and with a second V tile; SharedRing:
+/// the shared raw-copy ring plan a window of its rows takes where no register plan serves (forced plans: parity and bench).
+enum class Int8MmaPlan {
+    Auto, TwoStageRing, ThreeStageRing, OneStagePingPong, NarrowRing, Direct, RegisterRing, RegisterPingPong, SharedRing
+};
 /// Auto: the shard model; Previous: the halving rule the model falls back to.
 enum class Int8MmaShards { Auto, Previous };
 struct Int8MmaPlanInfo {
@@ -168,6 +172,7 @@ struct Int8MmaPlanInfo {
     int shards = 0, blocks = 0, slots = 0;
     int busy = 0;       ///< the blocks that hold a slice of the row at max_keys
     double units = 0.;  ///< that row's modeled time in slice times of one block
+    int prime_span = 0; ///< keys between the tiles consecutive shards copy before the preparation's wait (0: no priming)
 };
 
 /// Parity and microbenchmark entry point. Returns false if a forced MMA plan cannot run on this device. shard_count > 0

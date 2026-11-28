@@ -22,6 +22,7 @@ constexpr int kKeys100Ki = 100 * 1024;
 // Rows near this depth take all 64 slices, so any smaller slice count slices them differently.
 constexpr int kKeysAllSlices = 130000;
 constexpr int kKeysPartTail = 128 * 1024 - 1000;   // a deep row whose last slice is partly filled
+constexpr int kKeysBetween = 44000;                // rows between the reader's cutoff and the bench's depths
 
 static const char* mma_ring_name(const ink::Int8MmaPlanInfo& info) {
     return info.stages == 0 ? "direct" : info.ping_pong ? "ping-pong-ring" : "ring";
@@ -35,6 +36,9 @@ static const char* mma_plan_name(ink::Int8MmaPlan plan) {
         case ink::Int8MmaPlan::OneStagePingPong: return "one-stage-ping-pong";
         case ink::Int8MmaPlan::NarrowRing: return "narrow-ring";
         case ink::Int8MmaPlan::Direct: return "direct";
+        case ink::Int8MmaPlan::RegisterRing: return "register-ring";
+        case ink::Int8MmaPlan::RegisterPingPong: return "register-ping-pong";
+        case ink::Int8MmaPlan::SharedRing: return "shared-ring";
     }
     return "unknown";
 }
@@ -58,6 +62,148 @@ static bool check_cuda(cudaError_t e, const char* what) {
     if (e == cudaSuccess) return true;
     std::fprintf(stderr, "kv_int8_parity: %s: %s\n", what, cudaGetErrorString(e));
     return false;
+}
+
+// The K and V caches' bytes read once, 16 bytes a thread a step with streaming loads: the card's achievable read rate over
+// the bytes an attention call reads.
+__global__ void stream_read_kernel(const int4* __restrict__ k, const int4* __restrict__ v, size_t n, int* __restrict__ out) {
+    int acc = 0;
+    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
+        const int4 a = __ldcs(k + i), b = __ldcs(v + i);
+        acc ^= a.x ^ a.y ^ a.z ^ a.w ^ b.x ^ b.y ^ b.z ^ b.w;
+    }
+    if (acc == 0x7fffffff) *out = acc;
+}
+
+// --bench-ring: deep windows of 2 to 8 rows under the shared raw-copy ring plan and under the register-staged plans (a
+// window's tiles through registers, so three blocks fit a multiprocessor), the three timed in the order A B C C B A,
+// beside the streaming roof over the same bytes. Each call reads its whole cache, several times the L2, so no call finds
+// the last one's lines. Prints whether each register plan's output has the ring's bits.
+static bool bench_register_ring() {
+    const int64_t depths[] = {81920, 131072, 146000};
+    using Plan = ink::Int8MmaPlan;
+    const Plan plans[] = {Plan::SharedRing, Plan::RegisterRing, Plan::RegisterPingPong};
+    int dev = 0;
+    cudaDeviceProp prop{};
+    if (!check_cuda(cudaGetDevice(&dev), "ring device") || !check_cuda(cudaGetDeviceProperties(&prop, dev), "ring device"))
+        return false;
+    constexpr int rows_max = ink::kDecodeRows, reps = 50;
+    float *y = nullptr, *table = nullptr, *q = nullptr, *r = nullptr, *sink = nullptr, *out = nullptr;
+    int32_t* pos = nullptr;
+    uint8_t* q8 = nullptr;
+    void* scr = nullptr;
+    std::mt19937 rng(0x72696e67);
+    std::normal_distribution<float> normal(0.f, 0.4f);
+    const auto upload = [&](float** p, size_t n) {
+        std::vector<float> h(n);
+        for (float& x : h) x = normal(rng);
+        return check_cuda(cudaMalloc((void**) p, n * 4), "ring alloc") &&
+               check_cuda(basalt::core::device_copy(*p, h.data(), n * 4, cudaMemcpyHostToDevice), "ring upload");
+    };
+    bool ok = upload(&y, (size_t) rows_max * ink::kProj) && upload(&table, (size_t) ink::kRel * ink::kExtent) &&
+              upload(&q, (size_t) rows_max * ink::kHeads * ink::kHeadDim) &&
+              upload(&r, (size_t) rows_max * ink::kHeads * ink::kRel) &&
+              upload(&sink, (size_t) rows_max * ink::kHeads) &&
+              check_cuda(cudaMalloc(&out, (size_t) rows_max * (ink::kHeads * ink::kHeadDim) * 4), "ring out") &&
+              check_cuda(cudaMalloc(&pos, rows_max * 4), "ring pos") &&
+              check_cuda(cudaMalloc(&q8, (size_t) rows_max * (ink::kHeads * ink::kHeadDim / 32 * 36)), "ring q8") &&
+              check_cuda(cudaMalloc(&scr, ink::attention_decode_scratch(rows_max, 1 << 20)), "ring scratch");
+    cudaEvent_t t0{}, t1{};
+    ok = ok && check_cuda(cudaEventCreate(&t0), "event") && check_cuda(cudaEventCreate(&t1), "event");
+    std::printf("kv ring: device=%s SMs=%d L2=%d shared_per_SM=%zu\n", prop.name, prop.multiProcessorCount, prop.l2CacheSize,
+                prop.sharedMemPerMultiprocessor);
+    for (const int64_t depth : depths) {
+        if (!ok) break;
+        const size_t cache = (size_t) depth * ink::kKvHeads * ink::kKvInt8RowBytes;
+        uint8_t *kc = nullptr, *vc = nullptr;
+        if (!check_cuda(cudaMalloc(&kc, cache), "ring k") || !check_cuda(cudaMalloc(&vc, cache), "ring v")) {
+            ok = false;
+            break;
+        }
+        {   // codes and scales at random: the scales' fp16 must be finite
+            std::vector<uint8_t> h(cache);
+            std::uniform_int_distribution<int> byte(0, 255);
+            for (size_t i = 0; i < h.size(); ++i) h[i] = (uint8_t) byte(rng);
+            for (size_t row = 0; row < cache / ink::kKvInt8RowBytes; ++row) {
+                uint8_t* scale = h.data() + row * ink::kKvInt8RowBytes + ink::kHeadDim;
+                for (int k = 0; k < 2; ++k) {
+                    const uint16_t half = (uint16_t) (0x1c00 + (byte(rng) & 0x3ff));   // about 0.004 to 0.008
+                    std::memcpy(scale + 2 * k, &half, 2);
+                }
+            }
+            ok = check_cuda(basalt::core::device_copy(kc, h.data(), cache, cudaMemcpyHostToDevice), "ring k up") &&
+                 check_cuda(basalt::core::device_copy(vc, h.data(), cache, cudaMemcpyHostToDevice), "ring v up");
+        }
+        double roof = 1e30;
+        for (const int per_sm : {2, 4, 8, 16}) {
+            const int grid = per_sm * prop.multiProcessorCount;
+            stream_read_kernel<<<grid, 256>>>((const int4*) kc, (const int4*) vc, cache / 16, (int*) scr);
+            cudaEventRecord(t0);
+            for (int i = 0; i < reps; ++i)
+                stream_read_kernel<<<grid, 256>>>((const int4*) kc, (const int4*) vc, cache / 16, (int*) scr);
+            cudaEventRecord(t1);
+            float ms = 0.f;
+            ok = ok && check_cuda(cudaEventSynchronize(t1), "ring stream") &&
+                 check_cuda(cudaEventElapsedTime(&ms, t0, t1), "ring stream");
+            roof = std::min(roof, (double) ms * 1000. / reps);
+        }
+        const double kv = 2. * (double) cache;
+        std::printf("kv ring: depth %lld streaming read of the K and V bytes: %.1f us, %.0f GB/s\n", (long long) depth, roof,
+                    kv / roof / 1000.);
+        for (int rows = 2; rows <= 8 && ok; ++rows) {
+            std::vector<int32_t> hp(rows);
+            for (int i = 0; i < rows; ++i) hp[i] = (int32_t) (depth - rows + i);
+            ok = check_cuda(basalt::core::device_copy(pos, hp.data(), rows * 4, cudaMemcpyHostToDevice), "ring pos up");
+            ink::AttnArgs aa;
+            aa.int8 = true;
+            aa.q = q; aa.r = r; aa.sink = sink; aa.rel_table = table; aa.pos = pos; aa.k_cache = kc; aa.v_cache = vc;
+            aa.cap = depth; aa.gate = y + ink::kOffGate; aa.gate_ld = ink::kProj; aa.q8 = q8; aa.min_full_keys = hp[0] + 1;
+            const size_t outputs = (size_t) rows * ink::kHeads * ink::kHeadDim;
+            std::vector<float> want(outputs), got(outputs);
+            ink::Int8MmaPlanInfo info[3];
+            bool available[3], same[3];
+            for (int p = 0; p < 3; ++p) {
+                available[p] = ink::attention_decode_int8_test(aa, rows, depth, scr, out, nullptr, true, plans[p], &info[p]);
+                same[p] = false;
+                if (!available[p]) continue;
+                ok = ok && check_cuda(cudaDeviceSynchronize(), "ring run") &&
+                     check_cuda(basalt::core::device_copy(p == 0 ? want.data() : got.data(), out, got.size() * 4,
+                                                          cudaMemcpyDeviceToHost), "ring out down");
+                same[p] = p == 0 || std::memcmp(want.data(), got.data(), got.size() * 4) == 0;
+            }
+            const auto time = [&](int p) {
+                cudaEventRecord(t0);
+                for (int i = 0; i < reps; ++i)
+                    ink::attention_decode_int8_test(aa, rows, depth, scr, nullptr, nullptr, true, plans[p]);
+                cudaEventRecord(t1);
+                float ms = 0.f;
+                ok = ok && check_cuda(cudaEventSynchronize(t1), "ring time") &&
+                     check_cuda(cudaEventElapsedTime(&ms, t0, t1), "ring time");
+                return (double) ms * 1000. / reps;
+            };
+            double us[3] = {};
+            for (const int p : {0, 1, 2, 2, 1, 0})
+                if (available[p]) us[p] += time(p) / 2.;
+            for (int p = 0; p < 3; ++p) {
+                if (!available[p]) {
+                    std::printf("kv ring: depth=%lld T=%d %s unavailable\n", (long long) depth, rows, mma_plan_name(plans[p]));
+                    continue;
+                }
+                std::printf("kv ring: depth=%lld T=%d %s %.1f us %.0f GB/s (%.0f %% of the roof) %+.1f %% stages=%d ping_pong=%d "
+                            "shared=%zu resident=%d slots=%d shards=%d units=%.2f same_bits=%d\n", (long long) depth, rows,
+                            mma_plan_name(plans[p]), us[p], kv / us[p] / 1000., 100. * roof / us[p], 100. * (us[p] / us[0] - 1.),
+                            info[p].stages, info[p].ping_pong, info[p].shared, info[p].resident, info[p].slots, info[p].shards,
+                            info[p].units, same[p]);
+            }
+        }
+        cudaFree(kc);
+        cudaFree(vc);
+    }
+    if (t0) cudaEventDestroy(t0);
+    if (t1) cudaEventDestroy(t1);
+    for (void* p : {(void*) y, (void*) table, (void*) q, (void*) r, (void*) sink, (void*) out, (void*) pos, (void*) q8, scr})
+        if (p) cudaFree(p);
+    return ok;
 }
 
 // A decode window of `rows` rows (positions depth - rows ..) over one visit's cache in each format: a sliding-window ring
@@ -424,11 +570,12 @@ static bool check_attention_mma(bool reduced) {
         depths.push_back(4096);
         for (const int boundary : {32768, 65536, kKeys100Ki, 131072, 196608, 262144})
             depths.insert(depths.end(), {boundary - 1, boundary, boundary + 1});
+        depths.push_back(kKeysBetween);
         depths.push_back(kKeysAllSlices);
         std::sort(depths.begin(), depths.end());
     }
     bool schedules_ok = true;
-    bool reported[static_cast<int>(ink::Int8MmaPlan::Direct) + 1] = {};
+    bool reported[static_cast<int>(ink::Int8MmaPlan::SharedRing) + 1] = {};
     for (const int depth : depths) {
         if (!ok) break;
         int32_t pos[rows];
@@ -566,7 +713,7 @@ static bool check_attention_mma(bool reduced) {
                 singleton_schedule[j] &= matches_plan(j, 1, ink::Int8MmaPlan::Direct, bound, singleton[j]);
             }
         }
-        for (const int width : {1, 2, 3, 5, 6, 7, 8}) {
+        for (const int width : {1, 2, 3, 4, 5, 6, 7, 8}) {
             if (!ok) break;
             const int first = 3 - (width - 1) / 2;
             DecodeResult scalar, mma, padded, automatic, auto_padded, segmented, separate;
@@ -581,6 +728,10 @@ static bool check_attention_mma(bool reduced) {
                     for (const int count : {1, 2, 3, 4, 8, 16, 21, 32, 64})
                         shard_invariant &= matches_plan(first, width, ink::Int8MmaPlan::Auto, bound, mma,
                                                         ink::Int8MmaShards::Auto, count);
+                    if (width >= 2)
+                        for (const auto plan : {ink::Int8MmaPlan::SharedRing, ink::Int8MmaPlan::RegisterRing,
+                                                ink::Int8MmaPlan::RegisterPingPong})
+                            schedule &= matches_plan(first, width, plan, bound, mma);
                     if (width >= 6) {
                         schedule &= matches_plan(first, width, ink::Int8MmaPlan::TwoStageRing, bound, mma);
                         schedule &= matches_plan(first, width, ink::Int8MmaPlan::ThreeStageRing, bound, mma);
@@ -588,7 +739,9 @@ static bool check_attention_mma(bool reduced) {
                     }
                 }
             }
-            if (ok && width == rows)
+            // a batch window of two segments, rows [0, 5) and [5, width) of the window, each its own cache
+            const bool batched = width > 5;
+            if (ok && batched)
                 ok = run(first, width, Reader::Auto, segmented, true) &&
                      run(first + 5, width - 5, Reader::Auto, separate, false, true);
             if (!ok) break;
@@ -596,7 +749,7 @@ static bool check_attention_mma(bool reduced) {
                 const bool invariant = same_output(mma, j, singleton[first + j], 0) && same_output(mma, j, padded, j);
                 const auto& expected = pos[first + j] + 1 >= mma_min_keys ? mma : scalar;
                 const bool dispatched = same_output(automatic, j, expected, j) && same_output(auto_padded, j, expected, j);
-                const bool batch_invariant = width != rows ||
+                const int batch_invariant = !batched ? -1 :
                     (j < 5 ? same_output(automatic, j, segmented, j) : same_output(separate, j - 5, segmented, j));
                 report(width, first, j, scalar, mma, invariant, dispatched, batch_invariant,
                        schedule && singleton_schedule[first + j], shard_invariant);
@@ -715,7 +868,10 @@ static bool check_decode_graph(bool reduced) {
               alloc(&scratch, ink::attention_decode_scratch(rows, cap)) &&
               check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "graph stream");
     bool pass = true;
-    for (const Shape& shape : shapes) {
+    // Each shape under the serving plan and under the shared ring (the narrow ring, which copies its first tile before the
+    // preparation's wait), each reporting the plan it took and the keys it primed.
+    for (const Shape& shape : shapes)
+    for (const ink::Int8MmaPlan plan : {ink::Int8MmaPlan::Auto, ink::Int8MmaPlan::SharedRing}) {
         if (!ok) break;
         const int pos0 = shape.depth - rows;   // the last row reads `depth` keys
         int64_t bucket = 1024;                 // the serving graph's key bound (session.cpp full_keys_of)
@@ -742,7 +898,8 @@ static bool check_decode_graph(bool reduced) {
                 // The preparation follows the poisoning copies (a plain launch); the reader and the merge may start early.
                 basalt::kernels::PdlScope scope(pdl, true);
                 ink::decode_prepare(pa, rows, stream);
-                ink::attention_decode(aa, rows, bucket, scratch, dout, stream);
+                if (plan == ink::Int8MmaPlan::Auto) ink::attention_decode(aa, rows, bucket, scratch, dout, stream);
+                else ink::attention_decode_int8_test(aa, rows, bucket, scratch, dout, stream, true, plan);
             };
             // A shape's first window runs directly, as the session's does, before its graph is captured.
             ok = ok && check_cuda(basalt::core::device_copy(dy, ys[replays].data(), ys[replays].size() * 4, cudaMemcpyHostToDevice), "graph y");
@@ -779,14 +936,22 @@ static bool check_decode_graph(bool reduced) {
         for (const auto& out : fp32)
             for (const float x : out) finite &= std::isfinite(x);
         const bool identical = fp32[0] == fp32[1] && q8[0] == q8[1];
-        // The reader's prefix slice: whole passes of its block, at most the card's slice count, for the proven bound's keys.
-        const int64_t slices = ink::attention_decode_int8_slices();
-        const int64_t units = (fewest + 128 * slices - 1) / (128 * slices);
-        const int prime_span = (int) std::max<int64_t>(units, 1) * 128;
-        std::printf("kv MMA graph: depth=%d T=%d replays=%d prime_span=%d identical=%d bound=%lld fewest=%lld finite=%d "
-                    "pdl_launches=%ld\n", shape.depth, rows, replays, prime_span, identical, (long long) bucket,
-                    (long long) fewest, finite, pdl_launches);
-        pass &= identical && finite && pdl_launches > 0;
+        // the plan this chain's reader takes and its priming, from the chain with PDL on, run directly: the preparation
+        // first, then the reader, as the captured chain and the serving window queue them
+        ink::Int8MmaPlanInfo info;
+        {
+            basalt::kernels::PdlScope scope(true, true);
+            ink::decode_prepare(pa, rows, stream);
+            ok = ok && ink::attention_decode_int8_test(aa, rows, bucket, scratch, dout, stream, true, plan, &info) &&
+                 check_cuda(cudaStreamSynchronize(stream), "graph plan");
+        }
+        // the shared ring takes its narrow form at two rows, which primes
+        const bool primed = plan != ink::Int8MmaPlan::SharedRing || info.prime_span > 0;
+        std::printf("kv MMA graph: depth=%d T=%d %s plan=%s replays=%d prime_span=%d identical=%d bound=%lld fewest=%lld "
+                    "finite=%d pdl_launches=%ld\n", shape.depth, rows, mma_plan_name(plan),
+                    info.stages == 0 ? (info.ping_pong ? "registers-ping-pong" : "registers") : mma_ring_name(info), replays,
+                    info.prime_span, identical, (long long) bucket, (long long) fewest, finite, pdl_launches);
+        pass &= identical && finite && pdl_launches > 0 && primed;
     }
     if (stream) cudaStreamDestroy(stream);
     for (void* p : {(void*) dy, (void*) dtaps, (void*) dqs, (void*) drs, (void*) dkr, (void*) dvr, (void*) dtable, (void*) dq,
@@ -798,8 +963,9 @@ static bool check_decode_graph(bool reduced) {
 int main(int argc, char** argv) {
     const bool bench = argc == 2 && std::strcmp(argv[1], "--bench") == 0;
     const bool reduced = argc == 2 && std::strcmp(argv[1], "--reduced") == 0;
+    if (argc == 2 && std::strcmp(argv[1], "--bench-ring") == 0) return bench_register_ring() ? 0 : 1;
     if (argc > 2 || (argc == 2 && !bench && !reduced)) {
-        std::fprintf(stderr, "usage: inkling2_kv_int8_parity [--bench | --reduced]\n");
+        std::fprintf(stderr, "usage: inkling2_kv_int8_parity [--bench | --reduced | --bench-ring]\n");
         return 2;
     }
 
