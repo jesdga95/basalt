@@ -2,6 +2,7 @@
 // and aligner output are fp32; the inputs of the products are bf16. Attention runs one head at a time as two products
 // around a row softmax. The graph follows llama.cpp's mtmd deepseek4v encoder (MIT).
 #include "basalt/core/device_copy.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/models/deepseek41/vision.hpp"
 
 #include <cublas_v2.h>
@@ -149,6 +150,7 @@ __global__ void k_assemble(const float* aligned, const float* start, const float
 }  // namespace
 
 struct VisionEncoder::Impl {
+    int device = -1;
     int layers = 0, proj = 0, cap = 0, ng_cap = 0, tok_cap = 0;
     float eps = 1e-6f;
     cublasHandle_t blas = nullptr;   // borrowed from the VisionBlas
@@ -167,6 +169,7 @@ struct VisionEncoder::Impl {
     std::string err;
 
     ~Impl() {
+        core::OnDevice g(device);
         for (void* p : owned) cudaFree(p);
         for (void* p : work) cudaFree(p);
     }
@@ -295,8 +298,10 @@ VisionEncoder::~VisionEncoder() = default;
 int VisionEncoder::width() const { return impl_->proj; }
 
 struct VisionBlas::Impl {
+    int device = -1;
     cublasHandle_t blas = nullptr;
     ~Impl() {
+        core::OnDevice g(device);
         if (blas) cublasDestroy(blas);
     }
 };
@@ -306,6 +311,8 @@ VisionBlas::~VisionBlas() = default;
 
 bool VisionBlas::open(std::string& err) {
     if (impl_->blas) return true;
+    int dev = 0;
+    if (cudaGetDevice(&dev) == cudaSuccess) impl_->device = dev;
     if (cublasCreate(&impl_->blas) != CUBLAS_STATUS_SUCCESS) {
         impl_->blas = nullptr;
         err = "cannot create the product handle";
@@ -321,11 +328,12 @@ bool VisionBlas::open(std::string& err) {
         float* c = b + n * n;
         cudaMemset(buf, 0, 3 * (size_t) n * n * sizeof(float));
         const float one = 1.f, zero = 0.f;
-        ok = cublasGemmEx(impl_->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, &one, a, CUDA_R_32F, n, b, CUDA_R_32F, n, &zero, c,
-                          CUDA_R_32F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS &&
-             cublasGemmEx(impl_->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, &one, a, CUDA_R_16BF, n, b, CUDA_R_16BF, n, &zero, c,
-                          CUDA_R_32F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS &&
-             cudaStreamSynchronize(nullptr) == cudaSuccess;
+        const bool g1 = cublasGemmEx(impl_->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, &one, a, CUDA_R_32F, n, b, CUDA_R_32F, n, &zero, c,
+                                     CUDA_R_32F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
+        const bool g2 = g1 && cublasGemmEx(impl_->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, &one, a, CUDA_R_16BF, n, b, CUDA_R_16BF, n, &zero, c,
+                                           CUDA_R_32F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
+        const bool synced = cudaStreamSynchronize(nullptr) == cudaSuccess;
+        ok = g2 && synced;
         cudaFree(buf);
     }
     if (!ok) {
@@ -338,6 +346,8 @@ bool VisionBlas::open(std::string& err) {
 
 bool VisionEncoder::init(const basalt::vision::Mmproj& mp, VisionBlas& blas, std::string& err) {
     if (!blas.open(err)) return false;
+    impl_->device = blas.impl_->device;
+    core::OnDevice g(impl_->device);
     impl_->blas = blas.impl_->blas;
     if (!impl_->load(mp, err)) {
         if (err.empty()) err = "cannot upload the projector weights";
@@ -348,6 +358,7 @@ bool VisionEncoder::init(const basalt::vision::Mmproj& mp, VisionBlas& blas, std
 
 bool VisionEncoder::reserve(const VisionPlan& pl, std::string& err) {
     Impl& s = *impl_;
+    core::OnDevice g(s.device);
     const int n = pl.n_patches(), ng = pl.lw * pl.lh, ntok = pl.n_tokens();
     if (s.ensure(n, ng, ntok)) return true;
     err = "no device memory for the image encoder's work buffers (" + std::to_string(s.work_bytes(n, ng, ntok) >> 20) + " MiB)";
@@ -358,6 +369,7 @@ static int blocks(size_t n) { return (int) ((n + 255) / 256); }
 
 bool VisionEncoder::encode(const std::vector<float>& rows, const VisionPlan& pl, std::vector<float>& out, std::string& err) {
     Impl& s = *impl_;
+    core::OnDevice g(s.device);
     const int n = pl.n_patches(), ng = pl.lw * pl.lh, ntok = pl.n_tokens();
     if ((size_t) n * kVisionPatchValues != rows.size()) {
         err = "patch rows do not match the plan";

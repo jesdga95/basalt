@@ -31,6 +31,7 @@
 #include <mma.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
 #include <cmath>
 #include <stdexcept>
@@ -1466,10 +1467,16 @@ void indexer_select_batch(const IndexerArgs& a, const float* qr, const float* x,
                                                           a.block_size, w.blk_ok);
     // the fp16 cache and Level2's candidate mask keep idx_score_kernel
     if (a.format == CacheFormat::Fp8 && a.mode != IndexMode::Level2) {
-        static bool attr = false;
-        if (!attr) {
-            cudaFuncSetAttribute(idx_score_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcSmem);
-            attr = true;
+        static std::atomic<bool> attr[64];
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) dev = 0;
+        const bool cached = dev >= 0 && dev < 64;
+        if (!cached || !attr[dev].load(std::memory_order_acquire)) {
+            const cudaError_t ae =
+                cudaFuncSetAttribute(idx_score_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcSmem);
+            if (ae != cudaSuccess)
+                throw std::runtime_error(std::string("idx_score_tc: shared-memory opt-in: ") + cudaGetErrorString(ae));
+            if (cached) attr[dev].store(true, std::memory_order_release);
         }
         dim3 g(std::min((a.n_comp + kTcRows - 1) / kTcRows, kTcScoreBlocks), (n_tokens + kTcTok - 1) / kTcTok);
         idx_score_tc_kernel<<<g, kTcThreads, kTcSmem, s>>>(w.iq, w.iw, pos, n_tokens, a.comp_ik, a.n_comp, a.ratio, w_scale, w.scores);
