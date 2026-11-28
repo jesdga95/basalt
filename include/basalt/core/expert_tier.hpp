@@ -390,6 +390,7 @@ private:
     bool move_to_peer(int layer, int e, const uint8_t* src);
 
     const ExpertTierSpec s_;
+    int device_ = -1;
     core::ExpertCache cache_;
     int n_layers_ = 0, n_expert_ = 0;
     int64_t per_layer_ = 0;                 ///< VRAM slots per layer in the base arena (their mean, with layer_weights)
@@ -456,6 +457,9 @@ private:
     platform::MappedFile file_;             ///< the experts section
     core::FileReads reads_;                       ///< open when the file holds experts and the RAM tier caches them
     std::vector<core::FileReads::Blob> blobs_;    ///< the reads of the last lookup
+    struct PendingRead { int layer; int expert; int32_t slot; };
+    std::vector<PendingRead> pending_reads_;      ///< in-flight reads to roll back if wait() fails
+    std::vector<std::vector<int32_t>> free_ram_;  ///< per-layer RAM slots freed on failed reads
     std::vector<uint16_t> uses_;            ///< [layer * n_expert + e] CPU uses toward a promotion, with reads_ open
     int64_t read_ = 0;                      ///< experts read into the RAM tier
     uint64_t host_bytes_ = 0;               ///< what the model's host buffers took
@@ -477,6 +481,8 @@ private:
     int32_t* held_pin_ = nullptr;            ///< its staging (pinned host)
     std::vector<int32_t> held_pub_;          ///< what was published last
     cudaEvent_t held_ev_ = nullptr;          ///< behind the last publish's copies
+    bool held_dirty_ = false;
+    bool held_ev_live_ = false;
     unsigned long long* route_counts_ = nullptr;
     float* zero_row_ = nullptr;
 
