@@ -254,10 +254,10 @@ public:
         if (stream_) cudaStreamSynchronize(stream_);
         if (lane_[1].stream) cudaStreamSynchronize(lane_[1].stream);
         if (!m_.wedged() && m_.has_spill() && ex_tally_) {   // how decode's lookups fell between the card and RAM
-            std::vector<uint32_t> t;
-            if (read_tally(t)) {
+            tally_dirty_ = true;
+            if (refresh_tally()) {
                 uint64_t loan = 0;
-                const CardShare sh = lookup_share(t, loan);
+                const CardShare sh = lookup_share(tally_h_, loan);
                 const uint64_t all = sh.all, card = sh.card;
                 if (m_.peer_device() >= 0)
                     basalt::log::info("basalt inkling2", "experts: %llu decode lookups, %.2f%% on the card, %llu on GPU %d, %llu on the CPU",
@@ -294,6 +294,10 @@ public:
         if (ra_st_) cudaStreamDestroy(ra_st_);
         if (pf_st_) cudaStreamDestroy(pf_st_);
         if (stream_) cudaStreamDestroy(stream_);
+        if (d_hist_) {
+            cudaFree(d_hist_);
+            d_hist_ = nullptr;
+        }
     }
 
     bool init(std::string& err) {
@@ -483,12 +487,13 @@ public:
 
     model::Result decode_window(const model::DecodeRequest& r) override {
         if (r.n_tokens < 1) return {model::Status::Error, "inkling2: an empty window"};
-        if (stale_) return stale();
+        if (stale_ && r.pos > 0) return stale();
         if (m_.wedged()) return wedged();
         if (r.pos + r.n_tokens > m_.context()) return {model::Status::Refused, "inkling2: the window runs past the context"};
         std::string err;
         const int64_t loaned_before = m_.loaned();
         if (heat_tally_) settle_window(r.pos);
+        if (r.pos == 0 && !restart_positions(r.n_tokens, 0)) return wedged();
         if (!ensure_positions(r.pos + r.n_tokens, err)) return grow_failed(err);
         if (heat_tally_) {   // the placement changes due at this position, before any row at or past it runs
             if (rebalances() && next_rebalance_ >= 0 && r.pos >= next_rebalance_) rebalance_copies(r.pos, false);
@@ -498,6 +503,7 @@ public:
         if (!admit(err)) return {model::Status::Error, "inkling2: " + err};
         const Admitted held{*this};
         hist_.resize((size_t) r.pos);
+        if (r.pos == 0) stale_ = true;
         for (int t0 = 0; t0 < r.n_tokens; t0 += kWindowRows) {
             const int n = std::min(kWindowRows, r.n_tokens - t0);
             const bool last = t0 + n == r.n_tokens;
@@ -522,7 +528,7 @@ public:
             logits_ = head > 0 ? blog_ : nullptr;
             if (head > 0) logits_gen_ = ++sh_->logits_gen;
             if (!want) continue;
-            if (!pick(r, t0, head, err)) return {model::Status::Error, "inkling2: " + err};
+            if (!pick(r, r.row_tokens ? t0 : 0, head, err)) return {model::Status::Error, "inkling2: " + err};
             if (r.row_tokens)
                 for (int i = 0; i < n; ++i) r.row_tokens[t0 + i] = picks_[(size_t) i];
             if (last && r.next_token) *r.next_token = picks_[(size_t) head - 1];
@@ -530,6 +536,7 @@ public:
                 cudaMemcpyAsync(r.logits, logits_ + (size_t) (head - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost, stream_);
         }
         if (const model::Result done = end_call("the window failed"); !done.ok()) return done;
+        stale_ = false;
         if (heat_tally_ && !m_.submit_loan(r.pos + kLoanLagRows)) return wedged();
         return {};
     }
@@ -589,10 +596,13 @@ protected:
         int max_seg_rows = 1;
         for (int i = 0; i < wsegs.n; ++i) max_seg_rows = std::max(max_seg_rows, wsegs.row0[i + 1] - wsegs.row0[i]);
         key.push_back((uint64_t) stage(v.w.tokens.data(), nullptr, v.w.rows, 0, v.w.positions.data(), &wsegs));
-        key.push_back((uint64_t) (max_seg_rows * (kHeads / kKvHeads) > 16));
+        const int m_rows = max_seg_rows * (kHeads / kKvHeads);
+        key.push_back((uint64_t) (m_rows > 16 ? (m_rows + 31) / 32 : 0));
         key.push_back(cpu_ = cpu_layers());
         if (cpu_) sh_->cpu->wake();
         if (!check(err)) return false;
+        ++sh_->logits_gen;
+        tally_dirty_ = true;
         held.passed = true;
         return true;
     }
@@ -602,7 +612,6 @@ protected:
         return false;
     }
     bool batch_forward(const model::BatchView& v, std::string&) override {
-        ++sh_->logits_gen;
         view_ = &v;
         body(v.w.rows, v.w.rows, full_keys_of(v.w.max_pos, v.w.rows));
         view_ = nullptr;
@@ -673,6 +682,7 @@ public:
         if (m_.wedged()) return wedged();
         hist_.resize((size_t) r.pos);
         stale_ = true;   // until the rows are in (an error or an exception leaves it set)
+        tally_dirty_ = true;
         if (staged) {   // PROMPT HOOK; a failed read's rows are no prefix to go on from
             PromptRunner::Prepare prepare;
             if (heat_tally_)
@@ -840,8 +850,19 @@ public:
     model::Result draft_batch(model::ModelSession* const* peers, const int32_t* anchors, const int64_t* pos, const int* n,
                               int count) override {
         if (m_.wedged()) return wedged();
-        if (!sh_->ds_batch || !sh_->ds_batch->on() || count <= 1 || count > bk::kWindowSegsMax)
+        if (!sh_->ds_batch || !sh_->ds_batch->on() || count <= 1)
             return ModelSession::draft_batch(peers, anchors, pos, n, count);
+        if (count > bk::kWindowSegsMax) {
+            for (int i = 0; i < count; ++i) {
+                Session* s = dynamic_cast<Session*>(peers[i]);
+                if (!s || s->sh_ != sh_) return ModelSession::draft_batch(peers, anchors, pos, n, count);
+            }
+            for (int i = 0; i < count; ++i) {
+                Session* s = static_cast<Session*>(peers[i]);
+                if (model::Result r = s->dspark_.draft_begin(anchors[i], pos[i], n[i], stream_); !r.ok()) return r;
+            }
+            return {};
+        }
         DsparkHook* hooks[bk::kWindowSegsMax] = {};
         for (int i = 0; i < count; ++i) {
             Session* s = dynamic_cast<Session*>(peers[i]);
@@ -1129,16 +1150,13 @@ public:
     // was served, not where its expert is later.
     bool settle_hits() {
         if (!m_.has_spill() || !ex_tally_) return true;
-        std::vector<uint32_t> t;
-        bool ok = true;
-        for (const Lane& k : lane_)
-            if (k.stream && cudaStreamSynchronize(k.stream) != cudaSuccess) ok = false;
-        if (!ok || !read_tally(t)) {
+        tally_dirty_ = true;
+        if (!refresh_tally()) {
             m_.wedge();
             basalt::log::error("basalt inkling2", "expert lookup counters could not be read; restart the engine");
             return false;
         }
-        hits_.settle(t, g_.n_expert, [&](int l, int e) { return served(l, e); });
+        hits_.settle(tally_h_, g_.n_expert, [&](int l, int e) { return served(l, e); });
         return true;
     }
     // How the lookups fell between the card and RAM; `loan`: the card's that went to loaned copies.
@@ -1306,10 +1324,9 @@ public:
     // counts say which experts the lookups went to, and those whose experts are in RAM are no hits
     ExpertCounts expert_counts() const override {
         if (!m_.has_spill() || !ex_tally_) return {lookups_, lookups_, 0, 0};
-        std::vector<uint32_t> t;
-        if (cudaStreamSynchronize(stream_) != cudaSuccess || !read_tally(t)) return {lookups_, lookups_, 0, 0};
+        if (!refresh_tally()) return {lookups_, lookups_, 0, 0};
         uint64_t loan = 0;
-        const CardShare sh = lookup_share(t, loan);
+        const CardShare sh = lookup_share(tally_h_, loan);
         return {(int64_t) (sh.card + sh.peer), (int64_t) sh.all, 0, 0};
     }
     std::vector<CardExperts> experts_by_card() const override {
@@ -1326,7 +1343,7 @@ public:
         return out;
     }
     bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override {
-        if (cudaStreamSynchronize(stream_) != cudaSuccess || !read_tally(tally_h_)) return false;
+        if (!refresh_tally()) return false;
         map_.take(tally_h_, total, homes, routed);
         return true;
     }
@@ -1364,15 +1381,23 @@ private:
         return p;
     }
 
-    // Every card's running counts of the experts' lookups, summed (a card counts its own layers').
-    bool read_tally(std::vector<uint32_t>& t) const {
-        t.assign((size_t) expert_pairs(), 0u);
-        std::vector<uint32_t> c(t.size());
+    // Every card's running counts of the experts' lookups, summed into tally_h_ on each lane's own stream.
+    bool refresh_tally() const {
+        const size_t n = (size_t) expert_pairs();
+        if (!tally_dirty_ && tally_h_.size() == n) return true;
+        tally_h_.assign(n, 0u);
+        tally_tmp_.resize(n);
         for (const Lane& k : lane_) {
             if (!k.ex_tally) continue;
-            if (basalt::core::device_copy(c.data(), k.ex_tally, c.size() * 4, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
-            for (size_t i = 0; i < t.size(); ++i) t[i] += c[i];
+            const core::OnDevice on_lane(k.device);
+            if (cudaMemcpyAsync(tally_tmp_.data(), k.ex_tally, n * sizeof(uint32_t), cudaMemcpyDeviceToHost, k.stream) != cudaSuccess ||
+                cudaStreamSynchronize(k.stream) != cudaSuccess) {
+                tally_dirty_ = true;
+                return false;
+            }
+            for (size_t i = 0; i < n; ++i) tally_h_[i] += tally_tmp_[i];
         }
+        tally_dirty_ = false;
         return true;
     }
 
@@ -1675,6 +1700,7 @@ private:
         }
         cpu_ = cpu_layers();
         if (cpu_) sh_->cpu->wake();
+        tally_dirty_ = true;
         if (!layers(rows, head, stage(tokens, emb, rows, pos0, nullptr), err, graphed) || !check(err)) return false;
         dspark_.note(pos0, rows);   // DSPARK HOOK: the host's record of the rows the drafter took
         return true;
@@ -2021,20 +2047,31 @@ private:
         if (!r.sampling) sp.temperature = 0.f;
         sp.counter += (uint64_t) t0;
         sp.logit_bias = bias_on_ ? d_bias_ : nullptr;
-        history_len_ = r.history != nullptr ? r.history_len : 0;
-        if (history_len_ > 0) {   // the penalties' history of each row of the window
-            const size_t n = (size_t) kWindowRows * history_len_;
+        const int hist_len = r.history != nullptr ? r.history_len : 0;
+        history_len_ = 0;
+        if (hist_len > 0) {   // the penalties' history of each row of the window
+            const size_t n = (size_t) std::max(kWindowRows, rows) * (size_t) hist_len;
             if (d_hist_len_ < n) {
-                bool ok = true;
-                d_hist_ = (int32_t*) alloc(n * 4, ok);
-                if (!ok) {
+                const core::OnDevice on_main(m_.device());
+                int32_t* fresh = nullptr;
+                if (cudaMalloc(&fresh, n * sizeof(int32_t)) != cudaSuccess) {
                     cudaGetLastError();
                     err = "out of device memory for the sampling history";
                     return false;
                 }
+                if (d_hist_) {
+                    (void) cudaStreamSynchronize(st);
+                    cudaFree(d_hist_);
+                }
+                d_hist_ = fresh;
                 d_hist_len_ = n;
             }
-            cudaMemcpyAsync(d_hist_, r.history + (size_t) t0 * history_len_, (size_t) rows * history_len_ * 4, cudaMemcpyHostToDevice, st);
+            if (cudaMemcpyAsync(d_hist_, r.history + (size_t) t0 * hist_len, (size_t) rows * hist_len * 4,
+                                cudaMemcpyHostToDevice, st) != cudaSuccess) {
+                err = "the sampling history upload failed";
+                return false;
+            }
+            history_len_ = hist_len;
         }
         sampling_ = sp;
         return true;
@@ -2076,7 +2113,9 @@ private:
     cudaEvent_t ra_ev_ = nullptr, ra_join_ = nullptr, gs_ev_ = nullptr;   // gs_ev_: a guess is in
     cudaStream_t pf_st_ = nullptr;              // the guesses' prefetch stream, its fork and join events
     cudaEvent_t pf_ev_ = nullptr, pf_join_ = nullptr;
-    std::vector<uint32_t> tally_h_;
+    mutable std::vector<uint32_t> tally_h_;
+    mutable std::vector<uint32_t> tally_tmp_;
+    mutable bool tally_dirty_ = true;
     // the copies' ranking (with copies): the kept rows' lookups, the last window's routed ids by visit and its rows not
     // folded yet (from window position win_pos_ + win_off_), the counts and rows the model has not learned yet
     uint32_t* heat_tally_ = nullptr;

@@ -356,12 +356,11 @@ public:
             return false;
         }
         chunk_ = kPromptChunk;
-        if (c == WideClose::RestoreFailed) {   // the read fails first; the next read lays the narrow buffers out
-            recarve_ = true;
+        recarve_ = true;
+        if (c == WideClose::RestoreFailed) {
             quiet_error("the copies a long prompt read lent did not all come back");
             return false;
         }
-        carve_lane();
         return true;
     }
     static void quiet_error(const char* what) noexcept {
@@ -414,7 +413,10 @@ public:
             const LayerWeights& w = m_.layer(l);
             if (!lane_runs(l)) continue;
             if (w.gu_type == kTypeMxfp8 && w.d_type == kTypeMxfp8 && mxfp8_shape()) continue;
-            if (!ready(w.gu_type, 2 * (int64_t) F) || !ready(w.d_type, E)) return false;
+            if (!ready(w.gu_type, 2 * (int64_t) F) || !ready(w.d_type, E)) {
+                (void) cudaStreamSynchronize(strm());
+                return false;
+            }
         }
         if (cudaStreamSynchronize(strm()) != cudaSuccess) {
             err = "the prompt path's setup failed";
@@ -512,9 +514,13 @@ private:
         const bool go = !(r.stop && r.stop());
         if (go && prepare && (!prepare() || m_.wedged() || m_.loaned() > 0))
             return {model::Status::Error, "inkling2: the prompt path's memory could not be taken back"};
-        if (go && std::exchange(recarve_, false)) carve_lane();
-        if (go && widen(n) == WideOpen::Failed)
-            return {model::Status::Error, "inkling2: the copies a long prompt read borrowed from could not be put back"};
+        if (go) {
+            const WideOpen w = widen(n);
+            if (w == WideOpen::Failed)
+                return {model::Status::Error, "inkling2: the copies a long prompt read borrowed from could not be put back"};
+            if (w == WideOpen::Wide) recarve_ = false;
+            else if (std::exchange(recarve_, false)) carve_lane();
+        }
         const int chunks = (n + chunk_ - 1) / chunk_;
         const int per = (n + chunks - 1) / chunks;
         for (int t0 = 0; go && t0 < n; t0 += per, ++k) {
@@ -751,8 +757,8 @@ private:
         aa.window = c.ring ? g_.window : 0;
         aa.scale = 1.0f / std::sqrt((float) kHeadDim);
         attention_prompt(aa, rows, b().attn, strm());
-        if (c.ring) stage_to_ring(b().k_stage, b().v_stage, chunk_, c.k, c.v, c.cap, pos0, rows, g_.window,
-                                  kv_cache_row_bytes(fp8, int8), strm());
+        if (c.ring) stage_to_ring(b().k_stage, b().v_stage, chunk_, c.k, c.v, c.cap, pos0, rows,
+                                  (int) std::min<int64_t>(c.cap, chunk_), kv_cache_row_bytes(fp8, int8), strm());
         attn_gate_q8_planes_prompt(b().attn, b().yq, one ? kProj : kProjQ, rows, b().xqd, strm());
         q8::gemm(reinterpret_cast<const int8_t*>(w.out), w.out_sc_t, E, kOut, b().xqd, rows, b().o, E,
                  q8::Epilogue::Store, strm());
@@ -1046,7 +1052,7 @@ private:
     int narrow_tap_rows_ = 0;
     bool wide_short_ = false;
     bool drained_ = false;   // the last failed read's streams were run out (drain)
-    bool recarve_ = false;   // a wide read whose copies did not all return left its buffers laid out wide
+    bool recarve_ = false;   // a narrowed wide read deferred carving the narrow buffers until the next narrow read
     WideOps wide_ops_{*this};
     WideChunk<WideOps> wide_{wide_ops_};
     const std::vector<VisitCache>* vc_ = nullptr;   // the reading session's caches, drafter and stream
