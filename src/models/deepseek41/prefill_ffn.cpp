@@ -17,6 +17,7 @@
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/platform/file.hpp"
+#include "basalt/platform/memory.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 #include "models/deepseek41/model.hpp"
 #include "models/deepseek41/layer_ops.hpp"
@@ -28,7 +29,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <condition_variable>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <cstdio>
@@ -60,15 +63,23 @@ class Impl final : public PrefillFfn {
 public:
     Impl(const DsModel& m, LayerOps& ops, int cap) : m_(m), g_(m.geo()), ops_(ops), cap_(cap) {}
     ~Impl() override {
+        core::OnDevice g(m_.device());
         stop_prefetch();
+        if (copy_) cudaStreamSynchronize(copy_);
         for (cudaEvent_t e : pf_events_) cudaEventDestroy(e);
         for (const auto& o : pf_out_) cudaEventDestroy(o.first);
-        for (void* p : dev_) cudaFree(p);
         for (Stage& b : stage_) {
             if (b.copied) cudaEventDestroy(b.copied);
             if (b.done) cudaEventDestroy(b.done);
         }
+        for (Stage& b : dstage_) {
+            if (b.copied) cudaEventDestroy(b.copied);
+            if (b.done) cudaEventDestroy(b.done);
+        }
         if (copy_) cudaStreamDestroy(copy_);
+        for (void* p : dev_) cudaFree(p);
+        for (uint8_t* p : direct_bufs_) platform::free_aligned(p);
+        if (direct_fd_ >= 0) platform::close_fd(direct_fd_);
     }
 
     bool init(std::string& err) {
@@ -108,6 +119,7 @@ public:
             err = "out of memory for the prefill expert buffers";
             return false;
         }
+        direct_fd_ = platform::open_unbuffered(m_.path());
         mmq::iota(ident_, (int64_t) E, nullptr);
         map_h_.resize(E);
         cudaDeviceSynchronize();
@@ -213,19 +225,21 @@ public:
                 }
             }
             if (!from_file.empty()) {
+                const int n_threads = std::min<int>(kReadThreads, (int) from_file.size());
+                ensure_direct_bufs(n_threads);
                 std::atomic<bool> read_ok{true};
                 std::atomic<size_t> next{0};
-                auto worker = [&] {
+                auto worker = [&](int wid) {
                     for (size_t i; (i = next.fetch_add(1)) < from_file.size();) {
                         const int q = from_file[i];
                         const int e = used[b0 + (size_t) q];
                         const uint64_t off = m_.pack().experts_range.offset + el.offset + (uint64_t) e * el.blob_bytes;
-                        if (!platform::pread_all(m_.experts_fd(), B.host + slot_ * (size_t) q, L.bytes, off)) read_ok = false;
+                        if (!read_blob(wid, B.host + slot_ * (size_t) q, L.bytes, off)) read_ok = false;
                     }
                 };
                 std::vector<std::thread> th;
-                for (int i = 1; i < std::min<int>(kReadThreads, (int) from_file.size()); ++i) th.emplace_back(worker);
-                worker();
+                for (int i = 1; i < n_threads; ++i) th.emplace_back(worker, i);
+                worker(0);
                 for (std::thread& t : th) t.join();
                 if (!read_ok) {
                     err = "deepseek41: short read of an expert blob";
@@ -356,13 +370,20 @@ private:
         std::vector<int32_t> act_tokens, pair;   // tokens whose activations the CPU needs; each CPU row's (token, slot) pair
         int cpu_rows = 0;
         int64_t cpu_at = 0;                      // the CPU rows' first row in the layer's rows
-        bool peer = false;                       // the second card took a share
-        int layer = -1;                          // whose: the share of that layer's card joins it
+        prefill::PeerShare* peer_share = nullptr;
+        void* peer_stream = nullptr;
         std::thread cpu_thread;
         void join() {
             if (cpu_thread.joinable()) cpu_thread.join();
         }
-        ~Share() { join(); }
+        ~Share() {
+            join();
+            if (peer_share) {
+                std::string ignored;
+                peer_share->join(peer_stream, ignored);
+                peer_share = nullptr;
+            }
+        }
     };
 
     // A layer's formats and its clamped SwiGLU, for the second card.
@@ -515,8 +536,8 @@ private:
         for (int e : used) at += (int64_t) by[(size_t) e].size();
         if (!peer.empty()) {
             if (!start_peer(il, T, x, by, peer, at, at, stream, err)) return false;
-            s.peer = true;
-            s.layer = il;
+            s.peer_share = tier_->share_for(il);
+            s.peer_stream = stream;
         }
         s.cpu_at = at;
         for (size_t i = 0; i < s.pair.size(); ++i) map_h_[(size_t) s.pair[i]] = (int32_t) (at + (int64_t) i);
@@ -537,7 +558,11 @@ private:
     // The rows of the CPU and the second card join the others'.
     bool finish_share(Share& s, void* stream, std::string& err) {
         s.join();
-        if (s.peer && !tier_->share_for(s.layer)->join(stream, err)) return false;
+        if (s.peer_share) {
+            prefill::PeerShare* ps = s.peer_share;
+            s.peer_share = nullptr;
+            if (!ps->join(stream, err)) return false;
+        }
         if (s.pair.empty()) return true;
         const size_t rows = s.pair.size(), n = (size_t) g_.n_embd;
         cudaMemcpyAsync(rows_ + (size_t) s.cpu_at * n, hrows_, rows * n * 4, cudaMemcpyHostToDevice, (cudaStream_t) stream);
@@ -655,16 +680,16 @@ private:
     }
 
     bool ahead_buffers() {
-        if (!dstage_[0].blobs) {
-            const size_t E = (size_t) cap_ * g_.n_used;
-            if (!dev(tok_all_, E * 4) || !dev(bnd_, (kStageExperts + 1) * 4)) return false;
-            for (Stage& b : dstage_) {
-                if (!dev(b.blobs, slot_ * kStageExperts) ||
-                    cudaEventCreateWithFlags(&b.copied, cudaEventDisableTiming) != cudaSuccess ||
-                    cudaEventCreateWithFlags(&b.done, cudaEventDisableTiming) != cudaSuccess)
-                    return false;
-            }
+        if (ahead_ready_) return true;
+        const size_t E = (size_t) cap_ * (size_t) g_.n_used;
+        if ((!tok_all_ && !dev(tok_all_, E * 4)) || (!bnd_ && !dev(bnd_, (kStageExperts + 1) * 4))) return false;
+        for (Stage& b : dstage_) {
+            if ((!b.blobs && !dev(b.blobs, slot_ * kStageExperts)) ||
+                (!b.copied && cudaEventCreateWithFlags(&b.copied, cudaEventDisableTiming) != cudaSuccess) ||
+                (!b.done && cudaEventCreateWithFlags(&b.done, cudaEventDisableTiming) != cudaSuccess))
+                return false;
         }
+        ahead_ready_ = true;
         return true;
     }
 
@@ -758,7 +783,27 @@ private:
         }
         cudaMemcpyAsync(tok_all_, tok.data(), tok.size() * 4, cudaMemcpyHostToDevice, st);
         int64_t end = 0;
-        if (!peer.empty() && !start_peer(il, T, x, by, peer, (int64_t) tok.size(), end, st, err)) return false;
+        struct PeerJoin {
+            prefill::PeerShare* share = nullptr;
+            cudaStream_t st = nullptr;
+            ~PeerJoin() {
+                if (share) {
+                    std::string ignored;
+                    share->join(st, ignored);
+                }
+            }
+            bool now(std::string& err) {
+                if (!share) return true;
+                prefill::PeerShare* s = share;
+                share = nullptr;
+                return s->join(st, err);
+            }
+        } peer_join;
+        if (!peer.empty()) {
+            if (!start_peer(il, T, x, by, peer, (int64_t) tok.size(), end, st, err)) return false;
+            peer_join.share = tier_->share_for(il);
+            peer_join.st = st;
+        }
         if (il + 1 < run_layers_) prepare_peer(il + 1);
 
         for (int g = 0; g < G; ++g) {
@@ -832,7 +877,7 @@ private:
             while (issued_ < std::min<int64_t>(consumed_ + prefillp::kAheadSlots, (int64_t) run_layers_ * G))
                 if (!issue_next(err)) return false;
         }
-        if (!peer.empty() && !tier_->share_for(il)->join(st, err)) return false;
+        if (!peer_join.now(err)) return false;
         cudaMemcpyAsync(map_, map_h_.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, st);
         weighted_sum_tokens(rows_, map_, w, T, K, g_.n_embd, out, st);
         return true;
@@ -865,17 +910,19 @@ private:
                 }
                 const size_t i1 = std::min(list.size(), i0 + (size_t) room);
                 auto at = [&](size_t i) { return ring_ + (size_t) ((pf_base_[(size_t) l] + (int64_t) i) % ring_pieces_) * slot_; };
+                const int n_threads = std::min<int>(kReadThreads, (int) (i1 - i0));
+                ensure_direct_bufs(n_threads);
                 std::atomic<bool> ok{true};
                 std::atomic<size_t> next{i0};
-                auto worker = [&] {
+                auto worker = [&](int wid) {
                     for (size_t i; (i = next.fetch_add(1)) < i1;) {
                         const uint64_t off = m_.pack().experts_range.offset + el.offset + (uint64_t) list[i] * el.blob_bytes;
-                        if (!platform::pread_all(m_.experts_fd(), at(i), el.blob_bytes, off)) ok = false;
+                        if (!read_blob(wid, at(i), el.blob_bytes, off)) ok = false;
                     }
                 };
                 std::vector<std::thread> th;
-                for (int i = 1; i < std::min<int>(kReadThreads, (int) (i1 - i0)); ++i) th.emplace_back(worker);
-                worker();
+                for (int i = 1; i < n_threads; ++i) th.emplace_back(worker, i);
+                worker(0);
                 for (std::thread& t : th) t.join();
                 std::lock_guard<std::mutex> lk(pf_mu_);
                 if (!ok) pf_failed_ = true;
@@ -905,6 +952,46 @@ private:
         ctx_.run(p, stream);
     }
 
+    static constexpr uint64_t kDirectAlign = 4096;
+    static constexpr uint64_t kDirectChunk = 1ull << 20;
+
+    void ensure_direct_bufs(int n) {
+        if (direct_fd_ < 0 || n <= (int) direct_bufs_.size()) return;
+        const size_t want = (size_t) std::min(n, kReadThreads);
+        while (direct_bufs_.size() < want) {
+            uint8_t* p = (uint8_t*) platform::alloc_aligned((size_t) (kDirectChunk + 2 * kDirectAlign), (size_t) kDirectAlign);
+            if (!p) break;
+            direct_bufs_.push_back(p);
+        }
+    }
+
+    // Reads `bytes` at `off` into `dst`, bypassing the OS file cache when an unbuffered handle and aligned bounce buffer
+    // are available; falls back to buffered pread_all otherwise.
+    bool read_blob(int wid, void* dst, uint64_t bytes, uint64_t off) const {
+        if (direct_fd_ >= 0 && wid >= 0 && (size_t) wid < direct_bufs_.size()) {
+            uint8_t* bounce = direct_bufs_[(size_t) wid];
+            bool ok = true;
+            for (uint64_t done = 0; ok && done < bytes;) {
+                const uint64_t pos = off + done;
+                const uint64_t len = std::min<uint64_t>(kDirectChunk, bytes - done);
+                const uint64_t a0 = pos - pos % kDirectAlign;
+                const uint64_t a1 = (pos + len + kDirectAlign - 1) / kDirectAlign * kDirectAlign;
+                uint64_t got = 0;
+                while (got < pos + len - a0) {
+                    const int64_t r = platform::pread(direct_fd_, bounce + got, (size_t) (a1 - a0 - got), a0 + got);
+                    if (r < 0 && errno == EINTR) continue;
+                    if (r <= 0) break;
+                    got += (uint64_t) r;
+                }
+                ok = got >= pos + len - a0;
+                if (ok) std::memcpy((uint8_t*) dst + done, bounce + (pos - a0), (size_t) len);
+                done += len;
+            }
+            if (ok) return true;
+        }
+        return platform::pread_all(m_.experts_fd(), dst, bytes, off);
+    }
+
     template <class P>
     bool dev(P*& p, size_t bytes) {
         void* v = nullptr;
@@ -927,7 +1014,9 @@ private:
     Stage stage_[2];
     cudaStream_t copy_ = nullptr;
     uint64_t launch_ = 0;
-    bool ahead_ = false;
+    bool ahead_ = false, ahead_ready_ = false;
+    int direct_fd_ = -1;
+    std::vector<uint8_t*> direct_bufs_;
     int run_layers_ = 0;
     std::vector<int> layer_tokens_;                 // [layer] the chunk's tokens through it
     std::vector<std::vector<uint8_t>> on_peer_;     // [layer][expert] the second card computes it in a long chunk
