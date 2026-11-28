@@ -1038,7 +1038,12 @@ def main():
             ap.error("--mmproj is required unless --no-vision")
         convert_bf16(a)
         return
-    arch = A.for_architecture(source_architecture(Path(a.gguf[0])))
+    src_arch = source_architecture(Path(a.gguf[0]))
+    if src_arch in ("inkling2_loop", "inkling2"):
+        import inkling2_gguf as IG
+        IG.build(a, Job, source_paths, export_tokenizer, fingerprint, die)
+        return
+    arch = A.for_architecture(src_arch)
     if arch.side_sections:
         a.name = a.name or arch.default_name(a.gguf[0], {}, bool(a.sections_from))
         if not a.no_vision and not a.mmproj and not a.sections_from:
