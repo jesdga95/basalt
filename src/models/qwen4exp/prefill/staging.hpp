@@ -53,14 +53,16 @@ struct Stager {
     // previous layer can never take a job of this one)
     std::atomic<uint64_t> head{0};
     std::atomic<int> issued{0}, active{0};
+    std::atomic<bool> abort{false};
     uint32_t gen = 0;
     bool quit = false;
     std::mutex mu;
     std::condition_variable cv;
     std::vector<std::thread> threads;
-    int device = 0;
+    int device = -1;
 
     bool init(size_t blob_bytes, int nthreads) {
+        cudaGetDevice(&device);
         buf.assign((size_t) kRing, nullptr);
         pinned.assign((size_t) kRing, 0);
         dma_done.assign((size_t) kRing, nullptr);
@@ -74,7 +76,6 @@ struct Stager {
             }
             if (cudaEventCreateWithFlags(&dma_done[i], cudaEventDisableTiming) != cudaSuccess) return false;
         }
-        cudaGetDevice(&device);
         for (int t = 0; t < nthreads; ++t) threads.emplace_back([this] { work(); });
         return true;
     }
@@ -83,10 +84,11 @@ struct Stager {
         { std::lock_guard<std::mutex> lk(mu); quit = true; }
         cv.notify_all();
         for (auto& t : threads) t.join();
-        for (int i = 0; i < kRing; ++i) {
+        const core::OnDevice od(device);
+        for (size_t i = 0; i < dma_done.size(); ++i)
             if (dma_done[i]) cudaEventDestroy(dma_done[i]);
-            if (buf[i] && pinned[i]) cudaFreeHost(buf[i]);
-        }
+        for (size_t i = 0; i < buf.size(); ++i)
+            if (buf[i] && i < pinned.size() && pinned[i]) cudaFreeHost(buf[i]);
     }
     void work() {
         cudaSetDevice(device);
@@ -104,7 +106,12 @@ struct Stager {
                 if (j < 0) { active.fetch_sub(1, std::memory_order_acq_rel); break; }
                 const int b = j % kRing;
                 if (j >= kRing)   // job j - kRing's DMA from this buffer is queued
-                    while (issued.load(std::memory_order_acquire) <= j - kRing) std::this_thread::yield();
+                    while (!abort.load(std::memory_order_acquire) && issued.load(std::memory_order_acquire) <= j - kRing)
+                        std::this_thread::yield();
+                if (abort.load(std::memory_order_acquire)) {
+                    active.fetch_sub(1, std::memory_order_acq_rel);
+                    break;
+                }
                 // and done - for a generation's first kRing jobs that is the previous generation's last DMA from
                 // the buffer, which nothing else waits for when a chunk ends without a sync (no MTP) or the DMA
                 // was a ring entry the routing skipped (an event never recorded returns at once)
@@ -158,6 +165,7 @@ struct Stager {
             else if (i < kAhead) basalt::platform::advise_willneed(jobs[i].src, jobs[i].bytes);
         }
         while (any_file && (int) threads.size() < kIoThreads) threads.emplace_back([this] { work(); });
+        abort.store(false, std::memory_order_relaxed);
         issued.store(0);
         ++gen;
         head.store((uint64_t) gen << 32 | (uint64_t) jobs.size() << 16, std::memory_order_release);
@@ -176,7 +184,7 @@ struct Stager {
     /// No job is running after this (the end of a layer, or an early return in the middle of one).
     void finish() {
         head.store((uint64_t) gen << 32, std::memory_order_release);   // n = 0: nothing more to claim
-        issued.store(1 << 30, std::memory_order_release);
+        abort.store(true, std::memory_order_release);
         while (active.load(std::memory_order_acquire) != 0) std::this_thread::yield();
     }
 };

@@ -60,25 +60,35 @@ bool Prefill::Run::Chunk::ple_land() {
     ple_buf ^= 1;
     if (m.warm.pending && m.warm.run_pos0 == pos0) {
         m.warm.pending = false;
-        m.warm.fut = std::async(std::launch::async, [&m = m, sess = m.ss] {
-            try {
-                constexpr size_t kSlice = 2048;   // tokens per request, so the reader is shared with the chunk reads
-                const std::vector<int64_t>& w = m.warm.tok;
-                std::vector<uint32_t> rows;
-                std::string e;
-                for (size_t a = 2; a < w.size(); a += kSlice) {
-                    const size_t b = std::min(a + kSlice, w.size());
-                    rows.resize((b - a) * basalt::kernels::PLE_N_HEADS);
-                    for (size_t i = a; i < b; ++i) {
-                        const int32_t tok = (int32_t) w[i];
-                        const int32_t pv[2] = {(int32_t) w[i - 2], (int32_t) w[i - 1]};
-                        basalt::kernels::ngram_rows(&tok, pv, 1, sess->ple.consts,
-                                                    rows.data() + (i - a) * basalt::kernels::PLE_N_HEADS);
+        if (m.warm.fut.valid()) {
+            m.warm.stop.store(true, std::memory_order_release);
+            m.warm.fut.wait();
+        }
+        m.warm.stop.store(false, std::memory_order_relaxed);
+        const auto consts = m.ss->ple.consts;
+        auto* const table = m.ss->ple.table;
+        if (table != nullptr) {
+            m.warm.fut = std::async(std::launch::async, [&m = m, consts, table] {
+                try {
+                    constexpr size_t kSlice = 2048;   // tokens per request, so the reader is shared with the chunk reads
+                    const std::vector<int64_t>& w = m.warm.tok;
+                    std::vector<uint32_t> rows;
+                    std::string e;
+                    for (size_t a = 2; a < w.size(); a += kSlice) {
+                        if (m.warm.stop.load(std::memory_order_acquire)) return;
+                        const size_t b = std::min(a + kSlice, w.size());
+                        rows.resize((b - a) * basalt::kernels::PLE_N_HEADS);
+                        for (size_t i = a; i < b; ++i) {
+                            const int32_t tok = (int32_t) w[i];
+                            const int32_t pv[2] = {(int32_t) w[i - 2], (int32_t) w[i - 1]};
+                            basalt::kernels::ngram_rows(&tok, pv, 1, consts,
+                                                        rows.data() + (i - a) * basalt::kernels::PLE_N_HEADS);
+                        }
+                        if (!table->warm_rows(rows.data(), b - a, e)) return;
                     }
-                    if (!sess->ple.table->warm_rows(rows.data(), b - a, e)) return;
-                }
-            } catch (const std::exception&) {}   // only a warm-up: the later read fetches what is missing
-        });
+                } catch (const std::exception&) {}   // only a warm-up: the later read fetches what is missing
+            });
+        }
     }
     owner.stats_.ms_ple += ms_since(tp);
     return true;

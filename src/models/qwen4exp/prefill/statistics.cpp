@@ -53,7 +53,9 @@ bool Prefill::route_hist_take(std::vector<uint32_t>& out, int64_t& tokens) {
 
 void Prefill::set_ple_warm(const int64_t* tokens, int64_t run_pos0, int64_t from, int64_t to) {
     Impl& m = *impl_;
+    m.warm.stop.store(true, std::memory_order_release);
     if (m.warm.fut.valid()) m.warm.fut.wait();
+    m.warm.stop.store(false, std::memory_order_relaxed);
     m.warm.pending = false;
     if (m.ss == nullptr || !m.ss->ple.ready() || m.ss->ple.table == nullptr || from < 2) return;
     const int64_t cap = (int64_t) (m.ss->ple.table->cache_rows() / (2 * basalt::kernels::PLE_N_HEADS));

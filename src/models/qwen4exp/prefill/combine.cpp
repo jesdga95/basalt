@@ -10,7 +10,15 @@ using namespace detail;
 bool Prefill::Run::Chunk::Experts::finish() {
     if (cpu_fut.valid()) {   // CPU share: its rows into Dm's tail
         cudaEventRecord(m.cpu_gev[1], m.cs);   // after the GPU's expert work
-        if (!cpu_fut.get()) { err = "prefill: a CPU expert has no blob"; return false; }
+        if (!cpu_fut.get()) {
+            if (peer_now) {
+                std::string jerr;
+                (void) ppc->share->join(m.cs, jerr);
+                peer_now = false;
+            }
+            err = "prefill: a CPU expert has no blob";
+            return false;
+        }
         cudaMemcpyAsync(m.Dm + (size_t) (T * K - rows_cpu) * N, m.cpu_rows, (size_t) rows_cpu * N * sizeof(float),
                         cudaMemcpyHostToDevice, m.cs);
         owner.stats_.experts_cpu += n_cpu;
