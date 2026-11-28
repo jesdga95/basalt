@@ -28,6 +28,7 @@ class GgufFile;
 }
 namespace basalt::core {
 struct ConversationKv;
+struct Json;
 class LoadPlan;
 }
 namespace basalt::program {
@@ -379,8 +380,12 @@ public:
     virtual int planned_spec(const program::CommonOptions& o) const;
     /// The flags the quality gate starts this model with, space separated.
     virtual const char* quality_flags() const { return ""; }
-    /// The model's name as a community benchmark row records it; empty for a model that has none.
-    virtual const char* model_name() const { return ""; }
+    /// The model's name as a community benchmark row records it, for the pack whose metadata is `gguf_kv`; empty for a
+    /// model that has none.
+    virtual const char* model_name(const core::Json& gguf_kv) const {
+        (void) gguf_kv;
+        return "";
+    }
     /// The KV cache format a community benchmark row runs this model with when it takes no int8; empty: its default.
     virtual const char* community_kv() const { return ""; }
     /// The quant label of a community row when the pack's name carries none (its name ends in no format word); empty: "unknown".

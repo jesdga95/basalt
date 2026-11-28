@@ -32,7 +32,7 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
     bool known = false;
     const std::vector<bp::GpuCard> visible = bp::visible_gpus(known);
     bp::GpuChoice choice = bp::choose_gpus(spec, mode, o.gpu_share, visible, known);
-    if (choice.error.empty() && adapter != nullptr) choice.error = bp::check_gpu_modes(choice, adapter->model_name(), adapter->gpu_modes(), visible);
+    if (choice.error.empty() && adapter != nullptr) choice.error = bp::check_gpu_modes(choice, o.model_name, adapter->gpu_modes(), visible);
     if (o.gpu_plan) {
         std::string lossy;
         for (const auto& f : o.lossy) lossy += (lossy.empty() ? "" : ",") + f.flag;

@@ -67,7 +67,12 @@ public:
     program::GpuModes gpu_modes() const override { return {0, 0, 0}; }
     // each slot's window takes at least one row of a batch window; each slot keeps its own caches
     int max_slots() const override { return kRows; }
-    const char* model_name() const override { return "Gemma-4-26B-A4B"; }
+    // one architecture for every size: the pack's experts and layer count name it
+    const char* model_name(const core::Json& kv) const override {
+        if (kv.get("gemma4.expert_count") != nullptr) return "Gemma-4-26B-A4B";
+        const core::Json* layers = kv.get("gemma4.block_count");
+        return layers != nullptr && layers->i64() >= 60 ? "Gemma-4-31B" : "Gemma-4-12B";
+    }
     const char* community_quant() const override { return "NVFP4"; }   // NVFP4 experts, FP8 dense
 
     // --kv: attention caches as fp16 (default) or fp8; --spec, --suffix-draft, --draft-log: the drafter's windows
