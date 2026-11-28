@@ -73,7 +73,15 @@ public:
         const core::Json* layers = kv.get("gemma4.block_count");
         return layers != nullptr && layers->i64() >= 60 ? "Gemma-4-31B" : "Gemma-4-12B";
     }
-    const char* community_quant() const override { return "NVFP4"; }   // NVFP4 experts, FP8 dense
+    // NVFP4 for a pack with routed experts or an NVFP4 MLP, else FP8
+    const char* community_quant(const core::Json& meta) const override {
+        const core::Json* kv = meta.get("gguf_kv");
+        if (kv != nullptr && kv->get("gemma4.expert_count") != nullptr) return "NVFP4";
+        const core::Json* tensors = meta.get("tensors");
+        const core::Json* up = tensors != nullptr ? tensors->get("blk.0.ffn_up.weight") : nullptr;
+        const core::Json* type = up != nullptr ? up->get("type") : nullptr;
+        return type != nullptr && type->is_string() && type->s == "NVFP4_PLANES" ? "NVFP4" : "FP8";
+    }
 
     // --kv: attention caches as fp16 (default) or fp8; --spec, --suffix-draft, --draft-log: the drafter's windows
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int&) const override {

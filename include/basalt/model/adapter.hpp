@@ -388,8 +388,12 @@ public:
     }
     /// The KV cache format a community benchmark row runs this model with when it takes no int8; empty: its default.
     virtual const char* community_kv() const { return ""; }
-    /// The quant label of a community row when the pack's name carries none (its name ends in no format word); empty: "unknown".
-    virtual const char* community_quant() const { return ""; }
+    /// The quant label of a community row when the pack's name carries none (its name ends in no format word), for the
+    /// pack whose metadata is `meta`; empty: "unknown".
+    virtual const char* community_quant(const core::Json& meta) const {
+        (void) meta;
+        return "";
+    }
     /// The widest window the gate scores on this model; 0 takes what the request asks.
     virtual int quality_window() const { return 1; }
     /// The most parallel slots (--batch) the model batches: each slot's window takes at least one row of a batch window. A
