@@ -123,6 +123,7 @@ private:
     void* dev(size_t bytes, bool& ok);
     void* mapped(size_t bytes, bool& ok);   ///< mapped host memory; the device's pointer to it
     std::vector<void*> allocs_, pinned_;
+    int device_ = -1;
     uint64_t bytes_ = 0;
     bool finished_ = false;
 };
@@ -222,6 +223,7 @@ private:
     void stage(int k, int n, void* stream);
     bool stage_graph(int k, int n, void* stream);
     const DsparkWeights* w_ = nullptr;
+    int device_ = -1;
     std::unique_ptr<Dflash2Hook> df2_;
     std::vector<void*> allocs_, pinned_;
     uint8_t* slab_ptr_ = nullptr;
@@ -292,6 +294,7 @@ public:
 private:
     void* dev(size_t bytes, bool& ok);
     const DsparkWeights* w_ = nullptr;
+    int device_ = -1;
     std::unique_ptr<Dflash2Batch> df2_;
     std::vector<void*> allocs_, pinned_;
     // the head's draft rows a pass holds: every slot at kBatchDrafts drafts, or kMaxDraftSessions at a whole block's

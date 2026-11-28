@@ -11,6 +11,7 @@
 
 #include "basalt/core/diag.hpp"
 #include "basalt/core/model_file.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
@@ -95,6 +96,8 @@ void ws_need(const DsparkGeometry& d, size_t& partial, size_t& tickets) {
 DsparkWeights::DsparkWeights() = default;
 
 DsparkWeights::~DsparkWeights() {
+    const core::OnDevice on_dev(device_);
+    df2.reset();
     for (void* p : allocs_) cudaFree(p);
     for (void* p : pinned_) cudaFreeHost(p);
 }
@@ -131,6 +134,7 @@ model::Result dspark_plan(const Pack& pack, core::LoadPlan& reads, int file, int
         std::unique_ptr<Dflash2Weights> df2;
         if (model::Result r = dflash2_plan(pack, reads, file, device, df2); !r.ok()) return r;
         auto w = std::make_unique<DsparkWeights>();
+        w->device_ = device;
         w->n_vocab = pack.geo.n_vocab;
         w->logit_softcap = pack.dflash2.logit_softcap;
         w->target_eps = pack.geo.rms_eps;
@@ -156,6 +160,7 @@ model::Result dspark_plan(const Pack& pack, core::LoadPlan& reads, int file, int
     if (d.targets.back() != (int) g.visits.size()) return fail("its last target is not the target's final normed state");
 
     auto w = std::make_unique<DsparkWeights>();
+    w->device_ = device;
     w->geo = d;
     w->n_vocab = g.n_vocab;
     w->logit_softcap = g.logit_softcap;
@@ -247,6 +252,7 @@ model::Result dspark_plan(const Pack& pack, core::LoadPlan& reads, int file, int
 }
 
 model::Result DsparkWeights::finish(const void* head_q8, const uint16_t* emb, const float* en, void* stream) {
+    const core::OnDevice on_dev(device_);
     head = head_q8;
     embedding = emb;
     embed_norm = en;
@@ -346,6 +352,7 @@ uint64_t dspark_pool_bytes(const Pack& pack, int64_t positions, uint64_t gran, b
 }
 
 const DsparkWeights::SharedScratch* DsparkWeights::ensure_shared_scratch(int64_t context, std::string& err) const {
+    const core::OnDevice on_dev(device_);
     auto* self = const_cast<DsparkWeights*>(this);
     SharedScratch& s = self->shared_scr_;
     const int64_t want_cells = std::max(ring_cells(geo), full_cells(context));
@@ -406,6 +413,8 @@ const DsparkWeights::SharedScratch* DsparkWeights::ensure_shared_scratch(int64_t
 DsparkHook::DsparkHook() = default;
 
 DsparkHook::~DsparkHook() {
+    const core::OnDevice on_dev(device_);
+    df2_.reset();
     for (cudaGraphExec_t g : g_stage_)
         if (g) cudaGraphExecDestroy(g);
     for (cudaGraphExec_t g : g_head_)
@@ -415,6 +424,7 @@ DsparkHook::~DsparkHook() {
                           (long long) dump_drafts_, (long long) dump_differ_);
         std::fclose(dump_);
     }
+    full_.clear();
     for (void* p : allocs_) cudaFree(p);
     for (void* p : pinned_) cudaFreeHost(p);
 }
@@ -441,6 +451,7 @@ void* DsparkHook::dev(size_t bytes, bool& ok) {
 bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context, int tap_rows, float* tap, const std::string& dump,
                       bool int8, std::string& err) {
     if (!w) return true;
+    cudaGetDevice(&device_);
     if (w->df2) {
         tap_rows_ = std::max(tap_rows, kSlice);
         context_ = context;
@@ -832,6 +843,7 @@ model::Result DsparkHook::draft_begin(int32_t anchor, int64_t pos, int n, void* 
 
 model::Result DsparkHook::draft_end(int32_t* ids, float* conf, int max_n, int& n, const model::ModelSession::DraftNeed&,
                                     void* stream) {
+    const core::OnDevice on_dev(device_);
     if (df2_) return df2_->draft_end(ids, conf, max_n, n, stream);
     n = 0;
     if (!w_) return {model::Status::NotImplemented, "inkling2: the pack has no drafter"};
@@ -978,6 +990,7 @@ void DsparkHook::trim(int64_t positions) {
 }
 
 bool DsparkHook::save_cells(std::vector<core::ConversationKv>& kv, int64_t positions, void* stream) const {
+    const core::OnDevice on_dev(device_);
     if (df2_) return df2_->save_cells(positions, stream);
     if (!w_) return true;
     if (positions < 0 || positions > backed_cells_) return false;
@@ -1012,6 +1025,7 @@ bool DsparkHook::save_cells(std::vector<core::ConversationKv>& kv, int64_t posit
 }
 
 bool DsparkHook::restore_cells(const std::vector<core::ConversationKv>& kv, size_t& at, int64_t positions, void* stream) {
+    const core::OnDevice on_dev(device_);
     if (df2_) return df2_->restore_cells(kv.size(), at, positions, stream);
     if (!w_) return at == kv.size();
     if (positions < 0 || positions > backed_cells_) return false;
@@ -1046,6 +1060,8 @@ bool DsparkHook::restore_cells(const std::vector<core::ConversationKv>& kv, size
 DsparkBatch::DsparkBatch() = default;
 
 DsparkBatch::~DsparkBatch() {
+    const core::OnDevice on_dev(device_);
+    df2_.reset();
     for (void* p : allocs_) cudaFree(p);
     for (void* p : pinned_) cudaFreeHost(p);
 }
@@ -1064,6 +1080,7 @@ void* DsparkBatch::dev(size_t bytes, bool& ok) {
 bool DsparkBatch::init(const DsparkWeights* w, int max_sessions, int max_rows, int tap_rows, float* tap, int64_t context,
                        std::string& err) {
     if (!w || max_sessions <= 1) return true;
+    cudaGetDevice(&device_);
     if (w->df2) {
         df2_ = std::make_unique<Dflash2Batch>();
         return df2_->init(w->df2.get(), max_sessions, max_rows, tap_rows, tap, err);
@@ -1336,6 +1353,7 @@ model::Result DsparkBatch::draft(DsparkHook* const* hooks, const int32_t* anchor
 }
 
 model::Result DsparkBatch::take(int slot, int pending, int32_t* ids, float* conf, int max_n, int& n) {
+    const core::OnDevice on_dev(device_);
     if (df2_) return df2_->take(slot, pending, ids, conf, max_n, n);
     n = 0;
     if (!synced_) {

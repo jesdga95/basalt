@@ -7,6 +7,7 @@
 
 #include "basalt/core/elastic_kv.hpp"
 #include "basalt/core/expert_cache.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/core/vmm.hpp"
@@ -69,6 +70,20 @@ void quiet(F&& f) noexcept {
     } catch (...) {
     }
 }
+
+struct RestoreDevice {
+    int dev = 0;
+    ~RestoreDevice() { cudaSetDevice(dev); }
+};
+
+struct TmpBuf {
+    void* p = nullptr;
+    ~TmpBuf() {
+        if (!p) return;
+        (void) cudaDeviceSynchronize();
+        cudaFree(p);
+    }
+};
 
 // The fused projection rows of a layer: tensor suffix, first row, rows, needed on a full layer only.
 struct ProjPart {
@@ -133,17 +148,20 @@ uint64_t shared_bytes(const Geometry& g, bool drafter, bool head) {
 InklingModel::InklingModel() = default;
 
 InklingModel::~InklingModel() {
+    const core::OnDevice on_main(device_);
     // an upload that may still run keeps everything it reads or writes (and the stream it runs on)
     if (!drain_loan_upload() || loan_stuck_) return;
     if (loan_event_) cudaEventDestroy((cudaEvent_t) loan_event_);
     if (loan_stream_) cudaStreamDestroy((cudaStream_t) loan_stream_);
     peer_.reset();
     for (const auto& [d, p] : peer_bufs_) {
-        cudaSetDevice(d);
+        const core::OnDevice on_d(d);
         cudaFree(p);
     }
-    if (!peer_bufs_.empty()) cudaSetDevice(device_);
-    for (void* p : dev_) cudaFree(p);
+    for (const auto& [d, p] : dev_) {
+        const core::OnDevice on_d(d);
+        cudaFree(p);
+    }
     for (size_t g = 0; g < copy_maps_.size(); ++g) core::vmm::unmap(copies_va_ + g * copy_lay_.gran, copy_lay_.gran, copy_maps_[g]);
     if (copies_va_) core::vmm::release_range(copies_va_, copy_reserved_);
     if (loan_stage_) {
@@ -175,7 +193,9 @@ float* InklingModel::small(const std::string& name, uint64_t floats, core::LoadP
             err = "out of device memory loading " + name;
             return nullptr;
         }
-        dev_.push_back(p);
+        int dev = ldev_;
+        cudaGetDevice(&dev);
+        dev_.emplace_back(dev, p);
     }
     core::LoadItem it;
     it.file = file;
@@ -200,7 +220,9 @@ uint16_t* InklingModel::small_bf16(const std::string& name, uint64_t values, cor
             err = "out of device memory loading " + name;
             return nullptr;
         }
-        dev_.push_back(p);
+        int dev = ldev_;
+        cudaGetDevice(&dev);
+        dev_.emplace_back(dev, p);
     }
     core::LoadItem it;
     it.file = file;
@@ -227,6 +249,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         spare_ = (uint64_t) req.vram_reserve_mib * kMiB;
     }
     cudaGetDevice(&device_);
+    const RestoreDevice restore_dev{device_};
     ldev_ = device_;
     fp8_ = req.kv == "fp8";
     const Geometry& g = pack_.geo;
@@ -249,7 +272,9 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
     auto device_buf = [&](uint64_t bytes) -> uint8_t* {
         void* p = nullptr;
         if (cudaMalloc(&p, bytes) != cudaSuccess) return nullptr;
-        dev_.push_back(p);
+        int dev = ldev_;
+        cudaGetDevice(&dev);
+        dev_.emplace_back(dev, p);
         return static_cast<uint8_t*>(p);
     };
     const uint64_t n_embd = (uint64_t) g.n_embd, n_vocab = (uint64_t) g.n_vocab;
@@ -450,7 +475,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const uint64_t shared = shared_bytes(g, dspark_ != nullptr, true);
         // what card c keeps beside its pool: the sessions' own buffers, what they share and the spare
         const auto kept_on = [&](int c) {
-            return own_on(c) * (uint64_t) n_sess + (c == 0 ? shared + batch_graphs_bytes(n_sess) + spare : shared_bytes(g, false, false) + kCardSpare);
+            return own_on(c) * (uint64_t) n_sess + (c == 0 ? shared + batch_graphs_bytes(n_sess) + spare : shared_bytes(g, false, false) + spare_base);
         };
         const auto size_pool = [&](int c, uint64_t free_b) -> model::Result {
             const uint64_t kept = kept_on(c);
@@ -607,12 +632,15 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
 }
 
 model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64_t& experts) {
+    const RestoreDevice restore_dev{device_};
     const Geometry& g = pack_.geo;
     auto fail = [&](const std::string& e) { return model::Result{model::Status::Error, "inkling2: " + e}; };
     auto device_buf = [&](uint64_t bytes) -> uint8_t* {
         void* p = nullptr;
         if (cudaMalloc(&p, bytes) != cudaSuccess) return nullptr;
-        dev_.push_back(p);
+        int dev = device_;
+        cudaGetDevice(&dev);
+        dev_.emplace_back(dev, p);
         return static_cast<uint8_t*>(p);
     };
     const uint64_t gran = spill_.any() ? core::vmm::granularity() : 0;
@@ -789,15 +817,15 @@ model::SplitSpec InklingModel::split_spec(const model::GpuCards& c) const {
                                               : 2 * (req.kv_pool ? std::max(full, n_sess * gran) : n_sess * full);
         s.layer.push_back((uint64_t) g.n_expert * expert_stride(el.gu_type, el.blob_bytes) + dense + (uint64_t) visits[(size_t) l] * kv);
     }
+    const uint64_t spare_base = spare_ ? spare_ : kCardSpare;
     const uint64_t slot_rest = session_bytes(g, want, fp8, int8, g.n_layers, 1);   // a slot's own beyond its caches (no layer on card 1)
-    s.fixed = {kCardSpare + shared_bytes(g, req.spec >= 2, true) + batch_graphs_bytes(n_sess) + slot_rest * n_sess + (req.spec >= 2 ? 1000ull << 20 : 0),
-               kCardSpare + shared_bytes(g, false, false) + slot_rest * n_sess};
+    s.fixed = {spare_base + shared_bytes(g, req.spec >= 2, true) + batch_graphs_bytes(n_sess) + slot_rest * n_sess + (req.spec >= 2 ? 1000ull << 20 : 0),
+               spare_base + shared_bytes(g, false, false) + slot_rest * n_sess};
     for (const model::GpuCards::Card& card : c.cards) {
-        cudaSetDevice(card.device);
+        const core::OnDevice on_card(card.device);
         size_t free_b = 0, total_b = 0;
         s.room.push_back(basalt::core::gpu_mem_info(&free_b, &total_b) == cudaSuccess ? free_b : 0);
     }
-    cudaSetDevice(device_);
     return s;
 }
 
@@ -882,28 +910,30 @@ bool InklingModel::peer_place(const model::PeerPlacement& p, std::string& err) {
     uint64_t bytes = 0;
     for (int64_t b : sizes) bytes += (uint64_t) (b + 255) / 256 * 256;
     peer_bytes_ = bytes - (uint64_t) ((int64_t) kSlotGuard);
-    cudaSetDevice(peer_->device());
-    cudaMemset(peer_->slot_ptr(0), 0, bytes);   // the padding after each blob and the guard
-    peer_map_.assign((size_t) g.n_layers, nullptr);
-    for (int l = 0; l < g.n_layers; ++l) {
-        if (peer_n_[(size_t) l] == 0) continue;
-        std::vector<int32_t> map((size_t) ne, -1);
-        int j = 0;
-        for (int e = 0; e < ne; ++e)
-            if (mine[(size_t) l * ne + e]) {
-                map[(size_t) e] = j++;
-                peer_->admit(l, e, peer_slot_[(size_t) l * ne + e]);
+    {
+        const core::OnDevice on_peer(peer_->device());
+        cudaMemset(peer_->slot_ptr(0), 0, bytes);   // the padding after each blob and the guard
+        peer_map_.assign((size_t) g.n_layers, nullptr);
+        for (int l = 0; l < g.n_layers; ++l) {
+            if (peer_n_[(size_t) l] == 0) continue;
+            std::vector<int32_t> map((size_t) ne, -1);
+            int j = 0;
+            for (int e = 0; e < ne; ++e)
+                if (mine[(size_t) l * ne + e]) {
+                    map[(size_t) e] = j++;
+                    peer_->admit(l, e, peer_slot_[(size_t) l * ne + e]);
+                }
+            void* d = nullptr;
+            if (cudaMalloc(&d, (size_t) ne * 4) != cudaSuccess ||
+                basalt::core::device_copy(d, map.data(), (size_t) ne * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+                if (d) cudaFree(d);
+                err = "gpu-mode peer: out of device memory for the expert maps";
+                return false;
             }
-        void* d = nullptr;
-        if (cudaMalloc(&d, (size_t) ne * 4) != cudaSuccess || basalt::core::device_copy(d, map.data(), (size_t) ne * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
-            cudaSetDevice(device_);
-            err = "gpu-mode peer: out of device memory for the expert maps";
-            return false;
+            peer_bufs_.emplace_back(peer_->device(), d);
+            peer_map_[(size_t) l] = static_cast<int32_t*>(d);
         }
-        peer_bufs_.emplace_back(peer_->device(), d);
-        peer_map_[(size_t) l] = static_cast<int32_t*>(d);
     }
-    cudaSetDevice(device_);
     // the main card's slots: a layer's RAM experts first, the second card's last (a chunk stages the first run only)
     for (int l = 0; l < g.n_layers; ++l) {
         if (peer_n_[(size_t) l] == 0) continue;
@@ -923,36 +953,32 @@ std::string InklingModel::peer_main() const {
 }
 
 model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::unique_ptr<model::ModelSession>>& sessions) {
+    const RestoreDevice restore_dev{device_};
     {   // Convert loaded Q8_0 w.proj and w.out blocks in-place to wgemm::q8_planes + coalesced prefill scale planes.
         const int64_t E = pack_.geo.n_embd;
         const size_t proj_b = (size_t) kProj * (size_t) (E / 32 * 34);
         const size_t out_b = (size_t) E * (size_t) (3072 / 32 * 34);
         const int64_t nb_e = E / 32;
         for (int c = 0; c < cards(); ++c) {
-            if (const auto error = cudaSetDevice(card_device(c)); error != cudaSuccess) {
-                cudaSetDevice(device_);
+            if (const auto error = cudaSetDevice(card_device(c)); error != cudaSuccess)
                 return {model::Status::Error, std::string("inkling2: cannot select the layer's device: ") + cudaGetErrorString(error)};
-            }
             if (int8_) {
                 try {
                     attention_decode_int8_init();
                 } catch (const std::runtime_error& error) {
-                    cudaSetDevice(device_);
                     return {model::Status::Error, error.what()};
                 }
             }
-            void* tmp = nullptr;
-            if (cudaMalloc(&tmp, std::max(proj_b, out_b)) != cudaSuccess) {
-                cudaSetDevice(device_);
+            TmpBuf tmp;
+            if (cudaMalloc(&tmp.p, std::max(proj_b, out_b)) != cudaSuccess)
                 return {model::Status::Error, "inkling2: out of device memory converting Q8_0 projections to planes"};
-            }
             for (int l = 0; l < pack_.geo.n_layers; ++l) {
                 if (card_of(l) != c) continue;
                 LayerWeights& w = layers_[(size_t) l];
-                kernels::wgemm::q8_planes(w.proj, kProj, E, tmp, nullptr);
-                basalt::core::device_copy(w.proj, tmp, proj_b, cudaMemcpyDeviceToDevice);
-                kernels::wgemm::q8_planes(w.out, E, 3072, tmp, nullptr);
-                basalt::core::device_copy(w.out, tmp, out_b, cudaMemcpyDeviceToDevice);
+                kernels::wgemm::q8_planes(w.proj, kProj, E, tmp.p, nullptr);
+                basalt::core::device_copy(w.proj, tmp.p, proj_b, cudaMemcpyDeviceToDevice);
+                kernels::wgemm::q8_planes(w.out, E, 3072, tmp.p, nullptr);
+                basalt::core::device_copy(w.out, tmp.p, out_b, cudaMemcpyDeviceToDevice);
                 const uint16_t* proj_sc = reinterpret_cast<const uint16_t*>(w.proj + (size_t) kProj * (size_t) E);
                 prefill::q8::transpose_scales(proj_sc, kProjQ, E, w.proj_q_sc_t, nullptr);
                 prefill::q8::transpose_scales(proj_sc + (size_t) kRowK * nb_e, kProjKV, E, w.proj_k_sc_t, nullptr);
@@ -961,7 +987,8 @@ model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::u
                 prefill::q8::transpose_scales(out_sc, E, 3072, w.out_sc_t, nullptr);
             }
             cudaDeviceSynchronize();
-            cudaFree(tmp);
+            cudaFree(tmp.p);
+            tmp.p = nullptr;
         }
         cudaSetDevice(device_);
     }
@@ -971,13 +998,14 @@ model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::u
         const int64_t V = pack_.geo.n_vocab, E = pack_.geo.n_embd;
         const size_t head_b = (size_t) V * (size_t) (E / 32 * 34);
         cudaSetDevice(device_);
-        void* tmp = nullptr;
-        if (cudaMalloc(&tmp, head_b) != cudaSuccess)
+        TmpBuf tmp;
+        if (cudaMalloc(&tmp.p, head_b) != cudaSuccess)
             return {model::Status::Error, "inkling2: out of device memory converting lm_head to q8_planes"};
-        kernels::wgemm::q8_planes(head_, V, E, tmp, nullptr);
-        basalt::core::device_copy(head_, tmp, head_b, cudaMemcpyDeviceToDevice);
+        kernels::wgemm::q8_planes(head_, V, E, tmp.p, nullptr);
+        basalt::core::device_copy(head_, tmp.p, head_b, cudaMemcpyDeviceToDevice);
         cudaDeviceSynchronize();
-        cudaFree(tmp);
+        cudaFree(tmp.p);
+        tmp.p = nullptr;
     }
     for (auto& s : sessions)
         if (model::Result r = s->prepare(); !r.ok()) return r;

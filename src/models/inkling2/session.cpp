@@ -81,6 +81,11 @@ int call_rows_of(const InklingModel& m) {
     return m.sessions() > 1 ? std::min(kMaxRows, m.sessions() * kWindowRows) : kWindowRows;
 }
 
+struct RestoreDevice {
+    int dev = 0;
+    ~RestoreDevice() { cudaSetDevice(dev); }
+};
+
 // The forward scratch: the rows of one call through the layers and the head. Every session of the model runs on the same
 // buffers (Shared below), one call at a time: each call syncs its stream before it returns, and a batch window syncs every
 // session's stream before it starts.
@@ -147,9 +152,11 @@ struct Shared {
         max_rows = call_rows_of(m);
         if (!alloc_scratch(m, x, m.device(), true, err)) return false;
         if (m.cards() > 1) {
-            cudaSetDevice(m.card_device(1));
-            const bool ok = alloc_scratch(m, x1, m.card_device(1), false, err);
-            cudaSetDevice(m.device());
+            bool ok = false;
+            {
+                const core::OnDevice on_peer(m.card_device(1));
+                ok = alloc_scratch(m, x1, m.card_device(1), false, err);
+            }
             if (!ok) return false;
             tap_slot0 = max_pulls;
             hand_slots = max_pulls + kDsTargets;
@@ -214,8 +221,10 @@ struct Shared {
         x.gs_log_ = f((int64_t) Scratch::kGuessRows * g.n_expert);
         x.gs_w_ = f(Scratch::kGuessExperts);
         x.pf_sink_ = (uint32_t*) alloc(4);
-        x.lp_ = f((int64_t) bk::row_logprobs_scratch_floats(max_rows, g.n_vocab) + R * (bk::kLogprobStride + 1));
-        x.blog_ = f(R * (int64_t) g.n_vocab);
+        if (first) {
+            x.lp_ = f((int64_t) bk::row_logprobs_scratch_floats(max_rows, g.n_vocab) + R * (bk::kLogprobStride + 1));
+            x.blog_ = f(R * (int64_t) g.n_vocab);
+        }
         x.io_d_ = (int32_t*) alloc((size_t) (2 * R + kSegWords) * 4);
         x.tok_d_ = x.io_d_;
         x.pos_d_ = x.io_d_ + R;
@@ -233,7 +242,7 @@ struct Shared {
 // One card's side of a session's forward: its streams and events and its running counts of the experts' lookups. The first
 // card's are the session's own members (stream_, ...); the layer split's second card has its own.
 struct Lane {
-    int device = 0;
+    int device = -1;
     const Scratch* x = nullptr;
     cudaStream_t stream = nullptr, ra_st = nullptr, pf_st = nullptr;
     cudaEvent_t ra_ev = nullptr, ra_join = nullptr, gs_ev = nullptr, pf_ev = nullptr, pf_join = nullptr;
@@ -250,9 +259,15 @@ class Session final : public model::BatchSession, private Scratch {
 public:
     explicit Session(InklingModel& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
+        const core::OnDevice on_main(m_.device());
         if (sh_) std::erase(sh_->heat_sessions, this);
-        if (stream_) cudaStreamSynchronize(stream_);
-        if (lane_[1].stream) cudaStreamSynchronize(lane_[1].stream);
+        for (cudaStream_t st : {stream_, ra_st_, pf_st_})
+            if (st) (void) cudaStreamSynchronize(st);
+        if (Lane& k = lane_[1]; k.device >= 0) {
+            const core::OnDevice on_peer(k.device);
+            for (cudaStream_t st : {k.stream, k.ra_st, k.pf_st})
+                if (st) (void) cudaStreamSynchronize(st);
+        }
         if (!m_.wedged() && m_.has_spill() && ex_tally_) {   // how decode's lookups fell between the card and RAM
             std::vector<uint32_t> t;
             if (read_tally(t)) {
@@ -272,19 +287,25 @@ public:
                                       (unsigned long long) loan);
             }
         }
+        graphs_.clear();
+        for (size_t i = 0; i < elastic_.size(); ++i) {
+            const int card = i < elastic_card_.size() ? elastic_card_[i] : 0;
+            const core::OnDevice on_e(m_.card_device(card));
+            elastic_[i].reset();
+        }
+        elastic_.clear();
         for (auto [d, p] : bufs_) {
-            cudaSetDevice(d);
+            const core::OnDevice on_d(d);
             cudaFree(p);
         }
         for (void* p : pinned_) cudaFreeHost(p);
-        if (Lane& k = lane_[1]; k.stream) {
-            cudaSetDevice(k.device);
+        if (Lane& k = lane_[1]; k.device >= 0) {
+            const core::OnDevice on_peer(k.device);
             for (cudaEvent_t e : {k.ra_ev, k.ra_join, k.gs_ev, k.pf_ev, k.pf_join, k.hand, io_ev1_})
                 if (e) cudaEventDestroy(e);
             for (cudaStream_t st : {k.ra_st, k.pf_st, k.stream})
                 if (st) cudaStreamDestroy(st);
         }
-        cudaSetDevice(m_.device());
         for (cudaEvent_t e : {hand0_, io_ev0_})
             if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : stage_ev_)
@@ -297,6 +318,8 @@ public:
     }
 
     bool init(std::string& err) {
+        const RestoreDevice restore_dev{m_.device()};
+        lane_[0].device = m_.device();
         if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess ||
             cudaStreamCreateWithFlags(&ra_st_, cudaStreamNonBlocking) != cudaSuccess ||
             cudaStreamCreateWithFlags(&pf_st_, cudaStreamNonBlocking) != cudaSuccess ||
@@ -794,7 +817,7 @@ public:
     model::Result set_low_memory(bool low, int64_t& expert_slots) override {
         if (m_.wedged()) return wedged();
         if (!m_.copies()) return {};
-        if (cudaStreamSynchronize(stream_) != cudaSuccess || !feed_heat()) return wedged();
+        if (!sync_lanes() || !feed_heat()) return wedged();
         if (low && !recall_loan(-1)) return wedged();
         if (!m_.lend(low))
             return {model::Status::Error, low ? "inkling2: the expert copies could not go back to RAM"
@@ -807,7 +830,7 @@ public:
     // no copies to resize: refused unless it already leaves that much.
     model::Result set_vram_reserve(int64_t mib, int64_t& expert_slots) override {
         if (m_.wedged()) return wedged();
-        if (cudaStreamSynchronize(stream_) != cudaSuccess)
+        if (!sync_lanes())
             return {model::Status::Error, "inkling2: the session stream failed before resizing VRAM"};
         if (!feed_heat()) return wedged();
         const bool fits = m_.resize_reserve((uint64_t) (mib < 0 ? std::max(m_.flags().vram_reserve_mib, 0) : mib) << 20);
@@ -1224,11 +1247,14 @@ public:
         if (stale_) return stale();
         if (m_.wedged()) return wedged();
         if (positions < 0 || positions > backed_) return {model::Status::Error, "inkling2: positions past the backed caches"};
-        cudaStreamSynchronize(stream_);
+        const core::OnDevice on_main(m_.device());
+        if (!sync_lanes()) return {model::Status::Error, "inkling2: the session stream failed before saving caches"};
         kv.clear();
         const size_t run = (size_t) positions * cell_bytes();
-        for (const VisitCache& c : vc_) {
+        for (size_t vi = 0; vi < vc_.size(); ++vi) {
+            const VisitCache& c = vc_[vi];
             if (c.ring) continue;
+            const core::OnDevice on_dev(m_.card_device(slot_card_[vi]));
             core::ConversationKv k;
             k.format = cell_format();
             k.page_size = 1;
@@ -1253,14 +1279,17 @@ public:
         if (m_.wedged()) return wedged();
         if (positions < 0 || positions > m_.context()) return {model::Status::Error, "inkling2: positions past the context"};
         if (std::string e; !ensure_positions(positions, e)) return grow_failed(e);
-        cudaStreamSynchronize(stream_);
+        const core::OnDevice on_main(m_.device());
+        if (!sync_lanes()) return {model::Status::Error, "inkling2: the session stream failed before restoring caches"};
         const size_t run = (size_t) positions * cell_bytes();
         size_t i = 0;
-        for (const VisitCache& c : vc_) {
+        for (size_t vi = 0; vi < vc_.size(); ++vi) {
+            const VisitCache& c = vc_[vi];
             if (c.ring) continue;
             if (i >= kv.size() || kv[i].format != cell_format() || kv[i].cells != positions || kv[i].heads != kKvHeads ||
                 kv[i].k.size() < run || kv[i].v.size() < run)
                 return {model::Status::Error, "inkling2: a parked conversation has other caches"};
+            const core::OnDevice on_dev(m_.card_device(slot_card_[vi]));
             const auto up = [&](void* dev, const core::ConversationBuffer& from) {
                 return from.visit(0, run, [&](const uint8_t* p, size_t n, size_t at) {
                     return basalt::core::device_copy((uint8_t*) dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
@@ -1340,6 +1369,19 @@ public:
 
 private:
     int64_t expert_pairs() const { return (int64_t) g_.n_layers * g_.n_expert; }
+
+    bool sync_lanes() const {
+        bool ok = true;
+        {
+            const core::OnDevice on_main(m_.device());
+            if (stream_ && cudaStreamSynchronize(stream_) != cudaSuccess) ok = false;
+        }
+        if (lane_[1].stream) {
+            const core::OnDevice on_peer(lane_[1].device);
+            if (cudaStreamSynchronize(lane_[1].stream) != cudaSuccess) ok = false;
+        }
+        return ok;
+    }
 
     // On the current device.
     void* alloc(size_t bytes, bool& ok) {
@@ -1758,6 +1800,7 @@ private:
         try {
             body(rows, head, full_keys);
         } catch (...) {   // the stream leaves the capture before the call's cleanup syncs it
+            cudaSetDevice(m_.device());
             cudaGraph_t dropped = nullptr;
             cudaStreamEndCapture(stream_, &dropped);
             if (dropped) cudaGraphDestroy(dropped);
@@ -1783,6 +1826,7 @@ private:
     // Launches only: the visits, then the head. Each kernel may start while the one before it finishes (it waits for it
     // before reading what it wrote), so a product streams its first weights during the glue before it.
     void body(int rows, int head, int64_t full_keys) {
+        const RestoreDevice restore_dev{m_.device()};
         for (Lane& k : lane_) k.ra_on = k.pf_on = false;
         visits_and_head(rows, head, full_keys);
         join_sides(lane_[0]);
@@ -1924,8 +1968,7 @@ private:
     // Admission to the CPU experts' windows (CpuExperts::enter): held from before a call's first window until the sync
     // that ends them, so an abort waits for the calls in flight, and a call it interrupted discards its results.
     bool admit(std::string& err) {
-        if (!sh_->cpu) return true;
-        if (!sh_->cpu->enter()) {
+        if (sh_->cpu && !sh_->cpu->enter()) {
             err = "the CPU experts were stopped";
             return false;
         }
@@ -1937,21 +1980,30 @@ private:
     bool complete(cudaError_t synced) {
         if (!admitted_) return synced == cudaSuccess;
         admitted_ = false;
-        if (synced == cudaSuccess && lane_[1].stream) synced = cudaStreamSynchronize(lane_[1].stream);
+        if (lane_[1].stream) {
+            const core::OnDevice on_peer(lane_[1].device);
+            const cudaError_t pe = cudaStreamSynchronize(lane_[1].stream);
+            if (synced == cudaSuccess) synced = pe;
+        }
         const bool joined = !fork_open_;
         fork_open_ = false;
+        if (!sh_->cpu) return synced == cudaSuccess && joined;
         return sh_->cpu->leave(synced, joined) && synced == cudaSuccess && joined;
     }
     // An exit before that sync: the window stream is synchronized first.
     void release() {
-        if (admitted_) complete(cudaStreamSynchronize(stream_));
+        if (!admitted_) return;
+        const core::OnDevice on_main(m_.device());
+        complete(cudaStreamSynchronize(stream_));
     }
     // The end of a call that took admission: its closing sync, then the abort's verdict on its results.
     model::Result end_call(const char* failed) {
         const cudaError_t synced = cudaStreamSynchronize(stream_);
         const bool kept = complete(synced);
         if (synced != cudaSuccess) return {model::Status::Error, std::string("inkling2: ") + failed};
-        if (!kept) return {model::Status::Error, "inkling2: the CPU experts were stopped"};
+        if (!kept)
+            return {model::Status::Error,
+                    sh_->cpu ? "inkling2: the CPU experts were stopped" : std::string("inkling2: ") + failed};
         return {};
     }
     // Gives admission up on every return of a call that took it, unless passed on.
