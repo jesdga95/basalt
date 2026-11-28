@@ -124,6 +124,8 @@ struct DsparkDrafter::Impl {
     float *d_hc_ws = nullptr, *d_coef = nullptr, *d_collapsed = nullptr, *d_normed = nullptr;
     void *d_q8 = nullptr, *d_ql_q8 = nullptr, *d_out_q8 = nullptr;
     float *d_ql = nullptr, *d_qh = nullptr, *d_kv_proj = nullptr, *d_kv_row = nullptr;
+    void *d_stage_q8 = nullptr;
+    float *d_stage_kv_proj = nullptr, *d_stage_kv_row = nullptr;
     float *d_mqa_out = nullptr, *d_mqa_ws = nullptr, *d_out_lat = nullptr, *d_attn_out = nullptr;
     float *d_logits_route = nullptr, *d_route_w = nullptr, *d_shared = nullptr;
     float *d_shared_gate = nullptr, *d_shared_up = nullptr, *d_shared_hidden = nullptr;
@@ -574,6 +576,9 @@ std::unique_ptr<DsparkDrafter> DsparkDrafter::plan_load(const DsModel& main, int
     p->d_qh = static_cast<float*>(p->alloc_dev((size_t) B * 64 * 512 * sizeof(float)));
     p->d_kv_proj = static_cast<float*>(p->alloc_dev((size_t) 8 * 512 * sizeof(float)));
     p->d_kv_row = static_cast<float*>(p->alloc_dev((size_t) 8 * 512 * sizeof(float)));
+    p->d_stage_q8 = p->alloc_dev(kernels::native_q8_1_bytes((int) H, 8));
+    p->d_stage_kv_proj = static_cast<float*>(p->alloc_dev((size_t) 8 * 512 * sizeof(float)));
+    p->d_stage_kv_row = static_cast<float*>(p->alloc_dev((size_t) 8 * 512 * sizeof(float)));
     p->d_mqa_out = static_cast<float*>(p->alloc_dev((size_t) B * 64 * 512 * sizeof(float)));
     p->d_mqa_ws = static_cast<float*>(p->alloc_dev(mqa_ws_floats * sizeof(float)));
     p->d_out_q8 = p->alloc_dev(kernels::sparse_mqa_output_scratch_bytes(B));
@@ -714,11 +719,12 @@ bool DsparkDrafter::stage(int w, int64_t pos0, int n_rows, const float* d_featur
         const DevTensor *wkv = p_->req(pre + "attn_kv.weight", err), *kvn = p_->req(pre + "attn_kv_a_norm.weight", err);
         if (!wkv || !kvn) return false;
         project_attention_kv(p_->d_feat_norm, wkv->type, wkv->ptr, static_cast<const float*>(kvn->ptr), p_->g.rms_eps,
-                             p_->d_stage_pos, p_->ropes[st].attention, n_rows, p_->d_q8, p_->d_kv_proj, p_->d_kv_row, s);
+                             p_->d_stage_pos, p_->ropes[st].attention, n_rows, p_->d_stage_q8, p_->d_stage_kv_proj,
+                             p_->d_stage_kv_row, s);
         // the row's latent, kept in the staging set at slot pos % 8
         for (int r = 0; r < n_rows; ++r)
             if (!ck(cudaMemcpyAsync(p_->d_staged + ((size_t) st * 8 + (size_t) ((pos0 + r) % 8)) * 512,
-                                    p_->d_kv_row + (size_t) r * 512, 512 * sizeof(float), cudaMemcpyDeviceToDevice, s),
+                                    p_->d_stage_kv_row + (size_t) r * 512, 512 * sizeof(float), cudaMemcpyDeviceToDevice, s),
                     "stage rows", err))
                 return false;
     }

@@ -76,16 +76,13 @@ model::Result DsModel::ensure_tier() {
             return failure("pinned expert mapping reserve overflows");
     }
 
-    // A prompt reads beside the tier: homes leave a long read's room free, and the copies too; a short read fits beside
-    // the homes' arena in the slot reserve.
+    // A short prompt reads beside the tier's copies (or homes) and leaves them in place; a long prompt lends the
+    // copies and uses the full chunk up to the context.
     const int long_cap = (int) std::min<int64_t>(kMaxChunk, context_);
     const uint64_t short_room = prompt_room_bytes(weights_, context_, std::min(kShortChunk, long_cap)) + kShortMargin;
-    // The tier leaves the prompt's room free beside its homes and its copies: a short read fits it whole, a long one
-    // lends the copies and takes a full chunk up to the context.
     const uint64_t home_room = prompt_room_bytes(weights_, context_, std::min(8192, long_cap)) + kLongMargin;
-    const uint64_t copies_room = prompt_room_bytes(weights_, context_, long_cap) + kLongMargin;
     uint64_t homes_keep = 0, copies_keep = 0;
-    if (!ctxp::add(gpu_keep, home_room, homes_keep) || !ctxp::add(gpu_keep, copies_room, copies_keep))
+    if (!ctxp::add(gpu_keep, home_room, homes_keep) || !ctxp::add(gpu_keep, short_room, copies_keep))
         return failure("prompt room reserve overflows");
     reserve.homes = homes_keep;
     reserve.copies = copies_keep;

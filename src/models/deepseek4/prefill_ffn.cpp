@@ -30,13 +30,29 @@ bool dense_supported(int type, int64_t rows) {
 
 class Impl final : public PrefillFfn {
 public:
+    struct Stage {
+        uint8_t* blobs = nullptr;
+        uint8_t* host = nullptr;
+        uint8_t* gu = nullptr;
+        uint8_t* down = nullptr;
+        int32_t* bounds = nullptr;
+        cudaEvent_t copied = nullptr;
+        cudaEvent_t done = nullptr;
+    };
+
     Impl(ModelWeights& weights, core::ExpertTier& tier, int cap)
         : weights_(weights), tier_(tier), g_(weights.geo()), cap_(cap), route_cap_((size_t) cap * kRoutes) {}
 
     ~Impl() override {
         if (last_stream_) cudaStreamSynchronize(last_stream_);
+        if (copy_) cudaStreamSynchronize(copy_);
+        for (Stage& s : stage_) {
+            if (s.copied) cudaEventDestroy(s.copied);
+            if (s.done) cudaEventDestroy(s.done);
+            if (s.host) cudaFreeHost(s.host);
+        }
+        if (copy_) cudaStreamDestroy(copy_);
         for (void* p : dev_) cudaFree(p);
-        if (stage_host_) cudaFreeHost(stage_host_);
     }
 
     bool init(std::string& err) {
@@ -77,17 +93,25 @@ public:
                   device(token_ids_, route_cap_ * sizeof(int32_t)) &&
                   device(output_ids_, route_cap_ * sizeof(int32_t)) &&
                   device(bounds_, ((size_t) g_.n_expert + 1) * sizeof(int32_t)) &&
-                  device(group_bounds_, (expert_cap + 1) * sizeof(int32_t)) &&
-                  device(stage_, stage_stride_ * kGroup) && device(group_gu_, gu_stride_ * expert_cap) &&
-                  device(group_down_, down_stride_ * expert_cap) &&
                   device(shared_xq_, mmq::q8_bytes(cap_, g_.n_embd)) &&
                   device(shared_hq_, mmq::q8_bytes(cap_, g_.n_ff_exp)) &&
                   device(shared_gate_, (size_t) cap_ * g_.n_ff_exp * sizeof(float)) &&
                   device(shared_up_, (size_t) cap_ * g_.n_ff_exp * sizeof(float)) &&
                   device(shared_hidden_, (size_t) cap_ * g_.n_ff_exp * sizeof(float)) &&
-                  device(shared_bounds_, 2 * sizeof(int32_t)) && device(identity_, (size_t) cap_ * sizeof(int32_t));
-        const cudaError_t pinned = ok ? cudaHostAlloc(reinterpret_cast<void**>(&stage_host_), stage_stride_ * expert_cap,
-                                                      cudaHostAllocPortable) : cudaSuccess;
+                  device(shared_bounds_, 2 * sizeof(int32_t)) && device(identity_, (size_t) cap_ * sizeof(int32_t)) &&
+                  cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking) == cudaSuccess;
+        cudaError_t pinned = cudaSuccess;
+        for (int i = 0; i < 2 && ok; ++i) {
+            Stage& s = stage_[i];
+            ok = device(s.blobs, stage_stride_ * kGroup) &&
+                 device(s.gu, gu_stride_ * kGroup) &&
+                 device(s.down, down_stride_ * kGroup) &&
+                 device(s.bounds, ((size_t) kGroup + 1) * sizeof(int32_t)) &&
+                 cudaEventCreateWithFlags(&s.copied, cudaEventDisableTiming) == cudaSuccess &&
+                 cudaEventCreateWithFlags(&s.done, cudaEventDisableTiming) == cudaSuccess;
+            if (ok) pinned = cudaHostAlloc(reinterpret_cast<void**>(&s.host), stage_stride_ * kGroup, cudaHostAllocPortable);
+            if (pinned != cudaSuccess) break;
+        }
         if (!ok || pinned != cudaSuccess) {
             size_t free_b = 0, total_b = 0;
             cudaMemGetInfo(&free_b, &total_b);
@@ -177,103 +201,116 @@ public:
             return true;
         }
 
-        std::vector<int32_t> all_bounds(used.size() + 1);
-        for (size_t q = 0; q < used.size(); ++q)
-            all_bounds[q] = bounds_host_[(size_t) used[q]];
-        all_bounds.back() = total;
-        if (cudaMemcpyAsync(group_bounds_, all_bounds.data(), all_bounds.size() * sizeof(int32_t),
-                            cudaMemcpyHostToDevice, last_stream_) != cudaSuccess) {
-            err = "deepseek4: cannot upload prompt MMQ expert bounds";
-            return false;
-        }
-
         const ExpertLayer& el = weights_.pack().experts[(size_t) layer];
         const auto L = kernels::native_expert_layout(el.gate_up_type, el.down_type, g_.n_embd, g_.n_ff_exp,
                                                       g_.swiglu_limit);
         mmq::quantize(x, token_ids_, xq_, el.gate_up_type, g_.n_embd, g_.n_embd, total, stream);
-        for (size_t first = 0; first < used.size(); first += (size_t) kGroup) {
+        const size_t gate_bytes = L.gu_row * (size_t) g_.n_ff_exp;
+        const size_t up_bytes = L.up_row * (size_t) g_.n_ff_exp;
+        const size_t down_bytes = L.d_row * (size_t) g_.n_embd;
+        const size_t hq_row_bytes = mmq::q8_bytes(1, g_.n_ff_exp);
+
+        for (size_t first = 0, gidx = 0; first < used.size(); first += (size_t) kGroup, ++gidx) {
+            Stage& B = stage_[gidx & 1];
             const int n = (int) std::min((size_t) kGroup, used.size() - first);
+            if (cudaStreamWaitEvent(copy_, B.done, 0) != cudaSuccess) {
+                err = "deepseek4: copy stream wait failed";
+                return false;
+            }
+            int32_t gb[kGroup + 1]{};
+            int group_rows = 0, group_max = 0;
+            for (int q = 0; q < n; ++q) {
+                const int e = used[first + (size_t) q];
+                const int cnt = (int) by[(size_t) e].size();
+                gb[q] = group_rows;
+                group_rows += cnt;
+                group_max = std::max(group_max, cnt);
+            }
+            gb[n] = group_rows;
+            if (cudaMemcpyAsync(B.bounds, gb, (size_t) (n + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, copy_) != cudaSuccess) {
+                err = "deepseek4: cannot upload prompt MMQ group bounds";
+                return false;
+            }
             mmq::GatherGroup gather;
             for (int q = 0; q < n; ++q) {
                 const int e = used[first + (size_t) q];
                 core::ExpertTier::Source src = tier_.locate(layer, e);
                 if (src.dev) gather.blob[q] = src.dev;
                 else {
-                    uint8_t* const dst = stage_host_ + stage_stride_ * (first + (size_t) q);
+                    uint8_t* const dev_dst = B.blobs + stage_stride_ * (size_t) q;
                     if (src.pinned) {
-                        if (cudaMemcpyAsync(stage_ + stage_stride_ * (size_t) q, src.pinned, (size_t) el.bytes,
-                                            cudaMemcpyHostToDevice, last_stream_) != cudaSuccess) {
+                        if (cudaMemcpyAsync(dev_dst, src.pinned, (size_t) el.bytes, cudaMemcpyHostToDevice, copy_) != cudaSuccess) {
                             err = "deepseek4: cannot stage a pinned prompt expert";
                             return false;
                         }
                     } else {
-                        if (!weights_.read_expert_blob(layer, e, dst, (size_t) el.bytes, err)) return false;
-                        if (cudaMemcpyAsync(stage_ + stage_stride_ * (size_t) q, dst, (size_t) el.bytes,
-                                            cudaMemcpyHostToDevice, last_stream_) != cudaSuccess) {
+                        uint8_t* const host_dst = B.host + stage_stride_ * (size_t) q;
+                        if (!weights_.read_expert_blob(layer, e, host_dst, (size_t) el.bytes, err)) return false;
+                        if (cudaMemcpyAsync(dev_dst, host_dst, (size_t) el.bytes, cudaMemcpyHostToDevice, copy_) != cudaSuccess) {
                             err = "deepseek4: cannot upload a prompt expert blob";
                             return false;
                         }
                     }
-                    gather.blob[q] = stage_ + stage_stride_ * (size_t) q;
+                    gather.blob[q] = dev_dst;
                 }
             }
             gather.first = 0;
             gather.n = n;
-            const size_t gate_bytes = L.gu_row * (size_t) g_.n_ff_exp;
-            const size_t up_bytes = L.up_row * (size_t) g_.n_ff_exp;
-            const size_t down_bytes = L.d_row * (size_t) g_.n_embd;
             if (!mmq::gather_native_group(gather, L.up_off, gate_bytes, L.down_off, down_bytes,
-                                          reinterpret_cast<uint8_t*>(group_gu_) + first * gu_stride_, gu_stride_,
-                                          reinterpret_cast<uint8_t*>(group_down_) + first * down_stride_, down_stride_,
-                                          stream, 0, nullptr, up_bytes)) {
+                                          B.gu, gu_stride_, B.down, down_stride_, copy_, 0, nullptr, up_bytes)) {
                 for (int q = 0; q < n; ++q) {
                     const uint8_t* b = gather.blob[q];
                     mmq::gather_native(b, b + L.up_off, gate_bytes, b + L.down_off, down_bytes,
-                                       reinterpret_cast<uint8_t*>(group_gu_) + (first + (size_t) q) * gu_stride_,
-                                       reinterpret_cast<uint8_t*>(group_down_) + (first + (size_t) q) * down_stride_,
-                                       stream, nullptr, nullptr, up_bytes);
+                                       B.gu + (size_t) q * gu_stride_, B.down + (size_t) q * down_stride_,
+                                       copy_, nullptr, nullptr, up_bytes);
                 }
             }
-        }
-        mmq::Product gu;
-        gu.type = el.gate_up_type;
-        gu.w_rows = 2 * (int64_t) g_.n_ff_exp;
-        gu.w_cols = g_.n_embd;
-        gu.expert_bytes = gu_stride_;
-        gu.xq = xq_;
-        gu.ids = output_ids_;
-        gu.total_rows = total;
-        gu.max_rows = max_rows;
-        gu.dst = gu_;
-        gu.ld_dst = gu.w_rows;
-        for (size_t first = 0; first < used.size(); first += (size_t) kGroup) {
-            gu.w = reinterpret_cast<uint8_t*>(group_gu_) + first * gu_stride_;
-            gu.n = (int) std::min((size_t) kGroup, used.size() - first);
-            gu.bounds = group_bounds_ + first;
-            mmq_.run(gu, stream);
-            if (cudaStreamSynchronize(last_stream_) != cudaSuccess) {
-                err = "deepseek4: prompt gate/up MMQ failed for expert group " + std::to_string(first);
+            if (cudaEventRecord(B.copied, copy_) != cudaSuccess ||
+                cudaStreamWaitEvent(last_stream_, B.copied, 0) != cudaSuccess) {
+                err = "deepseek4: compute stream wait failed";
                 return false;
             }
-        }
-        swiglu_split_clamped(gu_, total, g_.n_ff_exp, g_.swiglu_limit, h_, stream);
-        mmq::quantize(h_, output_ids_, hq_, el.down_type, g_.n_ff_exp, g_.n_ff_exp, total, stream);
-        mmq::Product down;
-        down.type = el.down_type;
-        down.w_rows = g_.n_embd;
-        down.w_cols = g_.n_ff_exp;
-        down.expert_bytes = down_stride_;
-        down.xq = hq_;
-        down.ids = output_ids_;
-        down.total_rows = total;
-        down.max_rows = max_rows;
-        down.dst = rows_;
-        down.ld_dst = g_.n_embd;
-        for (size_t first = 0; first < used.size(); first += (size_t) kGroup) {
-            down.w = reinterpret_cast<uint8_t*>(group_down_) + first * down_stride_;
-            down.n = (int) std::min((size_t) kGroup, used.size() - first);
-            down.bounds = group_bounds_ + first;
+            const int row0 = bounds_host_[(size_t) used[first]];
+            mmq::Product gu;
+            gu.type = el.gate_up_type;
+            gu.w_rows = 2 * (int64_t) g_.n_ff_exp;
+            gu.w_cols = g_.n_embd;
+            gu.expert_bytes = gu_stride_;
+            gu.xq = xq_;
+            gu.ids = output_ids_ + row0;
+            gu.total_rows = group_rows;
+            gu.max_rows = group_max;
+            gu.dst = gu_ + (size_t) row0 * 2 * (size_t) g_.n_ff_exp;
+            gu.ld_dst = gu.w_rows;
+            gu.w = B.gu;
+            gu.n = n;
+            gu.bounds = B.bounds;
+            mmq_.run(gu, stream);
+
+            swiglu_split_clamped(gu.dst, group_rows, g_.n_ff_exp, g_.swiglu_limit,
+                                 h_ + (size_t) row0 * (size_t) g_.n_ff_exp, stream);
+            mmq::quantize(h_ + (size_t) row0 * (size_t) g_.n_ff_exp, output_ids_ + row0,
+                          hq_ + (size_t) row0 * hq_row_bytes, el.down_type, g_.n_ff_exp, g_.n_ff_exp, group_rows, stream);
+
+            mmq::Product down;
+            down.type = el.down_type;
+            down.w_rows = g_.n_embd;
+            down.w_cols = g_.n_ff_exp;
+            down.expert_bytes = down_stride_;
+            down.xq = hq_ + (size_t) row0 * hq_row_bytes;
+            down.ids = output_ids_ + row0;
+            down.total_rows = group_rows;
+            down.max_rows = group_max;
+            down.dst = rows_;
+            down.ld_dst = g_.n_embd;
+            down.w = B.down;
+            down.n = n;
+            down.bounds = B.bounds;
             mmq_.run(down, stream);
+            if (cudaEventRecord(B.done, last_stream_) != cudaSuccess) {
+                err = "deepseek4: compute stream event record failed";
+                return false;
+            }
         }
         weighted_route_sum(rows_, weights, T, g_.n_embd, out, stream);
         return true;
@@ -393,11 +430,13 @@ private:
     int cap_ = 0;
     size_t route_cap_ = 0, stage_stride_ = 0, gu_stride_ = 0, down_stride_ = 0;
     std::vector<void*> dev_;
-    uint8_t *stage_ = nullptr, *stage_host_ = nullptr, *xq_ = nullptr, *hq_ = nullptr,
+    Stage stage_[2];
+    cudaStream_t copy_ = nullptr;
+    uint8_t *xq_ = nullptr, *hq_ = nullptr,
             *shared_xq_ = nullptr, *shared_hq_ = nullptr;
-    float *gu_ = nullptr, *h_ = nullptr, *rows_ = nullptr, *group_gu_ = nullptr, *group_down_ = nullptr,
+    float *gu_ = nullptr, *h_ = nullptr, *rows_ = nullptr,
           *shared_gate_ = nullptr, *shared_up_ = nullptr, *shared_hidden_ = nullptr;
-    int32_t *token_ids_ = nullptr, *output_ids_ = nullptr, *bounds_ = nullptr, *group_bounds_ = nullptr, *shared_bounds_ = nullptr,
+    int32_t *token_ids_ = nullptr, *output_ids_ = nullptr, *bounds_ = nullptr, *shared_bounds_ = nullptr,
             *identity_ = nullptr;
     std::vector<int32_t> rows_host_, token_host_, bounds_host_;
     mmq::Context mmq_;
@@ -417,11 +456,11 @@ size_t prefill_ffn_bytes(const ModelWeights& weights, int row_cap) {
     }
     const size_t route_cap = cap * 6;
     const size_t stage_stride = (blob_cap + 15) & ~size_t(15);
-    return stage_stride * kGroup + gu_cap * (size_t) g.n_expert + down_cap * (size_t) g.n_expert +
+    return 2 * (stage_stride * kGroup + gu_cap * kGroup + down_cap * kGroup + (kGroup + 1) * sizeof(int32_t)) +
            mmq::q8_bytes((int64_t) route_cap, g.n_embd) + mmq::q8_bytes((int64_t) route_cap, g.n_ff_exp) +
            route_cap * 2 * (size_t) g.n_ff_exp * sizeof(float) + route_cap * (size_t) g.n_ff_exp * sizeof(float) +
            route_cap * (size_t) g.n_embd * sizeof(float) + route_cap * sizeof(int32_t) * 2 +
-           ((size_t) g.n_expert + 1) * sizeof(int32_t) * 2 +
+           ((size_t) g.n_expert + 1) * sizeof(int32_t) +
            mmq::q8_bytes((int64_t) cap, g.n_embd) + mmq::q8_bytes((int64_t) cap, g.n_ff_exp) +
            cap * (size_t) g.n_ff_exp * sizeof(float) * 3 + 2 * sizeof(int32_t) + cap * sizeof(int32_t);
 }
