@@ -49,8 +49,11 @@ namespace {
 
 constexpr int kMaxDecodeWindow = 8;
 constexpr int kAttRows = 128;          ///< attention & dense-layer slice width (bounds attention scratch VRAM)
-constexpr int kMaxPromptChunk = 8192;  ///< max prompt MoE chunk width (amortizes 512-expert PCIe streaming)
-constexpr int kHomePromptChunk = 2048; ///< prompt MMQ chunk guaranteed beside permanent VRAM homes (`homes_.main > 0`)
+constexpr int kMaxPromptChunk = 16384; ///< max prompt MoE chunk width (amortizes 512-expert PCIe streaming)
+constexpr int kHomePromptChunk = 8192; ///< prompt MMQ chunk guaranteed beside permanent VRAM homes (`homes_.main > 0`)
+constexpr int kRingRows = 8192;        ///< a prompt chunk this wide routes to ~all 512 experts, justifying ring preload
+constexpr int kRingMinExperts = 64;    ///< the smallest prompt expert ring worth opening (experts per layer slot)
+constexpr int kHomeRingExperts = 128;  ///< ring experts per layer slot reserved beside permanent VRAM homes
 constexpr int kStageExperts = 16;      ///< MXFP4 experts per GPU-0 double-buffered staging slot
 constexpr int kIdxKeyTile = 4096;      ///< BF16 Tensor-Core Lightning Indexer key tile width
 constexpr uint64_t kL2Prefetch = 56ull << 20;   ///< next-layer weight budget prefetched into L2 while waiting on host
@@ -184,6 +187,7 @@ public:
         cudaSetDevice(m_.device());
         if (!ck(cudaStreamCreate(&stream_), "stream", err) ||
             !ck(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking), "copy_stream", err) ||
+            !ck(cudaStreamCreateWithFlags(&ring_stream_, cudaStreamNonBlocking), "ring stream", err) ||
             !ck(cudaStreamCreateWithFlags(&pf_stream_, cudaStreamNonBlocking), "prefetch stream", err) ||
             !ck(cudaEventCreateWithFlags(&pf_fork_, cudaEventDisableTiming), "prefetch event", err) ||
             !ck(cudaEventCreateWithFlags(&pf_join_, cudaEventDisableTiming), "prefetch event", err) ||
@@ -371,7 +375,9 @@ public:
         uint64_t home_prompt = 0;
         std::string pe;
         make_prompt_bufs(probe, kHomePromptChunk, pe, &home_prompt);
-        const ctxp::TierReserve tr = ctxp::plan_tier_reserve(home_prompt, kMmqHeadroom);
+        // the ring beside the homes is permanent prompt scratch: cards that keep expert homes size it in too
+        const uint64_t home_ring = expert_ring_bytes(std::min(kHomeRingExperts, g_.n_expert));
+        const ctxp::TierReserve tr = ctxp::plan_tier_reserve(home_prompt, kMmqHeadroom, home_ring);
         core::ExpertTier::Reserve res;
         res.copies = tr.copies;
         res.homes = tr.homes;
@@ -891,7 +897,10 @@ private:
         b.h_pair_map = pin_i((size_t) R * K);
         b.h_ids = pin_i((size_t) R * K);
         b.h_launch_tok = pin_i((size_t) R * K);
-        b.h_launch_bounds = pin_i((size_t) (g_.n_expert + (R * K) / kLaunchRows + 8) * 2);
+        // The staging loop writes <= 2 bounds entries per expert slice (slices: <= n_expert + rows/kLaunchRows), the
+        // prompt expert ring <= ring_cap_ + its own slices (ring_cap_ <= n_expert); this holds both paths' worst case
+        // at once (a few KiB of pinned memory), so the pre-packed launch tables can never overrun.
+        b.h_launch_bounds = pin_i((size_t) 4 * g_.n_expert + 3 * ((size_t) R * K / kLaunchRows + 1) + 16);
         b.gu = alloc_f((size_t) kLaunchRows * 2 * F);
         b.h = alloc_f((size_t) kLaunchRows * F);
         b.xq1 = alloc_bytes(mmq::q8_bytes(std::max(kLaunchRows, R), std::max(L, H)));
@@ -983,21 +992,30 @@ private:
 
         t_prompt_moe_ms_ = 0;
         t_prompt_peer_wait_ms_ = 0;
-        n_prompt_dev_ = n_prompt_bus_ = n_prompt_peer_ = n_prompt_cpu_ = n_prompt_file_ = 0;
+        t_ring_ms_ = 0.0;
+        n_prompt_dev_ = n_prompt_bus_ = n_prompt_peer_ = n_prompt_cpu_ = n_prompt_file_ = n_prompt_ring_ = 0;
         n_prompt_peer_rows_ = n_prompt_cpu_rows_ = 0;
 
-        // First try bounded partial lend so GPU 0 keeps its hottest decode experts untouched
+        // First try bounded partial lend for the full target chunk `want` (plus ring if long) so GPU 0 keeps its
+        // hottest decode experts untouched without shrinking `want` prematurely when lend_all() would fit it.
         if (tier && tier->partial_lend()) {
-            for (int R = want; R >= kMaxDecodeWindow * 2; R /= 2) {
-                PromptBufs probe;
-                uint64_t need = 0;
-                std::string pe;
-                make_prompt_bufs(probe, R, pe, &need);
-                if (tier->lend(need + kMmqHeadroom) && make_prompt_bufs(big_, R, pe)) {
+            PromptBufs probe;
+            uint64_t need = 0;
+            std::string pe;
+            make_prompt_bufs(probe, want, pe, &need);
+            const uint64_t ring_need =
+                (total >= kRingRows && want >= kRingRows) ? expert_ring_bytes(ring_target_cap()) : 0;
+            if (tier->lend(need + ring_need + kMmqHeadroom) && make_prompt_bufs(big_, want, pe)) {
+                // MMQ allocates its stream-k buffers on its first launches: a chunk that left the card no room
+                // for them ended the engine
+                size_t free_b = 0, total_b = 0;
+                if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b < kMmqHeadroom) {
+                    big_.release();
+                } else {
+                    open_prompt_ring(total, want);
                     lent_ = true;
                     return true;
                 }
-                if (m_.flags().diag_rows > 0) break;
             }
         }
         if (tier) {
@@ -1009,7 +1027,10 @@ private:
                 // MMQ allocates its stream-k buffers on its first launches: a chunk that left the card no room for
                 // them ended the engine
                 size_t free_b = 0, total_b = 0;
-                if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b >= kMmqHeadroom) return true;
+                if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b >= kMmqHeadroom) {
+                    open_prompt_ring(total, R);
+                    return true;
+                }
                 big_.release();
                 err = "no room for MMQ beside the prompt chunk R=" + std::to_string(R);
             }
@@ -1024,19 +1045,36 @@ private:
         return false;
     }
 
+    // The packed prefill expert ring beside the chunk's own buffers (long chunks only). Non-fatal: with no room for
+    // it every layer's experts keep staging through stage_[2] as before.
+    void open_prompt_ring(int total, int R) {
+        if (ring_ || total < kRingRows || R < kRingRows || !m_.shared_tier().tier) return;
+        if (!ring_open(ring_target_cap(), /*allow_shrink=*/true)) cudaGetLastError();
+    }
+
     void release_prompt() {
-        if (!big_.ready) return;
+        if (!big_.ready) {
+            ring_close();   // belt and braces: a ring only ever opens beside a ready prompt chunk
+            return;
+        }
         cudaSetDevice(m_.device());
         cudaStreamSynchronize(stream_);
         cudaStreamSynchronize(copy_stream_);
         if (t_prompt_moe_ms_ > 0.0) {
+            const std::string ring_w =
+                n_prompt_ring_ > 0 || t_ring_ms_.load() > 0.0
+                    ? " ring=" + std::to_string((long long) n_prompt_ring_) + "(" +
+                          std::to_string((long long) t_ring_ms_.load()) + "ms)"
+                    : "";
             basalt::log::info("basalt ernie55",
-                              "prompt MMQ (R=%d): moe=%.0fms (peer_wait=%.0fms), experts dev=%lld bus=%lld file=%lld peer=%lld(%lld rows) cpu=%lld(%lld rows)",
+                              "prompt MMQ (R=%d): moe=%.0fms (peer_wait=%.0fms), experts dev=%lld bus=%lld file=%lld "
+                              "peer=%lld(%lld rows) cpu=%lld(%lld rows)%s",
                               big_.rows, t_prompt_moe_ms_, t_prompt_peer_wait_ms_,
                               (long long) n_prompt_dev_, (long long) n_prompt_bus_, (long long) n_prompt_file_,
                               (long long) n_prompt_peer_, (long long) n_prompt_peer_rows_,
-                              (long long) n_prompt_cpu_, (long long) n_prompt_cpu_rows_);
+                              (long long) n_prompt_cpu_, (long long) n_prompt_cpu_rows_, ring_w.c_str());
         }
+        ring_close();
         big_.release();
         if (core::ExpertTier* tier = m_.shared_tier().tier.get(); tier && lent_) {
             std::string e;
@@ -1045,6 +1083,203 @@ private:
             tier->grow();
         }
         lent_ = false;
+    }
+
+    // ---- Packed adaptive prefill expert ring (ring_stream_, long chunks only) ----
+
+    // A prompt chunk of kRingRows rows or more routes to (almost) every expert of every layer, so the next layer's
+    // experts do not wait for its router: a layer's local experts are packed into one of two ring slots on the ring
+    // stream while the layer before it computes. ring_stream_ is its own non-blocking stream: hundreds of H2D copies
+    // queue there without ever holding the copy_stream_ (the ev_ids D2H and the stage_[2] overflow staging share it)
+    // or letting the routing readback wait behind them.
+
+    // The bytes the prompt MMQ products read past the last expert of a blob buffer: the last row of a matrix whose
+    // rows are not a multiple of 256 values is read on to the next multiple (zeros there, a stray scale could be NaN).
+    size_t expert_past() const {
+        namespace mmq = prefill::mmq;
+        size_t past = 16;
+        for (const ExpertLayer& el : m_.pack().experts) {
+            if (el.blob_bytes == 0) continue;
+            if (mmq::supported(el.gu_type)) past = std::max(past, mmq::read_past_bytes(el.gu_type, g_.n_latent));
+            if (mmq::supported(el.d_type)) past = std::max(past, mmq::read_past_bytes(el.d_type, g_.n_ff_exp));
+        }
+        return past;
+    }
+    size_t expert_ring_bytes(int cap) const { return 2 * (size_t) cap * stride_ + expert_past(); }
+
+    // How many of one layer's experts GPU 0 needs: all non-peer experts on single-GPU, or at most half of the
+    // non-peer RAM experts when PeerShare splits work across two cards (so GPU 0 never starves GPU 1).
+    int ring_target_cap() const {
+        core::ExpertTier* tier = m_.shared_tier().tier.get();
+        if (!tier || !tier->share_for(0)) return g_.n_expert;
+        int peer_res = 0;
+        for (int e = 0; e < g_.n_expert; ++e)
+            if (tier->locate(0, e).peer) ++peer_res;
+        const int half_ram = std::max(0, (g_.n_expert - peer_res) / 2);
+        return std::clamp(half_ram / kStageExperts * kStageExperts, kRingMinExperts, g_.n_expert);
+    }
+
+    // Shrinks the ring to whatever fits above the MMQ headroom, in whole kStageExperts steps, never below
+    // kRingMinExperts; false (and nothing allocated) when even that does not fit.
+    bool ring_open(int want_cap, bool allow_shrink) {
+        const size_t past = expert_past();
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return false;
+        const uint64_t floor = kMmqHeadroom + (64ull << 20);
+        if (stride_ == 0 || free_b <= floor + past) return false;
+        int cap = std::clamp(want_cap > 0 ? want_cap : g_.n_expert, kRingMinExperts, g_.n_expert);
+        int fit = (int) ((free_b - floor - past) / (2 * stride_));
+        fit = std::min(fit, cap) / kStageExperts * kStageExperts;   // whole staging groups, rounded down
+        if (cap > fit) {
+            if (!allow_shrink) return false;
+            cap = fit;
+        }
+        while (cap >= kRingMinExperts) {
+            if (cudaMalloc((void**) &ring_, expert_ring_bytes(cap)) == cudaSuccess) {
+                size_t after_free = 0;
+                if (cudaMemGetInfo(&after_free, &total_b) == cudaSuccess && after_free >= kMmqHeadroom) break;
+                cudaFree(ring_);   // MMQ still needs its own room beside the ring
+                ring_ = nullptr;
+            } else {
+                cudaGetLastError();
+            }
+            cap -= kStageExperts;
+        }
+        if (!ring_) return false;
+        if (cudaMemset((uint8_t*) ring_ + 2 * (size_t) cap * stride_, 0, past) != cudaSuccess) {
+            cudaGetLastError();
+            cudaFree(ring_);
+            ring_ = nullptr;
+            return false;
+        }
+        ring_cap_ = cap;
+        for (int i = 0; i < 2; ++i) {
+            if (cudaEventCreateWithFlags(&ring_copied_[i], cudaEventDisableTiming) != cudaSuccess ||
+                cudaEventCreateWithFlags(&ring_done_[i], cudaEventDisableTiming) != cudaSuccess ||
+                cudaEventRecord(ring_done_[i], stream_) != cudaSuccess) {
+                cudaGetLastError();
+                ring_close();
+                return false;
+            }
+        }
+        ring_layer_[0] = ring_layer_[1] = -1;
+        basalt::log::info("basalt ernie55", "prompt expert ring: %d of %d experts per layer (%.2f GiB)", ring_cap_,
+                          g_.n_expert, (double) expert_ring_bytes(ring_cap_) / 1073741824.0);
+        return true;
+    }
+
+    void ring_join() {
+        for (std::thread& t : ring_thr_)
+            if (t.joinable()) t.join();
+    }
+
+    void ring_close() {
+        ring_join();
+        if (!ring_) return;
+        cudaStreamSynchronize(ring_stream_);
+        cudaStreamSynchronize(stream_);
+        cudaFree(ring_);
+        ring_ = nullptr;
+        ring_cap_ = 0;
+        ring_pos_[0].clear();
+        ring_pos_[1].clear();
+        for (int i = 0; i < 2; ++i) {
+            if (ring_copied_[i]) cudaEventDestroy(ring_copied_[i]);
+            if (ring_done_[i]) cudaEventDestroy(ring_done_[i]);
+            ring_copied_[i] = ring_done_[i] = nullptr;
+        }
+    }
+
+    // Tier layer `moe_l`'s experts that GPU 0 computes itself, packed into its slot on ring_stream_ once the layer
+    // that last used the slot is done. Peer experts are PeerShare's business, file-only experts stage_[2]'s. When the
+    // ring shrunk below the layer's local experts the RAM ones go FIRST: their slow PCIe copies then overlap the
+    // attention, and the card-resident ones (a fast D2D) may fall back to staging.
+    bool ring_copy(int moe_l) {
+        const int slot = moe_l & 1;
+        const int l = moe_l + g_.n_dense;
+        const ExpertLayer& el = m_.pack().experts[(size_t) l];
+        core::ExpertTier* tier = m_.shared_tier().tier.get();
+        uint8_t* base = ring_ + (size_t) slot * (size_t) ring_cap_ * stride_;
+        std::vector<int32_t>& pos = ring_pos_[slot];
+        pos.assign((size_t) g_.n_expert, -1);
+        cudaStreamWaitEvent(ring_stream_, ring_done_[slot], 0);
+
+        int local = 0;
+        for (int e = 0; e < g_.n_expert; ++e) {
+            const core::ExpertTier::Source src = tier->locate(moe_l, e);
+            local += (!src.peer && (src.dev || src.pinned)) ? 1 : 0;
+        }
+        const bool ram_first = local > ring_cap_;
+        int p = 0;
+        for (int pass = 0; pass < (ram_first ? 2 : 1) && p < ring_cap_; ++pass) {
+            for (int e = 0; e < g_.n_expert && p < ring_cap_; ++e) {
+                if (pos[(size_t) e] >= 0) continue;   // a RAM expert already packed in the first pass
+                const core::ExpertTier::Source src = tier->locate(moe_l, e);
+                if (src.peer || (!src.dev && !src.pinned)) continue;
+                if (ram_first && pass == 0 && !(src.pinned && !src.dev)) continue;
+                uint8_t* dst = base + stride_ * (size_t) p;
+                if (src.pinned && !src.dev && stride_ == el.blob_bytes) {
+                    // a run of experts at consecutive addresses in one RAM arena goes in a single copy
+                    int n = 1;
+                    while (e + n < g_.n_expert && p + n < ring_cap_) {
+                        const core::ExpertTier::Source nx = tier->locate(moe_l, e + n);
+                        if (pos[(size_t) (e + n)] >= 0) break;
+                        if (nx.peer || !nx.pinned || nx.dev) break;
+                        if ((const uint8_t*) nx.pinned - (const uint8_t*) src.pinned !=
+                            (ptrdiff_t) n * (ptrdiff_t) el.blob_bytes)
+                            break;
+                        ++n;
+                    }
+                    cudaMemcpyAsync(dst, src.pinned, (size_t) n * el.blob_bytes, cudaMemcpyHostToDevice, ring_stream_);
+                    for (int j = 0; j < n; ++j) pos[(size_t) (e + j)] = p + j;
+                    e += n - 1;
+                    p += n;
+                    continue;
+                }
+                if (src.dev)
+                    cudaMemcpyAsync(dst, src.dev, el.blob_bytes, cudaMemcpyDeviceToDevice, ring_stream_);
+                else
+                    cudaMemcpyAsync(dst, src.pinned, el.blob_bytes, cudaMemcpyHostToDevice, ring_stream_);
+                pos[(size_t) e] = p;
+                ++p;
+            }
+        }
+        cudaEventRecord(ring_copied_[slot], ring_stream_);
+        return true;
+    }
+
+    // The copies issue from a thread of their own: hundreds of H2D calls can hold the host thread until the bus has
+    // taken most of them, and the attention this chunk runs in parallel needs that thread to keep launching.
+    // Joining both slots before launching ensures only one host thread queues onto ring_stream_ at a time, preserving
+    // strict FIFO order between layer moe_l-1's ring_copied_ event and layer moe_l's copies.
+    void ring_start(int moe_l) {
+        if (moe_l < 0 || moe_l >= g_.n_layers - g_.n_dense) return;
+        const int slot = moe_l & 1;
+        ring_join();
+        ring_layer_[slot] = moe_l;
+        ring_ok_[slot] = false;
+        const int dev = m_.device();
+        ring_thr_[slot] = std::thread([this, moe_l, slot, dev] {
+            cudaSetDevice(dev);
+            const double t0 = now_ms();
+            ring_ok_[slot] = ring_copy(moe_l);
+            t_ring_ms_ += now_ms() - t0;
+        });
+    }
+
+    // Layer `moe_l`'s experts are in their slot (waits for the thread that issued the copy); false when they are not.
+    bool ring_ready(int moe_l) {
+        const int slot = moe_l & 1;
+        if (ring_layer_[slot] != moe_l) ring_start(moe_l);
+        if (ring_thr_[slot].joinable()) ring_thr_[slot].join();
+        return ring_ok_[slot];
+    }
+
+    // At the start of dense layer 0, kick MoE layer 0 onto ring_stream_ so it loads through layer 0's dense FFN and
+    // layer 1's attention; subsequent MoE layers are kicked from moe_prompt() right after ring_ready(moe_l) joins.
+    void ring_ahead(int l, int T) {
+        if (!ring_ || T < kRingRows || l != 0) return;
+        if (ring_layer_[0] != 0) ring_start(0);
     }
 
     prefill::PeerShare::Layer make_share_layer(int moe_l) const {
@@ -1322,6 +1557,11 @@ private:
             h_pairs_[(size_t) h_cur_[(size_t) e]++] = (int32_t) p;
         }
 
+        // Join this layer's prefill expert ring BEFORE the PeerShare split so experts already copied into GPU 0's
+        // ring stay on GPU 0 (counted with 0 remaining bus bytes) instead of being reassigned and copied again to GPU 1.
+        const bool ringed = ring_ && T >= kRingRows && ring_ready(moe_l);
+        const std::vector<int32_t>* rpos_ptr = ringed ? &ring_pos_[moe_l & 1] : nullptr;
+
         // Plan GPU 1 (PeerShare) split: GPU 1 takes its own resident experts + balanced RAM share via peer_take.
         // Interleave heavy and light RAM experts so every prefix [0..k) has the same average row density as the
         // remaining suffix, letting peer_take balance BOTH compute rows and PCIe blob bytes 50/50 across both GPUs.
@@ -1337,14 +1577,15 @@ private:
                 const int64_t nr = h_cnt_[(size_t) e];
                 if (nr == 0) continue;
                 const core::ExpertTier::Source src = tier->locate(moe_l, e);
+                const bool in_ring = rpos_ptr && (size_t) e < rpos_ptr->size() && (*rpos_ptr)[(size_t) e] >= 0;
                 if (src.peer) {
                     away[(size_t) e] = 1;
                     peer_rows += nr;
-                } else if (src.pinned && !src.dev) {
+                } else if (src.pinned && !src.dev && !in_ring) {
                     ram_all.push_back(e);
                 } else {
                     main_rows += nr;
-                    if (!src.dev) main_bytes += (double) el.blob_bytes;
+                    if (!src.dev && !in_ring) main_bytes += (double) el.blob_bytes;
                 }
             }
             std::sort(ram_all.begin(), ram_all.end(),
@@ -1521,7 +1762,134 @@ private:
         // Quantize x_lat ONCE for all T rows on stream_, then gather per GPU-0 launch via mmq::gather_q8
         if (!used.empty()) mmq::quantize(x_lat, nullptr, big_.xq_lat, el.gu_type, L, L, T, stream_);
 
-        // Flatten GPU-0 experts into slices of <= kLaunchRows so even a single super-hot expert at R=8192 never overruns
+        // The pre-packed launch tables and the double-buffered stage alternate from counters the ring's direct
+        // launches and the staged overflow experts share, so the two paths continue seamlessly into each other.
+        int32_t tok_cur = 0, bnd_cur = 0;
+        int64_t pos_cur = 0;
+        int launch_idx = 0;
+
+        // A prompt chunk of >= kRingRows rows routes to (almost) every expert: those whose blobs the ring already
+        // packed on ring_stream_ (while earlier layers computed) launch their MMQ straight from the ring slot; the
+        // overflow experts keep the copy_stream_ staging below. Bit-identical either way: the same blob bytes at the
+        // same stride, the same tok/bounds row layout (a gap between packed slots runs as empty bounds entries), the
+        // same row mapping and weighted sum.
+        if (ringed && moe_l + 1 < g_.n_layers - g_.n_dense && ring_layer_[(moe_l + 1) & 1] != moe_l + 1)
+            ring_start(moe_l + 1);   // the next layer's copies queue on ring_stream_ while this layer's MMQ runs
+        if (ringed) {
+            const int slot = moe_l & 1;
+            cudaStreamWaitEvent(stream_, ring_copied_[slot], 0);
+            const uint8_t* rbase = ring_ + (size_t) slot * (size_t) ring_cap_ * stride_;
+            const std::vector<int32_t>& rpos = ring_pos_[slot];
+            std::vector<int> in_ring, rest;
+            in_ring.reserve(used.size());
+            rest.reserve(used.size());
+            for (int e : used) {
+                if ((size_t) e < rpos.size() && rpos[(size_t) e] >= 0) in_ring.push_back(e);
+                else rest.push_back(e);
+            }
+            used = std::move(rest);
+            n_prompt_ring_ += (int64_t) in_ring.size();
+            // ascending packed slot: every launch walks the ring from a low position to strictly higher ones
+            std::sort(in_ring.begin(), in_ring.end(),
+                      [&](int a, int b) { return rpos[(size_t) a] < rpos[(size_t) b]; });
+
+            // Flatten the ringed experts into slices of <= kLaunchRows just like the staged path below
+            struct RingSlice {
+                int e;
+                int32_t off;
+                int32_t n;
+            };
+            std::vector<RingSlice> rslices;
+            rslices.reserve(in_ring.size());
+            for (int e : in_ring) {
+                const int32_t total_c = h_cnt_[(size_t) e];
+                for (int32_t off = 0; off < total_c; off += kLaunchRows)
+                    rslices.push_back({e, off, std::min<int32_t>(kLaunchRows, total_c - off)});
+            }
+            for (size_t rb0 = 0; rb0 < rslices.size();) {
+                const int p0 = rpos[(size_t) rslices[rb0].e];
+                size_t rb1 = rb0;
+                int64_t rows = 0, max_rows = 0;
+                while (rb1 < rslices.size() && rpos[(size_t) rslices[rb1].e] < p0 + kStageExperts) {
+                    if (rb1 > rb0 && rslices[rb1].e == rslices[rb1 - 1].e) break;
+                    const int64_t c = rslices[rb1].n;
+                    if (rb1 > rb0 && rows + c > kLaunchRows) break;
+                    rows += c;
+                    max_rows = std::max(max_rows, c);
+                    ++rb1;
+                }
+                const int nb = rpos[(size_t) rslices[rb1 - 1].e] - p0 + 1;   // packed slots, gaps included
+                const int32_t tok_off = tok_cur, bnd_off = bnd_cur;
+                int32_t ntok = 0;
+                big_.h_launch_bounds[bnd_cur++] = 0;
+                size_t cur = rb0;
+                for (int q = 0; q < nb; ++q) {
+                    if (cur < rb1 && rpos[(size_t) rslices[cur].e] == p0 + q) {   // a gap expert keeps empty bounds
+                        const RingSlice& sl = rslices[cur];
+                        const int32_t* ep = h_pairs_.data() + h_off_[(size_t) sl.e] + sl.off;
+                        for (int32_t j = 0; j < sl.n; ++j) {
+                            const int32_t p = ep[j];
+                            map_h[(size_t) p] = (int32_t) (pos_cur + ntok);
+                            big_.h_launch_tok[tok_cur++] = p / K;
+                            ++ntok;
+                        }
+                        ++cur;
+                    }
+                    big_.h_launch_bounds[bnd_cur++] = ntok;
+                }
+
+                // The tok/bounds tables ride stream_ (which owns them); the blobs are already on the card, so this
+                // launch reads them straight from its ring slot instead of a stage_[2] blob buffer.
+                MmqStage& B = big_.stage[launch_idx++ & 1];
+                cudaMemcpyAsync(B.tok, big_.h_launch_tok + tok_off, (size_t) rows * sizeof(int32_t),
+                                cudaMemcpyHostToDevice, stream_);
+                cudaMemcpyAsync(B.bounds, big_.h_launch_bounds + bnd_off, (size_t) (nb + 1) * sizeof(int32_t),
+                                cudaMemcpyHostToDevice, stream_);
+                mmq::gather_q8(big_.xq_lat, T, B.tok, big_.xq1, rows, L, stream_);
+                const uint8_t* w = rbase + (size_t) p0 * stride_;
+                mmq::Product p;
+                p.w = w;
+                p.type = el.gu_type;
+                p.w_rows = 2 * (int64_t) F;
+                p.w_cols = L;
+                p.expert_bytes = stride_;
+                p.n = nb;
+                p.xq = big_.xq1;
+                p.bounds = B.bounds;
+                p.ids = big_.pair_ident;
+                p.total_rows = rows;
+                p.max_rows = max_rows;
+                p.dst = big_.gu;
+                p.ld_dst = p.w_rows;
+                mmq_ctx_.run(p, stream_);
+
+                mmq::swiglu(big_.gu, big_.h, rows, F, /*interleaved=*/false, stream_, nullptr, nullptr, 0,
+                            mmq::SwigluForm{g_.gate_softcap, g_.up_softcap});
+
+                mmq::quantize(big_.h, nullptr, big_.xq2, el.d_type, F, F, rows, stream_);
+                mmq::Product d;
+                d.w = w + lay.down_off;
+                d.type = el.d_type;
+                d.w_rows = L;
+                d.w_cols = F;
+                d.expert_bytes = stride_;
+                d.n = nb;
+                d.xq = big_.xq2;
+                d.bounds = B.bounds;
+                d.ids = big_.pair_ident + pos_cur;
+                d.total_rows = rows;
+                d.max_rows = max_rows;
+                d.dst = big_.pair_rows;
+                d.ld_dst = L;
+                mmq_ctx_.run(d, stream_);
+                cudaEventRecord(B.done, stream_);   // the overflow staging may recycle B only once its MMQ is done
+                pos_cur += rows;
+                rb0 = rb1;
+            }
+            cudaEventRecord(ring_done_[slot], stream_);   // the slot's ring bytes are read: it may be refilled
+        }
+
+        // Flatten GPU-0 experts into slices of <= kLaunchRows so even a single super-hot expert at R=16384 never overruns
         struct UsedSlice {
             int e;
             int32_t off;
@@ -1545,8 +1913,6 @@ private:
         };
         std::vector<LaunchPlan> plans;
         plans.reserve((slices.size() + kStageExperts - 1) / kStageExperts + 4);
-        int32_t tok_cur = 0, bnd_cur = 0;
-        int64_t pos_cur = 0;
         for (size_t b0 = 0; b0 < slices.size();) {
             int nb = 0;
             int64_t rows = 0, max_rows = 0;
@@ -1577,7 +1943,6 @@ private:
         }
 
         // GPU 0 double-buffered staging on copy_stream_ overlapped with Blackwell Tensor-Core MMQ on stream_ (async, 0 host syncs)
-        int launch_idx = 0;
         for (const LaunchPlan& lp : plans) {
             MmqStage& B = big_.stage[launch_idx++ & 1];
             cudaStreamWaitEvent(copy_stream_, B.done, 0);
@@ -1938,6 +2303,10 @@ private:
         float* res_next = p_res_b;
 
         peer_prepared_ = -1;
+        if (use_prompt_moe && ring_ && T >= kRingRows) {   // a ring outlives one chunk: start the layer slots fresh
+            ring_join();
+            ring_layer_[0] = ring_layer_[1] = -1;
+        }
         for (int l = 0; l < g_.n_layers; ++l) {
             if (use_prompt_moe) {
                 // Keep Basalt's 60s serve stall watchdog informed during large prompt chunks (e.g. 8K tokens @ 130K+ ctx)
@@ -1945,6 +2314,9 @@ private:
                 core::progress_tick();
                 core::progress_at("ernie55 prompt chunk: layer", l, pos0);
                 if (l == g_.n_dense && T >= kPeerPrepareRows) prepare_peer(0, tier_ptr);
+                // MoE layer 0's experts ride the ring stream through layer 0's attention and dense FFN; later layers
+                // through the attention before them
+                ring_ahead(l, T);
             }
             // ---- Attention sublayer (mHC on full T; attention itself sliced to <= kAttRows = 128) ----
             const DevTensor *hc_fn = req_t(l, "hc_attn_fn.weight", err),
@@ -2296,8 +2668,29 @@ private:
                                                       (int64_t) A * g_.idx_heads * g_.idx_dim, stream_);
                         }
                         const float alpha = 1.0f, beta = 0.0f;
-                        for (int t0 = 0; t0 < A; t0 += kMaxDecodeWindow) {
-                            const int tw = std::min(kMaxDecodeWindow, A - t0);
+                        // Reuse idle big_.pair_rows (unused during the DSA attention loop) to batch up to all A = 128
+                        // query tokens per k0 pass, cutting idx_k_cache FP4->BF16 dequantization by up to 16x and
+                        // widening the Tensor-Core GEMM N dimension from 512 to 8192.
+                        const size_t pair_floats = big_.pair_rows
+                                                       ? (size_t) big_.rows * (size_t) g_.n_used * (size_t) g_.n_latent
+                                                       : 0;
+                        const int score_stride =
+                            (int) std::max<int64_t>(1, std::min<int64_t>(m_.context(), pos0 + a0 + A));
+                        const size_t per_tok_floats =
+                            (size_t) g_.idx_heads * (size_t) kIdxKeyTile + (size_t) score_stride;
+                        const int idx_step = (per_tok_floats > 0 &&
+                                              pair_floats / per_tok_floats > (size_t) kMaxDecodeWindow)
+                                                 ? std::min(A, (int) (pair_floats / per_tok_floats))
+                                                 : kMaxDecodeWindow;
+                        const bool use_pair_idx = idx_step > kMaxDecodeWindow;
+                        float* idx_dots_buf = use_pair_idx ? big_.pair_rows : big_.idx_dots;
+                        float* idx_scores_buf =
+                            use_pair_idx
+                                ? (big_.pair_rows + (size_t) idx_step * (size_t) g_.idx_heads * (size_t) kIdxKeyTile)
+                                : d_idx_scores_;
+                        const int idx_scores_stride = use_pair_idx ? score_stride : (int) m_.context();
+                        for (int t0 = 0; t0 < A; t0 += idx_step) {
+                            const int tw = std::min(idx_step, A - t0);
                             const int tw_older =
                                 (int) std::max<int64_t>(0, (pos0 + a0 + t0 + tw - 1) + 1 - g_.window);
                             if (tw_older > g_.idx_top_k) {
@@ -2308,14 +2701,14 @@ private:
                                                            stream_);
                                     cublasGemmEx(cublas_, CUBLAS_OP_T, CUBLAS_OP_N, kn, tw * g_.idx_heads, g_.idx_dim,
                                                  &alpha, big_.idx_k_bf16, CUDA_R_16BF, g_.idx_dim, q_bf16, CUDA_R_16BF,
-                                                 g_.idx_dim, &beta, big_.idx_dots, CUDA_R_32F, kn, CUBLAS_COMPUTE_32F,
+                                                 g_.idx_dim, &beta, idx_dots_buf, CUDA_R_32F, kn, CUBLAS_COMPUTE_32F,
                                                  CUBLAS_GEMM_DEFAULT);
-                                    dsa_indexer_reduce_tile(big_.idx_dots, iw_s + (size_t) t0 * g_.idx_heads, pos_s + t0,
+                                    dsa_indexer_reduce_tile(idx_dots_buf, iw_s + (size_t) t0 * g_.idx_heads, pos_s + t0,
                                                             tw, g_.idx_heads, g_.idx_dim, g_.idx_top_k, g_.window, k0,
-                                                            kn, d_idx_scores_, (int) m_.context(), stream_);
+                                                            kn, idx_scores_buf, idx_scores_stride, stream_);
                                 }
                             }
-                            dsa_indexer_select_cached(d_idx_scores_, (int) m_.context(), pos_s + t0, tw, g_.idx_top_k,
+                            dsa_indexer_select_cached(idx_scores_buf, idx_scores_stride, pos_s + t0, tw, g_.idx_top_k,
                                                       g_.window, d_sel_idx_ + (size_t) t0 * sel_w, stream_);
                         }
                     } else {
@@ -2569,6 +2962,7 @@ private:
 
     void release() {
         release_prompt();
+        ring_close();   // belt and braces: the ring and its threads die before the streams they use
         for (auto& s : hca_) {
             dfree(s.win_cache); dfree(s.comp_cache); dfree(s.state_kv); dfree(s.state_score);
         }
@@ -2596,6 +2990,7 @@ private:
         if (cublas_) { cublasDestroy(cublas_); cublas_ = nullptr; }
         if (cublas_ws_) { cudaFree(cublas_ws_); cublas_ws_ = nullptr; }
         if (copy_stream_) { cudaStreamDestroy(copy_stream_); copy_stream_ = nullptr; }
+        if (ring_stream_) { cudaStreamDestroy(ring_stream_); ring_stream_ = nullptr; }
         if (pf_stream_) { cudaStreamDestroy(pf_stream_); pf_stream_ = nullptr; }
         if (hint_stream_) { cudaStreamDestroy(hint_stream_); hint_stream_ = nullptr; }
         if (hint_fork_) { cudaEventDestroy(hint_fork_); hint_fork_ = nullptr; }
@@ -2663,10 +3058,25 @@ private:
 
     PromptBufs big_{};
     bool lent_ = false;
+
+    // The packed adaptive prefill expert ring: two slots of ring_cap_ expert blobs each. A long prompt chunk's next
+    // MoE layer's local experts are packed into the slot it does not use, on a dedicated non-blocking stream, so the
+    // PCIe RAM transfers overlap the HCA/MLA-DSA attention and dense/shared-expert compute instead of queueing
+    // behind (and holding) the copy_stream_ the routing readback and the stage_[2] overflow staging share.
+    cudaStream_t ring_stream_ = nullptr;
+    uint8_t* ring_ = nullptr;
+    int ring_cap_ = 0;                        ///< experts per ring slot (<= g_.n_expert)
+    std::vector<int32_t> ring_pos_[2];        ///< [slot][expert] -> packed slot index in ring_, or -1
+    cudaEvent_t ring_copied_[2] = {nullptr, nullptr}, ring_done_[2] = {nullptr, nullptr};
+    int ring_layer_[2] = {-1, -1};            ///< the tier layer whose copy fills (slot) / whose MMQ read (done) it
+    std::thread ring_thr_[2];                 ///< the issuer of the slot's copies (a ring stream's queue can be long)
+    bool ring_ok_[2] = {false, false};
+    std::atomic<double> t_ring_ms_{0};        ///< host ms the ring-copy threads spent queueing copies
     float *cpu_rows_ = nullptr, *cpu_x_ = nullptr;
     uint8_t* cpu_act_ = nullptr;
     double t_prompt_moe_ms_ = 0, t_prompt_peer_wait_ms_ = 0;
-    int64_t n_prompt_dev_ = 0, n_prompt_bus_ = 0, n_prompt_peer_ = 0, n_prompt_cpu_ = 0, n_prompt_file_ = 0;
+    int64_t n_prompt_dev_ = 0, n_prompt_bus_ = 0, n_prompt_peer_ = 0, n_prompt_cpu_ = 0, n_prompt_file_ = 0,
+            n_prompt_ring_ = 0;
     uint8_t* file_bounce_ = nullptr;   ///< pinned staging of the prompt experts only the file holds (kStageExperts)
     int64_t n_prompt_peer_rows_ = 0, n_prompt_cpu_rows_ = 0;
 

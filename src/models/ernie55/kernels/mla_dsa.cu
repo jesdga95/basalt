@@ -870,6 +870,240 @@ __global__ void dsa_mla_attention_preabsorbed_gqa512_kernel(
     }
 }
 
+// ---- Tensor-core FP16 MMA pre-absorbed sparse MLA attention (kv_lora = 512, qk_rope = 64 -> D = 576) -----------
+
+constexpr int kDsaMmaG = 2;       // M = 16 * kDsaMmaG = 32 heads per block
+constexpr int kDsaMmaCells = 32;  // keys per shared-memory tile
+constexpr int kDsaMmaLd = 584;    // 576 + 8 halfs (16-byte aligned, conflict-free)
+constexpr int kDsaMmaPLd = 40;    // 32 + 8 halfs
+
+constexpr size_t dsa_mma512_smem() {
+    constexpr int M = 16 * kDsaMmaG;
+    return (size_t) (M * kDsaMmaLd + kDsaMmaCells * kDsaMmaLd + M * kDsaMmaPLd) * sizeof(uint16_t)
+         + (size_t) (2 * M * kDsaMmaCells + 2 * M) * sizeof(float);
+}
+
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+
+__device__ __forceinline__ void dsa_ldsm4(uint32_t (&r)[4], const void* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"((uint32_t) __cvta_generic_to_shared(p)));
+}
+__device__ __forceinline__ void dsa_ldsm4t(uint32_t (&r)[4], const void* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"((uint32_t) __cvta_generic_to_shared(p)));
+}
+__device__ __forceinline__ void dsa_mma16816h(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ uint32_t dsa_bf2_to_h2(uint32_t v) {
+    const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&v));
+    const __half2 h = __float22half2_rn(f);
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+__device__ __forceinline__ uint32_t dsa_e4m3x2_to_h2(uint32_t codes, __half2 scale) {
+    const __half2 h = __hmul2(__half2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) codes, __NV_E4M3)), scale);
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+
+// Eight values of a DSA latent KV row's chunk ch (of 72: 64 c_kv + 8 k_pe) as eight packed FP16 values.
+// FP8 layout (kDsaFp8RowBytes = 656, 16-byte aligned): 512 E4M3 c_kv + 4 float scales (128-value groups -> ch >> 4)
+// + 64 BF16 k_pe starting at byte 528 (528 % 16 == 0).
+template <bool FP8>
+__device__ __forceinline__ uint4 dsa_fetch_row8(const uint8_t* kv_cache, size_t cell, int ch) {
+    if (!FP8) return *reinterpret_cast<const uint4*>(kv_cache + cell * (size_t) (2 * 576) + ch * 16);
+    const uint8_t* row = kv_cache + cell * (size_t) kDsaFp8RowBytes;
+    if (ch < 64) {
+        const uint2 codes = *reinterpret_cast<const uint2*>(row + ch * 8);
+        const __half2 s = __float2half2_rn(reinterpret_cast<const float*>(row + 512)[ch >> 4]);
+        return make_uint4(dsa_e4m3x2_to_h2(codes.x & 0xffffu, s), dsa_e4m3x2_to_h2(codes.x >> 16, s),
+                          dsa_e4m3x2_to_h2(codes.y & 0xffffu, s), dsa_e4m3x2_to_h2(codes.y >> 16, s));
+    }
+    const uint4 w = *reinterpret_cast<const uint4*>(row + 528 + (ch - 64) * 16);
+    return make_uint4(dsa_bf2_to_h2(w.x), dsa_bf2_to_h2(w.y), dsa_bf2_to_h2(w.z), dsa_bf2_to_h2(w.w));
+}
+
+// One block (256 threads, 8 warps) per (32-head tile, token): FP16 Tensor-Core sparse MLA attention over sel_idx.
+// Q = [q_lat (512), q_pe (64)] * scale (D = 576 = 36 * 16); K = [c_kv (512), k_pe (64)]; V = c_kv (512).
+template <bool FP8>
+__global__ void __launch_bounds__(256) dsa_mla_attention_preabsorbed_mma512_kernel(
+    const float* __restrict__ q_lat_in, const float* __restrict__ q_full, const uint8_t* __restrict__ kv_cache,
+    const float* __restrict__ attn_sink, const int32_t* __restrict__ sel_idx, int n_tokens, int n_heads,
+    int qk_nope, int sel_width, uint16_t* __restrict__ o_lat_f16) {
+    extern __shared__ __align__(16) unsigned char smraw[];
+    constexpr int W = 512, R = 64, D = W + R, M = 16 * kDsaMmaG;
+    uint16_t* qh = (uint16_t*) smraw;
+    uint16_t* ks = qh + M * kDsaMmaLd;
+    uint16_t* ph = ks + kDsaMmaCells * kDsaMmaLd;
+    float* sp = (float*) (ph + M * kDsaMmaPLd);   // [2][M][32]
+    float* alpha_s = sp + 2 * M * 32;
+    float* l_s = alpha_s + M;
+
+    const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
+    const int h0 = blockIdx.x * M;
+    const int t = blockIdx.y;
+    const int qd = qk_nope + R;
+    const float scale = rsqrtf((float) qd);
+
+    for (int i = tid; i < M * D; i += 256) {
+        const int h = i / D, e = i - h * D;
+        const int gh = h0 + h;
+        float v = 0.0f;
+        if (gh < n_heads) {
+            if (e < W) v = q_lat_in[((size_t) gh * n_tokens + t) * W + e];
+            else v = q_full[((size_t) t * n_heads + gh) * qd + qk_nope + (e - W)];
+        }
+        qh[h * kDsaMmaLd + e] = __half_as_ushort(__float2half_rn(v * scale));
+    }
+
+    float m[2 * kDsaMmaG], l[2 * kDsaMmaG];
+#pragma unroll
+    for (int hh = 0; hh < 2 * kDsaMmaG; ++hh) {
+        const int gh = h0 + w * 2 * kDsaMmaG + hh;
+        m[hh] = gh < n_heads ? attn_sink[gh] : 0.0f;
+        l[hh] = 1.0f;
+    }
+    if (tid < M) l_s[tid] = 1.0f;
+
+    float acc[8 * kDsaMmaG][4];
+#pragma unroll
+    for (int j = 0; j < 8 * kDsaMmaG; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.0f;
+
+    const int id = lane >> 3, r8 = lane & 7, rg = w % kDsaMmaG, dq = w / kDsaMmaG;
+    const int kh = (w / kDsaMmaG) & 1, cp = w / (2 * kDsaMmaG);
+    const int32_t* sel = sel_idx + (size_t) t * sel_width;
+
+    // 32 cells * (576 / 8) chunks / 256 threads = 9 chunks per thread
+    constexpr int kPer = kDsaMmaCells * (D / 8) / 256;
+    uint4 pre[kPer];
+    auto fetch = [&](int j0) {
+#pragma unroll
+        for (int k = 0; k < kPer; ++k) {
+            const int i = tid + k * 256, c = i / (D / 8), ch = i - c * (D / 8);
+            const int32_t cell = (j0 + c < sel_width) ? sel[j0 + c] : -1;
+            pre[k] = cell >= 0 ? dsa_fetch_row8<FP8>(kv_cache, (size_t) cell, ch) : make_uint4(0, 0, 0, 0);
+        }
+    };
+
+    if (sel_width > 0 && sel[0] >= 0) fetch(0);
+    for (int j0 = 0; j0 < sel_width; j0 += kDsaMmaCells) {
+        const uint32_t bad = __ballot_sync(0xffffffffu, (j0 + lane >= sel_width) || (sel[j0 + lane] < 0));
+        const int tn = bad ? (__ffs(bad) - 1) : kDsaMmaCells;
+        if (tn == 0) break;
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < kPer; ++k) {
+            const int i = tid + k * 256, c = i / (D / 8), ch = i - c * (D / 8);
+            *reinterpret_cast<uint4*>(ks + c * kDsaMmaLd + ch * 8) = pre[k];
+        }
+        __syncthreads();
+        const int jnext = j0 + kDsaMmaCells;
+        if (tn == kDsaMmaCells && jnext < sel_width && sel[jnext] >= 0) fetch(jnext);
+
+        {   // S = Q K^T over D = 576 (18 k-steps of 16 per kh half = 9 pairs of 32)
+            float c[kDsaMmaG][4];
+#pragma unroll
+            for (int nt = 0; nt < kDsaMmaG; ++nt) c[nt][0] = c[nt][1] = c[nt][2] = c[nt][3] = 0.0f;
+#pragma unroll
+            for (int kk = 0; kk < 9; ++kk) {
+                const int kb = (kh * 18 + kk * 2) * 16;
+                uint32_t b[kDsaMmaG][4];
+#pragma unroll
+                for (int nt = 0; nt < kDsaMmaG; ++nt)
+                    dsa_ldsm4(b[nt], ks + ((cp * kDsaMmaG + nt) * 8 + r8) * kDsaMmaLd + kb + id * 8);
+#pragma unroll
+                for (int s2 = 0; s2 < 2; ++s2) {
+                    const int kd = kb + s2 * 16;
+                    uint32_t ah[4];
+                    dsa_ldsm4(ah, qh + (rg * 16 + (id & 1) * 8 + r8) * kDsaMmaLd + kd + (id >> 1) * 8);
+#pragma unroll
+                    for (int nt = 0; nt < kDsaMmaG; ++nt) dsa_mma16816h(c[nt], ah, b[nt][2 * s2], b[nt][2 * s2 + 1]);
+                }
+            }
+            const int row = rg * 16 + (lane >> 2);
+#pragma unroll
+            for (int nt = 0; nt < kDsaMmaG; ++nt) {
+                const int col = (cp * kDsaMmaG + nt) * 8 + (lane & 3) * 2;
+                sp[(kh * M + row) * 32 + col] = c[nt][0];
+                sp[(kh * M + row) * 32 + col + 1] = c[nt][1];
+                sp[(kh * M + row + 8) * 32 + col] = c[nt][2];
+                sp[(kh * M + row + 8) * 32 + col + 1] = c[nt][3];
+            }
+        }
+        __syncthreads();
+
+        // Online softmax: 1 lane per key in the 32-key tile
+#pragma unroll
+        for (int hh = 0; hh < 2 * kDsaMmaG; ++hh) {
+            const int h = w * 2 * kDsaMmaG + hh;
+            const bool valid = lane < tn;
+            const float sc = valid ? sp[h * 32 + lane] + sp[(M + h) * 32 + lane] : -INFINITY;
+            const float mx = warp_max(sc);
+            const float nm = fmaxf(m[hh], mx);
+            const float alpha = expf(m[hh] - nm);
+            const float pr = valid ? expf(sc - nm) : 0.0f;
+            const float sum = warp_sum(pr);
+            l[hh] = l[hh] * alpha + sum;
+            m[hh] = nm;
+            ph[h * kDsaMmaPLd + lane] = __half_as_ushort(__float2half_rn(pr));
+            if (lane == 0) {
+                alpha_s[h] = alpha;
+                l_s[h] = l[hh];
+            }
+        }
+        __syncthreads();
+
+        // O = O * alpha + P V (V is the leading W = 512 c_kv columns of ks)
+        {
+            const float a0 = alpha_s[rg * 16 + (lane >> 2)], a1 = alpha_s[rg * 16 + (lane >> 2) + 8];
+#pragma unroll
+            for (int j = 0; j < 8 * kDsaMmaG; ++j) {
+                acc[j][0] *= a0; acc[j][1] *= a0;
+                acc[j][2] *= a1; acc[j][3] *= a1;
+            }
+#pragma unroll
+            for (int s2 = 0; s2 < 2; ++s2) {
+                uint32_t ah[4];
+                dsa_ldsm4(ah, ph + (rg * 16 + (id & 1) * 8 + r8) * kDsaMmaPLd + s2 * 16 + (id >> 1) * 8);
+#pragma unroll
+                for (int jj = 0; jj < 4 * kDsaMmaG; ++jj) {
+                    uint32_t b[4];
+                    dsa_ldsm4t(b, ks + (s2 * 16 + (id & 1) * 8 + r8) * kDsaMmaLd + dq * (W / (2 * kDsaMmaG)) + jj * 16 +
+                                      (id >> 1) * 8);
+                    dsa_mma16816h(acc[2 * jj], ah, b[0], b[1]);
+                    dsa_mma16816h(acc[2 * jj + 1], ah, b[2], b[3]);
+                }
+            }
+        }
+        if (tn < kDsaMmaCells) break;
+    }
+
+    __syncthreads();
+    const int row = rg * 16 + (lane >> 2);
+    const int g0 = h0 + row, g1 = h0 + row + 8;
+    const float i0 = 1.0f / l_s[row], i1 = 1.0f / l_s[row + 8];
+#pragma unroll
+    for (int j = 0; j < 8 * kDsaMmaG; ++j) {
+        const int d = dq * (W / (2 * kDsaMmaG)) + j * 8 + (lane & 3) * 2;
+        if (g0 < n_heads) {
+            uint16_t* o0 = o_lat_f16 + ((size_t) g0 * n_tokens + t) * W + d;
+            o0[0] = __half_as_ushort(__float2half_rn(acc[j][0] * i0));
+            o0[1] = __half_as_ushort(__float2half_rn(acc[j][1] * i0));
+        }
+        if (g1 < n_heads) {
+            uint16_t* o1 = o_lat_f16 + ((size_t) g1 * n_tokens + t) * W + d;
+            o1[0] = __half_as_ushort(__float2half_rn(acc[j][2] * i1));
+            o1[1] = __half_as_ushort(__float2half_rn(acc[j][3] * i1));
+        }
+    }
+}
+
+#endif  // __CUDA_ARCH__ >= 800
+
 // Dequantizes `n_keys` rows of `idx_k_cache[k0 .. k0+n_keys)` into BF16 `[n_keys, idx_dim]` for Tensor-Core GEMM.
 // Every MXFP4 E2M1 value (3-bit mantissa, 8-bit UE8M0 exponent) is bit-exact in BF16 with zero overflow/underflow.
 __global__ void dsa_dequant_idx_k_bf16_kernel(const uint8_t* __restrict__ idx_k_cache, int k0, int idx_dim, bool fp8,
@@ -1028,8 +1262,34 @@ void dsa_mla_attention_preabsorbed(const float* q_lat, const float* q_full, cons
                                    int qk_nope, int qk_rope, int kv_lora, int sel_width, bool fp8,
                                    uint16_t* o_lat_f16, void* stream) {
     if (n_tokens <= 0) return;
-    (void) qk_rope;
-    (void) kv_lora;
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    if (n_tokens > 8 && kv_lora == 512 && qk_rope == 64) {
+        static bool smem_raised[2] = {false, false};
+        static bool mma_usable[2] = {false, false};
+        const int sel = fp8 ? 1 : 0;
+        if (!smem_raised[sel]) {
+            const cudaError_t err =
+                fp8
+                    ? cudaFuncSetAttribute(dsa_mla_attention_preabsorbed_mma512_kernel<true>,
+                                           cudaFuncAttributeMaxDynamicSharedMemorySize, (int) dsa_mma512_smem())
+                    : cudaFuncSetAttribute(dsa_mla_attention_preabsorbed_mma512_kernel<false>,
+                                           cudaFuncAttributeMaxDynamicSharedMemorySize, (int) dsa_mma512_smem());
+            mma_usable[sel] = err == cudaSuccess;
+            if (!mma_usable[sel]) cudaGetLastError();
+            smem_raised[sel] = true;
+        }
+        if (mma_usable[sel]) {
+            const dim3 grid((n_heads + 16 * kDsaMmaG - 1) / (16 * kDsaMmaG), n_tokens);
+            if (fp8)
+                dsa_mla_attention_preabsorbed_mma512_kernel<true><<<grid, 256, dsa_mma512_smem(), (cudaStream_t) stream>>>(
+                    q_lat, q_full, kv_cache, attn_sink, sel_idx, n_tokens, n_heads, qk_nope, sel_width, o_lat_f16);
+            else
+                dsa_mla_attention_preabsorbed_mma512_kernel<false><<<grid, 256, dsa_mma512_smem(), (cudaStream_t) stream>>>(
+                    q_lat, q_full, kv_cache, attn_sink, sel_idx, n_tokens, n_heads, qk_nope, sel_width, o_lat_f16);
+            return;
+        }
+    }
+#endif
     dsa_mla_attention_preabsorbed_gqa512_kernel<<<dim3((n_heads + 7) / 8, n_tokens), 256, 0, (cudaStream_t) stream>>>(
         q_lat, q_full, kv_cache, attn_sink, sel_idx, n_tokens, n_heads, qk_nope, sel_width, fp8, o_lat_f16);
 }

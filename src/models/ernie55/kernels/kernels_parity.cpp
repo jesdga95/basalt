@@ -1284,6 +1284,266 @@ void test_prefill_fast_kernels() {
     }
 }
 
+// -----------------------------------------------------------------------------
+// 9. HCA tensor-core prefill attention (hca_attention with n_tokens = 32 > 8, n_heads = 24): the mma512 kernel
+//    against an FP64 reference and against the scalar path one token at a time, in FP8 and FP16 cache modes. The
+//    positions cross a 128-block boundary (1 vs 2 compressed blocks), the window spans win_cache ring slots and the
+//    current chunk's kv_rot rows, every head carries an attn_sink, and heads 24..31 are MMA padding that must never
+//    write out of bounds.
+// -----------------------------------------------------------------------------
+double e4m3_code_f64(int b) {
+    const int e = (b >> 3) & 15, m = b & 7;
+    const double sgn = (b & 0x80) ? -1.0 : 1.0;
+    if (e == 0) return sgn * (double) m * std::ldexp(1.0, -9);
+    return sgn * std::ldexp(1.0 + (double) m / 8.0, e - 7);
+}
+
+void test_hca_mma512() {
+    const int T = 32, HD = 512, ratio = 128, win = 128, cap = 128;
+    const int pos0 = 250;   // the chunk crosses the 256 boundary: tokens see 1 or 2 closed compressed blocks
+    std::vector<int32_t> pos(T);
+    for (int t = 0; t < T; ++t) pos[t] = pos0 + t;
+    DevBuf<int32_t> dpos(T);
+    dpos.upload(pos);
+
+    for (int NH : {24, 64}) {
+    auto q_all = rand_vec((size_t) T * NH * HD, -0.4f, 0.4f, 901 + NH);
+    auto sink = rand_vec(NH, -1.0f, 1.0f, 902 + NH);
+
+    DevBuf<float> dq(q_all.size()), dsink(NH);
+    dq.upload(q_all); dsink.upload(sink);
+
+    for (bool fp8 : {false, true}) {
+        const size_t row_bytes = fp8 ? (size_t) layout::kHcaFp8RowBytes : (size_t) HD * 2;
+        const int n_slots = 4 + cap;   // 4 compressed blocks + the window ring
+        // The caches as raw bytes and their exact FP64 dequantizations: what the kernels read.
+        std::vector<uint8_t> cache((size_t) n_slots * row_bytes, 0);
+        std::vector<std::vector<double>> deq(n_slots, std::vector<double>(HD, 0.0));
+        uint32_t st = fp8 ? 11u : 12u;
+        auto rnd = [&st](float lo, float hi) {
+            st = st * 1664525u + 1013904223u;
+            return lo + (float) (st >> 8) / 16777216.0f * (hi - lo);
+        };
+        for (int s = 0; s < n_slots; ++s) {
+            uint8_t* r = cache.data() + (size_t) s * row_bytes;
+            if (!fp8) {
+                __half* h = reinterpret_cast<__half*>(r);
+                for (int c = 0; c < HD; ++c) {
+                    h[c] = __float2half_rn(rnd(-0.5f, 0.5f));
+                    deq[s][c] = __half2float(h[c]);
+                }
+                continue;
+            }
+            float scales[7];   // powers of two, exact in FP16; 64 values a group (448 nope = 7 groups)
+            for (int g = 0; g < 7; ++g) {
+                scales[g] = (float) std::ldexp(1.0, -6 - ((s + g) % 6));
+                std::memcpy(r + 448 + 4 * g, &scales[g], 4);
+            }
+            for (int c = 0; c < 448; ++c) {
+                st = st * 1664525u + 1013904223u;
+                uint8_t b = (uint8_t) (st >> 24);
+                if ((b & 0x7f) >= 0x7e) b &= 0x70;   // no NaN codes
+                r[c] = b;
+                deq[s][c] = e4m3_code_f64(b) * (double) scales[c >> 6];
+            }
+            for (int c = 0; c < 64; ++c) {
+                const uint16_t bf = __bfloat16_as_ushort(__float2bfloat16(rnd(-0.5f, 0.5f)));
+                std::memcpy(r + 476 + 2 * c, &bf, 2);
+                deq[s][448 + c] = __bfloat162float(__ushort_as_bfloat16(bf));
+            }
+        }
+        // The current chunk's kv_rot rows, derived from their window ring slots (exactly representable in the cache's
+        // format): the MMA path reads a chunk row from kv_rot as F32, the scalar path a single token reads its own row
+        // from kv_rot and the earlier ones from win_cache, and every path then sees the same values.
+        std::vector<float> kv_rot((size_t) T * HD);
+        for (int t = 0; t < T; ++t)
+            for (int c = 0; c < HD; ++c)
+                kv_rot[(size_t) t * HD + c] = (float) deq[4 + ((pos0 + t) % cap)][c];
+
+        DevBuf<uint8_t> dcomp((size_t) 4 * row_bytes), dwin((size_t) cap * row_bytes);
+        DevBuf<float> dkv_rot(kv_rot.size());
+        CUDA_CHECK(cudaMemcpy(dcomp.ptr, cache.data(), 4 * row_bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dwin.ptr, cache.data() + 4 * row_bytes, (size_t) cap * row_bytes, cudaMemcpyHostToDevice));
+        dkv_rot.upload(kv_rot);
+
+        // the FP64 reference: compressed blocks [0 .. n_comp) + the window (a chunk row's slot equals its kv_rot row)
+        std::vector<double> ref((size_t) T * NH * HD, 0.0);
+        for (int t = 0; t < T; ++t) {
+            const int p = pos[t];
+            const int n_comp = (p + 1) / ratio;
+            const int ws = p - (win - 1) > 0 ? p - (win - 1) : 0;
+            std::vector<const std::vector<double>*> rows;
+            for (int j = 0; j < n_comp; ++j) rows.push_back(&deq[j]);
+            for (int jp = ws; jp <= p; ++jp) rows.push_back(&deq[4 + (jp % cap)]);
+            for (int h = 0; h < NH; ++h) {
+                const float* qrow = q_all.data() + ((size_t) t * NH + h) * HD;
+                double m = sink[h], l = 1.0;
+                std::vector<double> acc(HD, 0.0);
+                for (const auto* row : rows) {
+                    double dot = 0.0;
+                    for (int c = 0; c < HD; ++c) dot += (double) qrow[c] * (*row)[c];
+                    const double sc = dot / std::sqrt((double) HD);
+                    const double mn = std::max(m, sc);
+                    const double alpha = std::exp(m - mn), beta = std::exp(sc - mn);
+                    l = l * alpha + beta;
+                    m = mn;
+                    for (int c = 0; c < HD; ++c) acc[c] = acc[c] * alpha + beta * (*row)[c];
+                }
+                for (int c = 0; c < HD; ++c) ref[((size_t) t * NH + h) * HD + c] = acc[c] / l;
+            }
+        }
+
+        // the MMA tensor-core path (n_tokens = 32) and the scalar path one token at a time (n_tokens = 1)
+        DevBuf<float> dmma((size_t) T * NH * HD), d1((size_t) T * NH * HD);
+        hca_attention(dq.ptr, dcomp.ptr, dwin.ptr, dkv_rot.ptr, dsink.ptr, dpos.ptr, T, NH, HD, win, ratio, fp8,
+                      dmma.ptr, nullptr);
+        for (int t = 0; t < T; ++t)
+            hca_attention(dq.ptr + (size_t) t * NH * HD, dcomp.ptr, dwin.ptr, dkv_rot.ptr + (size_t) t * HD,
+                          dsink.ptr, dpos.ptr + t, 1, NH, HD, win, ratio, fp8, d1.ptr + (size_t) t * NH * HD, nullptr);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<float> hmm((size_t) T * NH * HD), h1((size_t) T * NH * HD);
+        dmma.download(hmm); d1.download(h1);
+
+        char name[112];
+        std::vector<double> h1d(h1.begin(), h1.end());
+        std::snprintf(name, sizeof name, "hca_attention mma512 (32 tok, %d heads, %s) vs fp64", NH, fp8 ? "fp8" : "f16");
+        check_tol(name, rel_l2_err(hmm, ref), 2e-3);
+        std::snprintf(name, sizeof name, "hca_attention mma512 (32 tok, %d heads, %s) vs scalar/token", NH, fp8 ? "fp8" : "f16");
+        check_tol(name, rel_l2_err(hmm, h1d), 2e-3);
+        std::snprintf(name, sizeof name, "hca_attention gqa512 (%d heads, %s) vs fp64", NH, fp8 ? "fp8" : "f16");
+        check_tol(name, rel_l2_err(h1, ref), 2e-3);
+    }
+    }
+}
+
+void test_dsa_preabsorbed_mma512() {
+    const int T = 32, NH = 64, kLora = 512, kNope = 192, kRope = 64, kQd = kNope + kRope;
+    const int n_cells = 140, sel_w = 100;
+    auto q_lat = rand_vec((size_t) NH * T * kLora, -0.35f, 0.35f, 1101);
+    auto q_full = rand_vec((size_t) T * NH * kQd, -0.35f, 0.35f, 1102);
+    auto sink = rand_vec(NH, -1.0f, 1.0f, 1103);
+
+    // Varying valid prefix lengths across tokens (including partial 32-key tiles, full tiles, and sentinel -1)
+    std::vector<int32_t> sel_idx((size_t) T * sel_w, -1);
+    uint32_t rng = 4242u;
+    for (int t = 0; t < T; ++t) {
+        const int n_valid = (t == 0) ? 0 : (t == 1 ? 17 : (t % 3 == 0 ? sel_w : 32 + (t * 7) % (sel_w - 32)));
+        for (int s = 0; s < n_valid; ++s) {
+            rng = rng * 1664525u + 1013904223u;
+            sel_idx[(size_t) t * sel_w + s] = (int32_t) ((rng >> 8) % (uint32_t) n_cells);
+        }
+    }
+
+    DevBuf<float> dql(q_lat.size()), dqf(q_full.size()), dsink(NH);
+    DevBuf<int32_t> dsel(sel_idx.size());
+    dql.upload(q_lat); dqf.upload(q_full); dsink.upload(sink); dsel.upload(sel_idx);
+
+    for (bool fp8 : {false, true}) {
+        const size_t row_bytes = fp8 ? (size_t) layout::kDsaFp8RowBytes : (size_t) (kLora + kRope) * 2;
+        std::vector<uint8_t> cache((size_t) n_cells * row_bytes, 0);
+        std::vector<std::vector<double>> deq(n_cells, std::vector<double>(kLora + kRope, 0.0));
+        uint32_t st = fp8 ? 31u : 32u;
+        auto rnd = [&st](float lo, float hi) {
+            st = st * 1664525u + 1013904223u;
+            return lo + (float) (st >> 8) / 16777216.0f * (hi - lo);
+        };
+        for (int s = 0; s < n_cells; ++s) {
+            uint8_t* r = cache.data() + (size_t) s * row_bytes;
+            if (!fp8) {
+                __half* h = reinterpret_cast<__half*>(r);
+                for (int c = 0; c < kLora + kRope; ++c) {
+                    h[c] = __float2half_rn(rnd(-0.5f, 0.5f));
+                    deq[s][c] = __half2float(h[c]);
+                }
+            } else {
+                float scales[4];
+                for (int g = 0; g < 4; ++g) {
+                    scales[g] = (float) std::ldexp(1.0, -6 - ((s + g) % 5));
+                    std::memcpy(r + kLora + 4 * g, &scales[g], 4);
+                }
+                for (int c = 0; c < kLora; ++c) {
+                    st = st * 1664525u + 1013904223u;
+                    uint8_t b = (uint8_t) (st >> 24);
+                    if ((b & 0x7f) >= 0x7e) b &= 0x70;
+                    r[c] = b;
+                    deq[s][c] = e4m3_code_f64(b) * (double) scales[c >> 7];
+                }
+                for (int c = 0; c < kRope; ++c) {
+                    const uint16_t bf = __bfloat16_as_ushort(__float2bfloat16(rnd(-0.5f, 0.5f)));
+                    std::memcpy(r + 528 + 2 * c, &bf, 2);
+                    deq[s][kLora + c] = __bfloat162float(__ushort_as_bfloat16(bf));
+                }
+            }
+        }
+
+        DevBuf<uint8_t> dkv(cache.size());
+        dkv.upload(cache);
+
+        std::vector<double> ref((size_t) NH * T * kLora, 0.0);
+        const double scale = 1.0 / std::sqrt((double) kQd);
+        for (int t = 0; t < T; ++t) {
+            for (int h = 0; h < NH; ++h) {
+                const float* ql = q_lat.data() + ((size_t) h * T + t) * kLora;
+                const float* qp = q_full.data() + ((size_t) t * NH + h) * kQd + kNope;
+                double m = sink[h], l = 1.0;
+                std::vector<double> acc(kLora, 0.0);
+                for (int s = 0; s < sel_w; ++s) {
+                    const int32_t cell = sel_idx[(size_t) t * sel_w + s];
+                    if (cell < 0) break;
+                    double dot = 0.0;
+                    for (int c = 0; c < kLora; ++c) dot += (double) ql[c] * deq[cell][c];
+                    for (int c = 0; c < kRope; ++c) dot += (double) qp[c] * deq[cell][kLora + c];
+                    const double sc = dot * scale;
+                    const double mn = std::max(m, sc);
+                    const double alpha = std::exp(m - mn), beta = std::exp(sc - mn);
+                    l = l * alpha + beta;
+                    m = mn;
+                    for (int c = 0; c < kLora; ++c) acc[c] = acc[c] * alpha + beta * deq[cell][c];
+                }
+                for (int c = 0; c < kLora; ++c) ref[((size_t) h * T + t) * kLora + c] = acc[c] / l;
+            }
+        }
+
+        DevBuf<uint16_t> dmma((size_t) NH * T * kLora);
+        dsa_mla_attention_preabsorbed(dql.ptr, dqf.ptr, dkv.ptr, dsink.ptr, dsel.ptr, T, NH, kNope, kRope, kLora,
+                                      sel_w, fp8, dmma.ptr, nullptr);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<uint16_t> hmm16((size_t) NH * T * kLora);
+        dmma.download(hmm16);
+        std::vector<float> hmm(hmm16.size());
+        for (size_t i = 0; i < hmm16.size(); ++i) hmm[i] = __half2float(__ushort_as_half(hmm16[i]));
+
+        char name[112];
+        std::snprintf(name, sizeof name, "dsa_mla preabsorbed mma512 (32 tok, 64 heads, %s) vs fp64",
+                      fp8 ? "fp8" : "f16");
+        check_tol(name, rel_l2_err(hmm, ref), 3e-3);
+    }
+}
+
+void test_mhc_prefill() {
+    const int T = 29, H = 4096, flat = kHcMult * H;   // non-multiple of 8 tokens to exercise tail guard
+    auto x = rand_vec((size_t) T * flat, -1.0f, 1.0f, 1201);
+    auto fn = rand_vec((size_t) kHcCoef * flat, -0.05f, 0.05f, 1202);
+    auto sc = rand_vec(3, 0.5f, 1.5f, 1203);
+    auto bs = rand_vec(kHcCoef, -0.5f, 0.5f, 1204);
+
+    DevBuf<float> dx(x.size()), dfn(fn.size()), dsc(3), dbs(kHcCoef);
+    DevBuf<float> dws(mhc_workspace_bytes(T) / sizeof(float));
+    DevBuf<float> dcoef_prefill((size_t) T * kHcCoef), dcoef_single((size_t) T * kHcCoef);
+    dx.upload(x); dfn.upload(fn); dsc.upload(sc); dbs.upload(bs);
+
+    mhc_mixes(dx.ptr, dfn.ptr, dsc.ptr, dbs.ptr, T, H, 1e-6f, 1e-4f, 20, dws.ptr, dcoef_prefill.ptr, nullptr);
+    for (int t = 0; t < T; ++t) {
+        mhc_mixes(dx.ptr + (size_t) t * flat, dfn.ptr, dsc.ptr, dbs.ptr, 1, H, 1e-6f, 1e-4f, 20, dws.ptr,
+                  dcoef_single.ptr + (size_t) t * kHcCoef, nullptr);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<float> hp((size_t) T * kHcCoef), hs((size_t) T * kHcCoef);
+    dcoef_prefill.download(hp); dcoef_single.download(hs);
+    std::vector<double> hsd(hs.begin(), hs.end());
+    check_tol("mhc_mixes prefill (29 tok, H=4096) vs single-token", rel_l2_err(hp, hsd), 1e-5);
+}
+
 int main() {
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) {
@@ -1291,12 +1551,15 @@ int main() {
         return 77;
     }
     test_mhc();
+    test_mhc_prefill();
     test_elementwise_and_router();
     test_hca();
     test_mla_dsa();
     test_dsa_split();
     test_fused();
     test_prefill_fast_kernels();
+    test_hca_mma512();
+    test_dsa_preabsorbed_mma512();
     std::printf("ernie55_kernels_parity: %d failure(s)\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

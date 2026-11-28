@@ -64,13 +64,16 @@ constexpr uint64_t kBesideHomesReserveBytes = 512ull << 20;
 constexpr uint64_t kModuleRoomBytes = 7ull << 27;
 
 /// Computes ExpertTier VRAM reserves so cards holding permanent VRAM homes (`homes_.main > 0`) always leave
-/// enough free VRAM for prompt MMQ staging, MMQ stream-k headroom, and first-prompt module loads.
-inline TierReserve plan_tier_reserve(uint64_t home_prompt_bytes, uint64_t mmq_headroom_bytes) {
+/// enough free VRAM for prompt MMQ staging, the prompt expert ring beside the homes, MMQ stream-k headroom, and
+/// first-prompt module loads. `home_ring_bytes` is the double-buffered prefill expert ring the prompt path opens
+/// next to the homes (0: no ring, as before).
+inline TierReserve plan_tier_reserve(uint64_t home_prompt_bytes, uint64_t mmq_headroom_bytes,
+                                     uint64_t home_ring_bytes = 0) {
     TierReserve r;
     r.copies = kCopiesReserveBytes;
     r.beside_homes = kBesideHomesReserveBytes;
     r.modules = kModuleRoomBytes;
-    r.homes = home_prompt_bytes + mmq_headroom_bytes + kModuleRoomBytes;
+    r.homes = home_prompt_bytes + home_ring_bytes + mmq_headroom_bytes + kModuleRoomBytes;
     return r;
 }
 
