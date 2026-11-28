@@ -36,22 +36,17 @@ const JsonValue* deref(const JsonValue* root, const JsonValue* s) {
         size_t pos = 2;
         while (cur && pos <= r->s.size()) {
             size_t e = r->s.find('/', pos);
-            std::string part = r->s.substr(pos, e == std::string::npos ? std::string::npos : e - pos);
+            std::string_view raw = std::string_view(r->s).substr(pos, e == std::string::npos ? std::string::npos : e - pos);
+            std::string part;
+            if (!json_pointer_unescape(raw, part)) {
+                cur = nullptr;
+                break;
+            }
             if (cur->is(Type::Object)) {
                 cur = cur->get(part);
             } else if (cur->is(Type::Array)) {
-                const size_t limit = cur->items.size();
-                bool ok_idx = !part.empty() && limit > 0;
                 size_t idx = 0;
-                for (size_t k = 0; ok_idx && k < part.size(); ++k) {
-                    const char ch = part[k];
-                    if (ch < '0' || ch > '9') { ok_idx = false; break; }
-                    const size_t d = (size_t) (ch - '0');
-                    if (idx > ((std::numeric_limits<size_t>::max)() - d) / 10) { ok_idx = false; break; }
-                    idx = idx * 10 + d;
-                    if (idx >= limit) { ok_idx = false; break; }
-                }
-                cur = ok_idx ? &cur->items[idx] : nullptr;
+                cur = json_pointer_index(part, cur->items.size(), idx) ? &cur->items[idx] : nullptr;
             } else {
                 cur = nullptr;
             }
@@ -424,7 +419,7 @@ std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptio
     const std::string one = "(" + join(fns, " | ") + ")";
     const bool shared_block = form.calls_share_block && opt.multiple_calls;
     const std::string call_rule =
-        c.add_rule("call", literal(form.call_open) + " " + (shared_block ? one + " (" + literal("\n") + " " + one + ")*" : one) + " " + literal(form.call_close));
+        c.add_rule("call", literal(form.call_open) + " " + (shared_block ? one + " ([ \\t\\n]* " + one + ")*" : one) + " " + literal(form.call_close));
     std::string root = opt.multiple_calls && !form.calls_share_block ? call_rule + " ([ \\t\\n]* " + call_rule + ")*" : call_rule;
     if (!opt.answer_schema.empty()) {
         JsonValue answer;
@@ -458,6 +453,7 @@ void collect_names(const JsonValue& tools, std::vector<std::string>& names) {
 }  // namespace
 
 RequestGrammar grammar_from_request(const std::string& grammar_json, std::string& err) {
+    err.clear();
     RequestGrammar out;
     JsonValue req;
     if (!read_json(grammar_json, req, err)) return out;

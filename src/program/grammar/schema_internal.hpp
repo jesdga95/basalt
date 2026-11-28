@@ -4,15 +4,51 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
 #include "json_value.hpp"
 
 namespace basalt::program::grammar {
+
+/// Unescapes one RFC 6901 JSON Pointer reference token (~1 -> /, ~0 -> ~) in a single left-to-right pass.
+inline bool json_pointer_unescape(std::string_view token, std::string& out) {
+    out.clear();
+    out.reserve(token.size());
+    for (size_t i = 0; i < token.size(); ++i) {
+        if (token[i] != '~') {
+            out += token[i];
+        } else {
+            if (i + 1 >= token.size()) return false;
+            const char next = token[++i];
+            if (next == '0') out += '~';
+            else if (next == '1') out += '/';
+            else return false;
+        }
+    }
+    return true;
+}
+
+/// Strict RFC 6901 array index parser ("0" or [1-9][0-9]* within [0, limit)).
+inline bool json_pointer_index(std::string_view token, size_t limit, size_t& idx) {
+    if (token.empty() || limit == 0) return false;
+    if (token.size() > 1 && token[0] == '0') return false;
+    size_t v = 0;
+    for (char ch : token) {
+        if (ch < '0' || ch > '9') return false;
+        const size_t d = (size_t) (ch - '0');
+        if (v > ((std::numeric_limits<size_t>::max)() - d) / 10) return false;
+        v = v * 10 + d;
+        if (v >= limit) return false;
+    }
+    idx = v;
+    return true;
+}
 
 struct SchemaNode;
 using SchemaPtr = std::unique_ptr<SchemaNode>;
@@ -36,6 +72,8 @@ struct SchemaNode {
     // Const (one value) / Enum
     std::vector<JsonValue> values;
     // Integer bounds, inclusive
+    bool has_minimum = false;
+    bool has_maximum = false;
     int64_t minimum = INT64_MIN;
     int64_t maximum = INT64_MAX;
     // String

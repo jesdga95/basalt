@@ -152,6 +152,10 @@ public:
     /// all ones. The mask of a recent stack set is kept (shared by the clones), so a repeated position is a copy;
     ///  false always walks the vocabulary.
     void fill_mask(const Vocab& vocab, std::vector<uint8_t>& out, bool use_cache = true) const;
+    /// Same mask bytes as fill_mask, returning a direct pointer into the shared mask cache on hit without copying into
+    /// `scratch`. The pointer stays valid until the next fill_mask/fill_mask_view call on this state or a clone sharing
+    /// its arena.
+    const uint8_t* fill_mask_view(const Vocab& vocab, std::vector<uint8_t>& scratch, bool use_cache = true) const;
 
     /// A copy to rewind to: the arena of interned stacks is shared, so this is cheap.
     GrammarState clone() const { return *this; }

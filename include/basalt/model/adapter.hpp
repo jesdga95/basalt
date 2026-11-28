@@ -30,6 +30,7 @@ namespace basalt::core {
 struct ConversationKv;
 struct Json;
 class LoadPlan;
+class ModelFile;
 }
 namespace basalt::program {
 struct CommonOptions;
@@ -414,8 +415,12 @@ public:
     };
     virtual PreTokenizer pretokenizer() const = 0;
     virtual program::grammar::ToolForm tool_form() const = 0;
+    /// Pack-aware tool form (for models whose special tags carry a pack-specific suffix); defaults to tool_form().
+    virtual program::grammar::ToolForm tool_form(const core::ModelFile& /*file*/) const { return tool_form(); }
     /// Where the model's reply holds its thinking, for the grammar guard (the default: a <think> block).
     virtual program::grammar::ReplyForm reply_form() const { return {}; }
+    /// Pack-aware reply form; defaults to reply_form().
+    virtual program::grammar::ReplyForm reply_form(const core::ModelFile& /*file*/) const { return reply_form(); }
     /// The options object of this model: the common flags and its own.
     virtual std::unique_ptr<program::CommonOptions> make_options() const;
     /// Takes a flag outside the common set; false when this model has no such flag. `code`: an exit code for a bad value.

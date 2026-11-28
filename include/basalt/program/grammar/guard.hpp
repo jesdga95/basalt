@@ -81,7 +81,7 @@ private:
     bool feed(int32_t token);
     void build_first_mask();
     bool opens_block(int32_t token);
-    void mask_bias(const std::vector<float>& user_bias, bool use_cache, std::vector<float>& bias);
+    bool mask_bias(const std::vector<float>& user_bias, bool use_cache);
     std::string describe() const;
 
     // a reply of blocks, outside a thinking block: where it is before (and after) the answer
@@ -91,9 +91,11 @@ private:
     PackVocab pv_;
     GrammarState st_;
     std::vector<uint8_t> mask_;
+    std::vector<float> bias_;
     bool on_ = false;
     bool thinking_ = false;
     bool blocks_ = false;        // this request's reply is read as blocks
+    bool header_starts_call_ = false;  // a grammar of blocks also allows tool calls opening with block_header
     bool ban_think_ = false;     // a reply of blocks that may not think, outside a grammar of blocks: no thinking block opens
     bool after_header_ = false;  // the last token opened a block
     bool has_grammar_ = false;

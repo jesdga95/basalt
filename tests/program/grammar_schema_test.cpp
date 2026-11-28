@@ -551,6 +551,10 @@ static void test_schema_regressions() {
         CHECK(num_frac && !ok(num_frac, "0") && ok(num_frac, "1") && ok(num_frac, "9") && !ok(num_frac, "10"));
         auto num_huge = build(R"({"allOf":[{"type":"integer"},{"type":"number","maximum":1e300}]})");
         CHECK(num_huge && ok(num_huge, "123456789"));
+        auto num_only_huge = build(R"({"type":"number","minimum":-1e300,"maximum":1e300})");
+        CHECK(num_only_huge && ok(num_only_huge, "1.5") && ok(num_only_huge, "-1e100"));
+        auto int_min_num = build(R"({"allOf":[{"type":"integer","minimum":-9223372036854775808},{"type":"number","maximum":5}]})");
+        CHECK(int_min_num && ok(int_min_num, "-9223372036854775808") && ok(int_min_num, "5") && !ok(int_min_num, "6") && !ok(int_min_num, "-9223372036854775809"));
     }
 
     // R2C-1: number_text overflow, ULLONG_MAX, and malformed JSON numbers
@@ -662,6 +666,145 @@ static void test_schema_regressions() {
         auto star_req_addl = build(R"({"type":"object","properties":{"*":{"type":"integer"}},"required":["*"],"additionalProperties":{"type":"string"}})");
         CHECK(star_req_addl && ok(star_req_addl, R"({"*":1})") && ok(star_req_addl, R"({"*":1,"k":"v"})") &&
               !ok(star_req_addl, R"({"*":"v"})") && !ok(star_req_addl, R"({"*":1,"*":"v"})"));
+    }
+
+    // R9-21: strict count/bound parsing, simultaneous minimum+exclusiveMinimum / maximum+exclusiveMaximum, overflow & UB guards
+    {
+        // get_count 32-bit truncation, negative wrap, and ERANGE overflow must fail
+        for (const char* bad_cnt : {
+                 R"({"type":"string","minLength":4294967296})",
+                 R"({"type":"string","minLength":4294967297})",
+                 R"({"type":"string","maxLength":2147483648})",
+                 R"({"type":"string","minLength":99999999999999999999999})",
+                 R"({"type":"array","items":{"type":"integer"},"minItems":4294967296})",
+                 R"({"type":"array","items":{"type":"integer"},"maxItems":-1})",
+             }) {
+            err.clear();
+            CHECK(json_schema_to_gbnf(bad_cnt, err).empty() && !err.empty());
+        }
+        // Simultaneous minimum + exclusiveMinimum / maximum + exclusiveMaximum keep the tighter bound
+        auto both_min = build(R"({"type":"integer","minimum":0,"exclusiveMinimum":5})");
+        CHECK(both_min && ok(both_min, "6") && ok(both_min, "100") && !ok(both_min, "5") && !ok(both_min, "0"));
+        auto both_min2 = build(R"({"type":"integer","minimum":10,"exclusiveMinimum":5})");
+        CHECK(both_min2 && ok(both_min2, "10") && !ok(both_min2, "9"));
+        auto both_max = build(R"({"type":"integer","maximum":10,"exclusiveMaximum":5})");
+        CHECK(both_max && ok(both_max, "4") && ok(both_max, "-5") && !ok(both_max, "5") && !ok(both_max, "10"));
+        auto both_max2 = build(R"({"type":"integer","maximum":3,"exclusiveMaximum":5})");
+        CHECK(both_max2 && ok(both_max2, "3") && !ok(both_max2, "4"));
+        // Fractional bounds round inwards
+        auto frac = build(R"({"type":"integer","minimum":0.5,"maximum":2.5})");
+        CHECK(frac && ok(frac, "1") && ok(frac, "2") && !ok(frac, "0") && !ok(frac, "3"));
+        auto frac_ex = build(R"({"type":"integer","exclusiveMinimum":1.5,"exclusiveMaximum":2.5})");
+        CHECK(frac_ex && ok(frac_ex, "2") && !ok(frac_ex, "1") && !ok(frac_ex, "3"));
+        // Exact INT64_MIN / INT64_MAX stay bounded (not erased as unbounded sentinel)
+        auto min_i64 = build(R"({"type":"integer","minimum":-9223372036854775808})");
+        CHECK(min_i64 && ok(min_i64, "-9223372036854775808") && ok(min_i64, "0") && !ok(min_i64, "-9223372036854775809"));
+        auto max_i64 = build(R"({"type":"integer","maximum":9223372036854775807})");
+        CHECK(max_i64 && ok(max_i64, "9223372036854775807") && ok(max_i64, "-1") && !ok(max_i64, "9223372036854775808"));
+        // Out-of-range integer / float bounds and INT64_MAX+1 / INT64_MIN-1 overflow must fail cleanly
+        for (const char* bad_bnd : {
+                 R"({"type":"integer","exclusiveMinimum":9223372036854775807})",
+                 R"({"type":"integer","exclusiveMaximum":-9223372036854775808})",
+                 R"({"type":"integer","minimum":99999999999999999999})",
+                 R"({"type":"integer","maximum":-99999999999999999999})",
+                 R"({"type":"integer","minimum":1e30})",
+                 R"({"type":"integer","maximum":9223372036854775808.0})",
+                 R"({"type":"integer","minimum":1e309})",
+                 R"({"type":"integer","maximum":-1e30})",
+             }) {
+            err.clear();
+            CHECK(json_schema_to_gbnf(bad_bnd, err).empty() && !err.empty());
+        }
+    }
+
+    // R9-22: reject "type": null / "" / non-string array elements; strict array index & RFC 6901 unescaping in $ref
+    {
+        for (const char* bad_type : {
+                 R"({"type":null})",
+                 R"({"type":""})",
+                 R"({"type":["string",null]})",
+                 R"({"type":[["string"]]})",
+                 R"({"type":[123]})",
+             }) {
+            err.clear();
+            CHECK(json_schema_to_gbnf(bad_type, err).empty() && !err.empty());
+        }
+        // RFC 6901 unescaping (~1 -> /, ~0 -> ~, ~01 -> ~1, ~10 -> /0) in resolve_ref()
+        auto ptr = build(R"({
+            "$defs": {
+                "a/b": {"type": "integer"},
+                "a~b": {"type": "boolean"},
+                "~1": {"type": "string"},
+                "/0": {"type": "null"}
+            },
+            "type": "object",
+            "properties": {
+                "p1": {"$ref": "#/$defs/a~1b"},
+                "p2": {"$ref": "#/$defs/a~0b"},
+                "p3": {"$ref": "#/$defs/~01"},
+                "p4": {"$ref": "#/$defs/~10"}
+            },
+            "required": ["p1", "p2", "p3", "p4"],
+            "additionalProperties": false
+        })");
+        CHECK(ptr && ok(ptr, R"({"p1":7,"p2":true,"p3":"ok","p4":null})") &&
+              !ok(ptr, R"({"p1":"no","p2":true,"p3":"ok","p4":null})"));
+        // Invalid JSON Pointer escape or malformed array index in resolve_ref() must fail
+        for (const char* bad_ref : {
+                 R"({"$defs":{"a~2b":{"type":"integer"}},"$ref":"#/$defs/a~2b"})",
+                 R"({"$defs":{"a~":{"type":"integer"}},"$ref":"#/$defs/a~"})",
+                 R"({"prefixItems":[{"type":"integer"}],"$ref":"#/prefixItems/0foo"})",
+                 R"({"prefixItems":[{"type":"integer"}],"$ref":"#/prefixItems/+0"})",
+                 R"({"prefixItems":[{"type":"integer"}],"$ref":"#/prefixItems/ 0"})",
+                 R"({"prefixItems":[{"type":"integer"}],"$ref":"#/prefixItems/01"})",
+                 R"({"prefixItems":[{"type":"integer"}],"$ref":"#/prefixItems/-0"})",
+             }) {
+            err.clear();
+            CHECK(json_schema_to_gbnf(bad_ref, err).empty() && !err.empty());
+        }
+        // RFC 6901 unescaping in schema.cpp deref() (tool parameter $ref to key with '/' and '~')
+        std::string dg = tool_call_gbnf(R"([{
+            "name": "f",
+            "parameters": {
+                "type": "object",
+                "$defs": {"num/int~v": {"type": "integer"}},
+                "properties": {"x": {"$ref": "#/$defs/num~1int~0v"}},
+                "required": ["x"]
+            }
+        }])", ToolGrammarOptions{}, err);
+        auto dgg = Grammar::parse(dg, err);
+        CHECK(dgg && ok(dgg, "<tool_call>\n<function=f>\n<parameter=x>\n42\n</parameter>\n</function>\n</tool_call>") &&
+              !pre(dgg, "<tool_call>\n<function=f>\n<parameter=x>\nhello"));
+    }
+
+    // R10-24: calls_share_block = true accepts adjacent and newline-separated calls inside one block
+    {
+        const ToolForm saved = tool_form();
+        ToolForm hf;
+        hf.call_open = "<tool_calls:opensource>";
+        hf.call_close = "</tool_calls:opensource>";
+        hf.fn_open = "<tool_call:opensource>";
+        hf.fn_close = "</tool_call:opensource>";
+        hf.param_open = "<arg_key:opensource>";
+        hf.param_mid_text = "</arg_key:opensource><arg_value:opensource>";
+        hf.param_mid_value = "</arg_key:opensource><arg_value:opensource>";
+        hf.param_close = "</arg_value:opensource>";
+        hf.text_end = "</arg_value:opensource>";
+        hf.calls_share_block = true;
+        hf.trigger = "<tool_calls:opensource>";
+        set_tool_form(hf);
+        err.clear();
+        std::string hg = tool_call_gbnf(R"([{"name":"ping","parameters":{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]}}])",
+                                        ToolGrammarOptions{}, err);
+        set_tool_form(saved);
+        auto hgg = Grammar::parse(hg, err);
+        CHECK(hgg);
+        const std::string c1 = "<tool_call:opensource>ping<arg_key:opensource>n</arg_key:opensource><arg_value:opensource>1</arg_value:opensource></tool_call:opensource>";
+        const std::string c2 = "<tool_call:opensource>ping<arg_key:opensource>n</arg_key:opensource><arg_value:opensource>2</arg_value:opensource></tool_call:opensource>";
+        CHECK(hgg && ok(hgg, "<tool_calls:opensource>" + c1 + "</tool_calls:opensource>"));
+        CHECK(hgg && ok(hgg, "<tool_calls:opensource>" + c1 + c2 + "</tool_calls:opensource>"));          // adjacent
+        CHECK(hgg && ok(hgg, "<tool_calls:opensource>" + c1 + "\n" + c2 + "</tool_calls:opensource>"));   // newline-separated
+        CHECK(hgg && !ok(hgg, "<tool_calls:opensource>" + c1 + "</tool_calls:opensource><tool_calls:opensource>" + c2 + "</tool_calls:opensource>"));
     }
 }
 

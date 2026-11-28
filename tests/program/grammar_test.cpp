@@ -483,6 +483,93 @@ static void test_partial_utf8() {
     CHECK(!nc3.allows("\xC3") && nc3.allows("\xC2"));
 }
 
+// R9-19 & R10-12: bit-exact parity between walk() / fill_mask() / fill_mask_view() and allows() across all overlong,
+// surrogate, >U+10FFFF, and boundary UTF-8 tokens, on both wide_uniform and non-wide_uniform grammars, plus LRU eviction.
+static void test_utf8_walk_and_mask_view_parity() {
+    std::vector<std::string> toks;
+    for (int i = 0; i < 256; ++i) toks.push_back(std::string(1, (char) i));
+    // All 46 illegal 2-byte continuation prefixes & full overlong/surrogate/>U+10FFFF sequences
+    for (int b = 0x80; b <= 0x9F; ++b) toks.push_back(std::string("\xE0") + (char) b);
+    for (int b = 0xA0; b <= 0xBF; ++b) toks.push_back(std::string("\xED") + (char) b);
+    for (int b = 0x80; b <= 0x8F; ++b) toks.push_back(std::string("\xF0") + (char) b);
+    for (int b = 0x90; b <= 0xBF; ++b) toks.push_back(std::string("\xF4") + (char) b);
+    for (const char* s : {"\xC0\x80", "\xC0\xAF", "\xC1\xBF", "\xE0\x80\x80", "\xE0\x82\x80", "\xE0\x9F\xBF",
+                          "\xED\xA0\x80", "\xED\xBF\xBF", "\xF0\x80\x80\xAF", "\xF0\x80\x82\x80", "\xF0\x8F\xBF\xBF",
+                          "\xF4\x90\x80\x80", "\xF5\x80\x80\x80",
+                          "\xC2\x80", "\xC3\xA9", "\xE0\xA0", "\xE0\xA0\x80", "\xED\x9F", "\xED\x9F\xBF",
+                          "\xEE\x80\x80", "\xE4\xB8", "\xE4\xB8\xAD", "\xF0\x90", "\xF0\x90\x80", "\xF0\x90\x80\x80",
+                          "\xF4\x8F", "\xF4\x8F\xBF\xBF", "\xF0\x9F\x98\x80", "abc", "\"x\"", "{", "}"}) {
+        toks.push_back(s);
+    }
+    const int32_t eos = (int32_t) toks.size();
+    toks.push_back("");
+    Vocab voc(toks, {eos});
+
+    auto check_state = [&](const GrammarState& s, const char* label) {
+        std::vector<uint8_t> m_nocache, m_cache, scratch1, scratch2;
+        s.fill_mask(voc, m_nocache, false);
+        s.fill_mask(voc, m_cache, true);
+        const uint8_t* v_hit = s.fill_mask_view(voc, scratch1, true);
+        const uint8_t* v_nc = s.fill_mask_view(voc, scratch2, false);
+        CHECK(m_cache == m_nocache);
+        CHECK(std::vector<uint8_t>(v_hit, v_hit + voc.size()) == m_nocache);
+        CHECK(std::vector<uint8_t>(v_nc, v_nc + voc.size()) == m_nocache);
+        int bad = 0;
+        for (size_t t = 0; t < voc.size(); ++t) {
+            const bool want = (int32_t) t == eos ? s.accepting() : (!voc.bytes((int32_t) t).empty() && s.allows(voc.bytes((int32_t) t)));
+            if ((m_nocache[t] != 0) != want) ++bad;
+        }
+        if (bad) std::printf("utf8 walk parity mismatch (%s): %d\n", label, bad);
+        CHECK(bad == 0);
+    };
+
+    // wide_uniform == true grammars
+    auto g_any = parse("root ::= .+");
+    auto g_json = parse(kJson);
+    CHECK(g_any && g_any->wide_uniform());
+    CHECK(g_json && g_json->wide_uniform());
+    for (const char* pre : {"", "\xE0", "\xED", "\xF0", "\xF4", "\xF0\x90", "\xE4\xB8"}) {
+        GrammarState s(g_any);
+        CHECK(s.accept(pre));
+        check_state(s, "wide_uniform .+");
+    }
+    for (const char* pre : {"", "{", "{\"a\": \"", "{\"a\": \"\xE0", "{\"a\": \"\xED", "{\"a\": \"\xF0", "{\"a\": \"\xF4"}) {
+        GrammarState s(g_json);
+        CHECK(s.accept(pre));
+        check_state(s, "wide_uniform json");
+    }
+
+    // wide_uniform == false grammars (distinct non-ASCII classes)
+    auto g_not_e = parse("root ::= [^\\u00e9]+");
+    auto g_non_ascii = parse("root ::= [\\u0080-\\u08ff\\U00010000-\\U00010fff]+");
+    CHECK(g_not_e && !g_not_e->wide_uniform());
+    CHECK(g_non_ascii && !g_non_ascii->wide_uniform());
+    for (const char* pre : {"", "\xE0", "\xED", "\xF0", "\xF4", "\xC3"}) {
+        GrammarState s(g_not_e);
+        CHECK(s.accept(pre));
+        check_state(s, "non_uniform not_e");
+    }
+    for (const char* pre : {"", "\xE0", "\xF0", "\xF0\x90"}) {
+        GrammarState s(g_non_ascii);
+        CHECK(s.accept(pre));
+        check_state(s, "non_uniform range");
+    }
+
+    // Cache-hit view returns direct cache pointer (not scratch) and survives >32 LRU evictions
+    auto g_chain = parse("root ::= [a-z]{40}");
+    CHECK(g_chain);
+    GrammarState st(g_chain);
+    for (int step = 0; step < 40; ++step) {
+        std::vector<uint8_t> sc1, sc2, nc;
+        const uint8_t* p1 = st.fill_mask_view(voc, sc1, true);
+        const uint8_t* p2 = st.fill_mask_view(voc, sc2, true);
+        CHECK(p1 == p2 && sc2.empty());   // second call hit cache without touching sc2
+        st.fill_mask(voc, nc, false);
+        CHECK(std::vector<uint8_t>(p2, p2 + voc.size()) == nc);
+        CHECK(st.accept("a"));
+    }
+}
+
 static double now_us() {
     using namespace std::chrono;
     return (double) duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count() / 1000.0;
@@ -599,6 +686,7 @@ int main() {
     test_token_refs();
     test_patterns();
     test_partial_utf8();
+    test_utf8_walk_and_mask_view_parity();
     if (std::getenv("BASALT_GRAMMAR_BENCH")) bench();
     if (g_fail) { std::printf("grammar_test: %d failures\n", g_fail); return 1; }
     std::printf("grammar_test: ok\n");

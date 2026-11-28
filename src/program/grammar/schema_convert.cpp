@@ -89,9 +89,7 @@ uint64_t neg_magnitude(int64_t v) {
     return (uint64_t) (-(v + 1)) + 1u;
 }
 
-void build_min_max_int(int64_t min_value, int64_t max_value, std::stringstream& out, int decimals_left = 16) {
-    auto has_min = min_value != (std::numeric_limits<int64_t>::min)();
-    auto has_max = max_value != (std::numeric_limits<int64_t>::max)();
+void build_min_max_int(bool has_min, int64_t min_value, bool has_max, int64_t max_value, std::stringstream& out, int decimals_left = 16) {
 
     auto digit_range = [&](char from, char to) {
         out << "[";
@@ -1144,8 +1142,14 @@ struct SchemaConverter::Impl {
             SchemaNode merged;
             merged.kind = SchemaNode::Integer;
             for (const SchemaNode* b : other_branches) {
-                if (b->minimum > merged.minimum) merged.minimum = b->minimum;
-                if (b->maximum < merged.maximum) merged.maximum = b->maximum;
+                if (b->has_minimum && (!merged.has_minimum || b->minimum > merged.minimum)) {
+                    merged.has_minimum = true;
+                    merged.minimum = b->minimum;
+                }
+                if (b->has_maximum && (!merged.has_maximum || b->maximum < merged.maximum)) {
+                    merged.has_maximum = true;
+                    merged.maximum = b->maximum;
+                }
             }
             return visit(merged, name);
         }
@@ -1276,18 +1280,16 @@ struct SchemaConverter::Impl {
                 return visit_primitive(rule_name, "string");
             }
             case SchemaNode::Integer: {
-                if (schema.minimum == (std::numeric_limits<int64_t>::min)() && schema.maximum == (std::numeric_limits<int64_t>::max)()) {
+                if (!schema.has_minimum && !schema.has_maximum) {
                     return visit_primitive(rule_name, "integer");
                 }
-                if (schema.minimum != (std::numeric_limits<int64_t>::min)() &&
-                    schema.maximum != (std::numeric_limits<int64_t>::max)() &&
-                    schema.minimum > schema.maximum) {
+                if (schema.has_minimum && schema.has_maximum && schema.minimum > schema.maximum) {
                     errors.push_back("minimum exceeds maximum");
                     return "";
                 }
                 std::stringstream out;
                 out << "(";
-                build_min_max_int(schema.minimum, schema.maximum, out);
+                build_min_max_int(schema.has_minimum, schema.minimum, schema.has_maximum, schema.maximum, out);
                 out << ")";
                 return add_rule(rule_name, out.str());
             }

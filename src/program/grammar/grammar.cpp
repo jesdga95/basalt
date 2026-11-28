@@ -676,6 +676,7 @@ struct GrammarState::Arena {
         sets.emplace_back();
         set_flags.push_back(0);
         if (max_flat_sets > 0) set_trans.assign(n_cls, 0);
+        masks.reserve(kMaskCache);
     }
 
     const Element& el(uint32_t i) const { return g->elements()[i]; }
@@ -1426,6 +1427,15 @@ void GrammarState::walk(const Vocab& v, int32_t root_set_id, const Utf8& u, std:
     u_stk[0] = u;
     const uint32_t n_cls = a.n_cls;
     const size_t max_flat = a.max_flat_sets;
+    const bool wide_uniform = g.wide_uniform();
+    const uint32_t wide_cls = g.wide_base();
+    auto step_cls_fast = [&](int32_t s, uint32_t cls) -> int32_t {
+        if ((size_t) s < max_flat) {
+            const int32_t cached = a.set_trans[(size_t) s * n_cls + cls];
+            if (cached >= 0) return cached;
+        }
+        return a.set_step_cls(s, cls);
+    };
     uint8_t* out_data = out.data();
     for (uint32_t i = 1; i < n_nodes;) {
         const Vocab::Node& nd = nodes[i];
@@ -1435,16 +1445,39 @@ void GrammarState::walk(const Vocab& v, int32_t root_set_id, const Utf8& u, std:
         Utf8 nu = u_stk[d - 1];
         int32_t next_set = parent_set;
         if (nu.n_remain == 0 && b < 0x80) {
-            const uint32_t cls = ascii_cls[b];
-            if ((size_t) parent_set < max_flat) {
-                next_set = a.set_trans[(size_t) parent_set * n_cls + cls];
-                if (next_set < 0) next_set = a.set_step_cls(parent_set, cls);
-            } else {
-                next_set = a.set_step_cls(parent_set, cls);
-            }
+            next_set = step_cls_fast(parent_set, ascii_cls[b]);
             if (next_set == 0) {
                 i = nd.skip;
                 continue;
+            }
+        } else if (wide_uniform) {
+            if (nu.n_remain == 0) {
+                if (b < 0xC2 || b > 0xF4 || step_cls_fast(parent_set, wide_cls) == 0) {
+                    i = nd.skip;
+                    continue;
+                }
+                if (b <= 0xDF) nu = {(uint32_t) (b & 0x1F), 1};
+                else if (b <= 0xEF) nu = {(uint32_t) (b & 0x0F), 2};
+                else nu = {(uint32_t) (b & 0x07), 3};
+            } else {
+                if ((b & 0xC0) != 0x80) { i = nd.skip; continue; }
+                if (nu.n_remain == 2 && ((nu.value == 0 && b < 0xA0) || (nu.value == 0x0D && b >= 0xA0))) {
+                    i = nd.skip;
+                    continue;
+                }
+                if (nu.n_remain == 3 && ((nu.value == 0 && b < 0x90) || (nu.value == 4 && b >= 0x90))) {
+                    i = nd.skip;
+                    continue;
+                }
+                nu.value = (nu.value << 6) | (b & 0x3F);
+                if (--nu.n_remain == 0) {
+                    if (nu.value > 0x10FFFF || (nu.value >= 0xD800 && nu.value <= 0xDFFF)) { i = nd.skip; continue; }
+                    next_set = step_cls_fast(parent_set, wide_cls);
+                    if (next_set == 0) { i = nd.skip; continue; }
+                } else if (step_cls_fast(parent_set, wide_cls) == 0) {
+                    i = nd.skip;
+                    continue;
+                }
             }
         } else {
             uint32_t cp = 0;
@@ -1456,6 +1489,14 @@ void GrammarState::walk(const Vocab& v, int32_t root_set_id, const Utf8& u, std:
                 else { i = nd.skip; continue; }
             } else {
                 if ((b & 0xC0) != 0x80) { i = nd.skip; continue; }
+                if (nu.n_remain == 2 && ((nu.value == 0 && b < 0xA0) || (nu.value == 0x0D && b >= 0xA0))) {
+                    i = nd.skip;
+                    continue;
+                }
+                if (nu.n_remain == 3 && ((nu.value == 0 && b < 0x90) || (nu.value == 4 && b >= 0x90))) {
+                    i = nd.skip;
+                    continue;
+                }
                 nu.value = (nu.value << 6) | (b & 0x3F);
                 if (--nu.n_remain == 0) {
                     cp = nu.value;
@@ -1464,7 +1505,7 @@ void GrammarState::walk(const Vocab& v, int32_t root_set_id, const Utf8& u, std:
                 }
             }
             if (complete) {
-                next_set = a.set_step_cls(parent_set, g.char_class(cp));
+                next_set = step_cls_fast(parent_set, g.char_class(cp));
                 if (next_set == 0) { i = nd.skip; continue; }
             } else if (!a.partial_ok_set(parent_set, nu.value, nu.n_remain)) {
                 i = nd.skip;
@@ -1478,10 +1519,10 @@ void GrammarState::walk(const Vocab& v, int32_t root_set_id, const Utf8& u, std:
     }
 }
 
-void GrammarState::fill_mask(const Vocab& vocab, std::vector<uint8_t>& out, bool use_cache) const {
+const uint8_t* GrammarState::fill_mask_view(const Vocab& vocab, std::vector<uint8_t>& scratch, bool use_cache) const {
     if (!active_ || !g_) {
-        out.assign(vocab.size(), 1);
-        return;
+        scratch.assign(vocab.size(), 1);
+        return scratch.data();
     }
     Arena& a = *arena_;
     use_cache = use_cache && utf8_.n_remain == 0;
@@ -1489,38 +1530,50 @@ void GrammarState::fill_mask(const Vocab& vocab, std::vector<uint8_t>& out, bool
         for (Arena::MaskEntry& m : a.masks) {
             if (m.vocab == vocab.id() && m.set_id == set_id_) {
                 m.used = ++a.tick;
-                out = m.mask;
-                return;
+                return m.mask.data();
             }
         }
     }
-    out.assign(vocab.size(), 0);
-    if (set_id_ != 0) walk(vocab, set_id_, utf8_, out);
+    std::vector<uint8_t>* target = &scratch;
+    if (use_cache) {
+        if (a.masks.size() < Arena::kMaskCache) {
+            a.masks.push_back({vocab.id(), set_id_, {}, ++a.tick});
+            target = &a.masks.back().mask;
+        } else {
+            auto oldest = std::min_element(a.masks.begin(), a.masks.end(),
+                                           [](const Arena::MaskEntry& x, const Arena::MaskEntry& y) { return x.used < y.used; });
+            oldest->vocab = vocab.id();
+            oldest->set_id = set_id_;
+            oldest->used = ++a.tick;
+            target = &oldest->mask;
+        }
+    }
+    std::vector<uint8_t>& dst = *target;
+    dst.assign(vocab.size(), 0);
+    if (set_id_ != 0) walk(vocab, set_id_, utf8_, dst);
     if (utf8_.n_remain == 0 && set_id_ != 0 && a.set_has_token(set_id_)) {
         for (uint32_t s : a.sets[(size_t) set_id_]) {
             if (s == 0 || !a.is_token(a.nodes[s].elem)) continue;
             const Element& t = a.el(a.nodes[s].elem);
             if (t.type == ElemType::Token) {
-                if (t.value < out.size()) out[t.value] = 1;
+                if (t.value < dst.size()) dst[t.value] = 1;
             } else {
-                for (size_t id = 0; id < out.size(); ++id) {
-                    if (id != t.value && !vocab.bytes((int32_t) id).empty()) out[id] = 1;
+                for (size_t id = 0; id < dst.size(); ++id) {
+                    if (id != t.value && !vocab.bytes((int32_t) id).empty()) dst[id] = 1;
                 }
             }
         }
     }
     bool end_ok = accepting();
     for (int32_t e : vocab.end_ids()) {
-        if (e >= 0 && (size_t) e < out.size()) out[(size_t) e] = end_ok ? 1 : 0;
+        if (e >= 0 && (size_t) e < dst.size()) dst[(size_t) e] = end_ok ? 1 : 0;
     }
-    if (!use_cache) return;
-    if (a.masks.size() < Arena::kMaskCache) {
-        a.masks.push_back({vocab.id(), set_id_, out, ++a.tick});
-    } else {
-        auto oldest = std::min_element(a.masks.begin(), a.masks.end(),
-                                       [](const Arena::MaskEntry& x, const Arena::MaskEntry& y) { return x.used < y.used; });
-        *oldest = {vocab.id(), set_id_, out, ++a.tick};
-    }
+    return dst.data();
+}
+
+void GrammarState::fill_mask(const Vocab& vocab, std::vector<uint8_t>& out, bool use_cache) const {
+    const uint8_t* ptr = fill_mask_view(vocab, out, use_cache);
+    if (ptr != out.data()) out.assign(ptr, ptr + vocab.size());
 }
 
 std::vector<std::vector<Element>> GrammarState::stack_elements() const {

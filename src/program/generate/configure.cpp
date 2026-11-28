@@ -3,6 +3,7 @@
 #include "../cli/gpu.hpp"
 #include "../cli/startup.hpp"
 
+#include "basalt/log.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/models/builtin.hpp"
 #include "basalt/program/gpu_select.hpp"
@@ -27,6 +28,10 @@ int run(int argc, char** argv) {
     if (const auto code = cli::select_gpus(common, chosen_cards, adapter)) return *code;
     // ---- where every loader reads from: the sections of the .basalt file
     if (const auto code = cli::prepare_model_process(common)) return *code;
+    if (adapter == nullptr) {
+        basalt::log::error("basalt generate", "--model FILE.basalt is required");
+        return 2;
+    }
     if (const std::optional<int> code = adapter->run(common, chosen_cards)) return *code;
     return run_session_model(common, *adapter);
 }
