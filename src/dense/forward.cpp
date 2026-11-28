@@ -1117,9 +1117,9 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
             kernels::attn_qk_prepare(b.bq + q0 * AQ, b.bk + q0 * KV, b.bv + q0 * KV, D.q_norm, D.k_norm, bd.eps, rope,
                                      b.bpos + q0 * 3, B, bd.n_head, bd.n_kv, b.bqo + q0 * AQ, st.dk[l], st.dv[l], pos[k], s,
                                      bd.head_dim, false, st.dctx_cap);
-            const int64_t window = std::min<int64_t>(bd.window, pos[k] - st.dctx_from + 1);   // context below dctx_from is gone
+            const int64_t min_pos = std::clamp<int64_t>(st.dctx_from, 0, pos[k]);   // context below dctx_from is gone
             kernels::gqa_window_attn(b.bqo + q0 * AQ, st.dk[l], st.dv[l], bd.n_head, bd.n_kv, bd.head_dim, pos[k], B, pos[k] + B,
-                                     window, st.dctx_cap, b.battn, st.dctx_cap, b.bao + q0 * AQ, s);
+                                     bd.window, st.dctx_cap, b.battn, st.dctx_cap, b.bao + q0 * AQ, s, false, {}, min_pos);
         }
         prod(m, D.o, wact(m, b.bao, D.o.type, AQ, R, s), b.tmp, R, s);
         conv(b.tmp, b.dyn + 2 * groups, D.conv_a.rows, D.base_a + 2 * H);
