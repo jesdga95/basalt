@@ -78,12 +78,12 @@ void gqa_decode_attn_segs(const float* q, int n_head, int n_kv, const GqaSeg* se
                           int64_t max_cells, float* out, void* stream, const float* gate_q = nullptr,
                           uint16_t* gated16 = nullptr);
 /// gqa_decode_attn for a block drafter's rows: head width 128 or 256, row t at position pos0 + t sees positions
-/// [pos0 + t - window + 1, hi) (not causal), position p in cache cell p % cap. `block`: every row sees the first row's
-/// window, [pos0 - window + 1, hi) (a drafter whose block shares its anchor's window). `q8`: the int8 cache instead (its
-/// codes decoded to the fp16 the fp16 path reads; not NVFP4).
+/// [max(min_pos, pos0 + t - window + 1), hi) (not causal), position p in cache cell p % cap. `block`: every row sees the
+/// first row's window, [max(min_pos, pos0 - window + 1), hi) (a drafter whose block shares its anchor's window). `q8`: the
+/// int8 cache instead (its codes decoded to the fp16 the fp16 path reads; not NVFP4).
 void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv, int head_dim,
                      int64_t pos0, int T, int64_t hi, int64_t window, int64_t cap, float* scratch, int64_t scratch_cells,
-                     float* out, void* stream, bool block = false, KvInt8 q8 = {});
+                     float* out, void* stream, bool block = false, KvInt8 q8 = {}, int64_t min_pos = 0);
 struct GqaWindowSeg {
     const uint16_t* k_cache = nullptr;
     const uint16_t* v_cache = nullptr;
@@ -94,6 +94,7 @@ struct GqaWindowSeg {
     int64_t cap = 0;
     bool block = false;
     KvInt8 q8 = {};   ///< the int8 cache instead: every segment of a call int8 or none
+    int64_t min_pos = 0;
 };
 /// gqa_window_attn for up to kWindowSegsMax segments of any rows in one launch (segment k's rows after segment k - 1's in
 /// q and out), each row what its segment alone gives; `scratch` holds gqa_decode_scratch_floats(scratch_cells, the rows of
