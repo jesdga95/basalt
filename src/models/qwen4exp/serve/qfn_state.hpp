@@ -207,6 +207,7 @@ class QfnRuntime final : public Runtime, private Context {
 public:
     explicit QfnRuntime(Context& context)
         : Runtime(context.o, context.model_file, context.err, context.n_vocab, context.grammar_vocab), Context(context) {}
+    ~QfnRuntime() override;
     int init_before_input() override;
     int init_after_input() override;
     void after_input_start() override;
@@ -299,6 +300,8 @@ private:
     SplitDrive split_drive_b{};
     basalt::core::Verifier ver_b{};   // pipelined windows: the second chain over the same sessions (stage 0)
     void* pair_snap{};
+    std::vector<float*> hand_hosts{};
+    float* hb_host{};
     int n_stages{};
     bool pipe_on{};
     basalt::core::PoolMultiFn win_pool_fn{};
@@ -362,6 +365,9 @@ private:
     cudaEvent_t p2p_ev{};
     bool xq_unsettled{};
     std::vector<std::pair<int32_t, int32_t>> xq_released{};
+    std::vector<std::pair<int32_t, int32_t>> xq_spare_released{};
+    std::vector<uint8_t> xq_copy_ok{};
+    bool xq_word_failed{};
     int S{};
     int S_mtp{};
     std::vector<int32_t> res_at_start{};

@@ -70,10 +70,15 @@ int sessions(Context& context) {
         const basalt::core::OnDevice on(st.dev);
         std::set<std::string> skip_s = skip_base;
         uint64_t pool_s = pool_bytes;
+        struct LayerRangeGuard {
+            bool active = false;
+            ~LayerRangeGuard() { if (active) basalt::core::NativeDense::set_layer_range(-1, -1); }
+        } layer_range_guard;
         if (stage_trim) {
             const int64_t lb = split_at[i], le = i + 1 < split_at.size() ? split_at[i + 1] : g.n_layers;
             add_foreign(lb, le, skip_s);
             basalt::core::NativeDense::set_layer_range((int) lb, (int) le);
+            layer_range_guard.active = true;
             if (!basalt::core::WeightTable::pool_bytes(pack_files, pool_s, err, &skip_s)) {
                 return fatal_start_error(err);
             }
@@ -85,6 +90,7 @@ int sessions(Context& context) {
         void* arena_s = nullptr;
         if (cudaMalloc(&arena_s, pool_s) != cudaSuccess ||
             !st.wt.load(pack_files, arena_s, pool_s, err, skip_s.empty() ? nullptr : &skip_s, true, context.reads)) {
+            if (arena_s != nullptr) cudaFree(arena_s);
             cudaGetLastError();
             size_t free_b = 0, total_b = 0;   // what that card had free
             basalt::core::gpu_mem_info(&free_b, &total_b);
@@ -178,6 +184,11 @@ int sessions(Context& context) {
     const int64_t kv_floor = o.serve && !multi_gpu && o.kv_resident == 0 && !o.vram_elastic &&
                              o.max_context > kv_base ? kv_base : 0;
     basalt::core::qsa_set_kv_elastic(kv_floor);
+    struct KvElasticGuard {
+        bool active = true;
+        void reset() { if (active) { basalt::core::qsa_set_kv_elastic(0); active = false; } }
+        ~KvElasticGuard() { reset(); }
+    } kv_elastic_guard;
     // ---- CUDA0's session, and the stages' sessions: sized to each device's own layer range (the carve).  A
     // stage that runs [lb, le) carves only those layers' GDN rows and QSA pools - before the carve every stage
     // held all 48 layers' state whatever layers it ran, which is the same disease the chunked-QSA-prefill PR
@@ -221,6 +232,7 @@ int sessions(Context& context) {
         void* sbuf_s = nullptr;
         if (cudaMalloc(&sbuf_s, basalt::core::session_bytes(g, o.max_context, K, st.lb, st.le)) != cudaSuccess ||
             basalt::core::session_init(g, o.max_context, K, sbuf_s, st.ss, st.lb, st.le) == 0) {
+            if (sbuf_s != nullptr) cudaFree(sbuf_s);
             basalt::log::error("basalt generate", "layer split, CUDA%d: the session state failed", st.dev);
             return 1;
         }
@@ -291,7 +303,7 @@ int sessions(Context& context) {
                                  (double) bytes / 1073741824.0);
                     continue;
                 }
-                SlotSession u(new basalt::core::SessionState());
+                SlotSession u(new basalt::core::SessionState(), SlotDelete{true, dev, nullptr});
                 void* buf = nullptr;
                 if (cudaMalloc(&buf, bytes) != cudaSuccess || basalt::core::session_init(g, slot_cap[(size_t) b], K, buf, *u, lo, hi) == 0) {
                     cudaGetLastError();
@@ -304,6 +316,7 @@ int sessions(Context& context) {
                     fit = b;
                     break;
                 }
+                u.get_deleter().buf = buf;
                 basalt::core::session_zero(*u, g, nullptr, nullptr);
                 bslot_ss[k].push_back(std::move(u));
                 total += bytes;
@@ -374,7 +387,7 @@ int sessions(Context& context) {
         if (!o.mtp.empty() && !mtp.load(basalt::core::MtpFiles::from(srcs), draft_geometry, ss, pipe_want ? basalt::core::kMtpChainMax : o.spec, *context.reads, err, o.mtp_window)) { basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
     }
-    basalt::core::qsa_set_kv_elastic(0);   // every later state: whole
+    kv_elastic_guard.reset();   // every later state: whole
     const bool mtp_on = !o.mtp.empty();
     const basalt::core::QsaState* const mtp_kv = mtp_on ? &mtp.kv_state() : nullptr;   // the draft layer's K/V, if any
     // THE HEAD BEFORE THE CACHE, AND BEFORE THE ARENA.  The expert cache takes what is free minus the reserve, so

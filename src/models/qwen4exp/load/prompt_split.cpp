@@ -261,6 +261,7 @@ int prompt_split(Context& context) {
     // and filled in the start's pass from the bytes it places on CUDA0 (a range CUDA0 does not hold is read from the file).
     // The images join the pass once every stage has its own.
     std::vector<basalt::core::LoadPlan> images(pstages.size());
+    std::vector<std::function<bool(std::string&)>> stage_after;
     for (size_t j = 0; j < pstages.size() && split_stages > 0; ++j) {
         PromptStage& st = *pstages[j];
         const basalt::core::OnDevice on(st.dev);
@@ -283,7 +284,7 @@ int prompt_split(Context& context) {
             // prompt with them widened to bf16 (Gemm::bf16_w): the stage's image takes those widened values in place of
             // the file's bf16, so that its layers read the prompt as the main card would (bitwise)
             if (!hc8_names.empty())
-                context.after->push_back([&st, w_at, &hc8_names](std::string& e) { return hc8_widen_into(st, w_at, hc8_names, e); });
+                stage_after.push_back([&st, w_at, &hc8_names](std::string& e) { return hc8_widen_into(st, w_at, hc8_names, e); });
             continue;
         }
         (void) cudaGetLastError();
@@ -291,7 +292,8 @@ int prompt_split(Context& context) {
                                                                    (err.empty() ? std::string("no memory") : err), true);
         err.clear();
         for (auto& x : pstages)
-            if (x->image != nullptr) cudaFreeHost(x->image);
+            if (x->image != nullptr) { cudaFreeHost(x->image); x->image = nullptr; }
+        stage_after.clear();
         pstages.clear();
         split_stages = 0;
     }
@@ -302,6 +304,7 @@ int prompt_split(Context& context) {
             on.push_back({pstages[j]->dev, (int) pstages[j]->lo, (int) pstages[j]->hi, basalt::core::StageHome::PinnedRam,
                           pstages[j]->image_bytes});
         }
+        for (auto& fn : stage_after) context.after->push_back(std::move(fn));
         basalt::core::log_prompt_split("basalt generate", on);
     }
     if (split_stages == 0) peers.peer_drop_stages();   // the start line shows no prompt layers

@@ -12,6 +12,11 @@ float QfnRequest::default_relax() const { return runtime_.o.relaxed_drafting; }
 Flow QfnRequest::prepare_image() {
     if (const Flow flow = begin_quality_gate(runtime_.ppl_base, runtime_.ppl_out, runtime_.S); flow != Flow::proceed) return flow;
     if (geni || !runtime_.mrope_identity) {
+        if (runtime_.batch_on()) {
+            std::printf("ERR cannot switch image M-RoPE table while another batch slot is actively decoding\n");
+            std::fflush(stdout);
+            return Flow::next;
+        }
         // positions for every cell this request can reach; the identity again for a text request
         std::string ve;
         runtime_.row_ptr.assign((size_t) n, nullptr);

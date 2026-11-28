@@ -24,6 +24,7 @@ bool QfnRuntime::fixed_experts(basalt::core::VerifyHits& h, int dev) {
     const basalt::core::OnDevice on(dev);
     int32_t* p = nullptr;
     if (cudaMalloc((void**) &p, le * 4) != cudaSuccess || cudaMemset(p, 0xff, le * 4) != cudaSuccess) {
+        if (p != nullptr) cudaFree(p);
         basalt::log::error("basalt serve", "--diag-fixed-experts: the residency table on CUDA%d", dev);
         return false;
     }
@@ -64,8 +65,12 @@ int QfnRuntime::init_verify() {
         std::vector<float*> hand((size_t) n_stages - 1, nullptr);
         for (float*& h : hand) {
             float* hh = nullptr;
-            if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-                cudaHostGetDevicePointer((void**) &h, hh, 0) != cudaSuccess) {
+            if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+                basalt::log::error("basalt serve", "the layer-split hand-off allocation failed");
+                return 1;
+            }
+            hand_hosts.push_back(hh);
+            if (cudaHostGetDevicePointer((void**) &h, hh, 0) != cudaSuccess) {
                 basalt::log::error("basalt serve", "the layer-split hand-off allocation failed");
                 return 1;
             }
@@ -111,7 +116,6 @@ int QfnRuntime::init_verify() {
         for (int st = 0; st + 1 < n_stages; ++st) stage_ver(st).set_next(&stage_ver(st + 1), &split_drive);
         if (pipe_on) {
             GpuStage& gs = *stages[0];
-            float* hb_host = nullptr;
             float* hand_b = nullptr;
             if (cudaHostAlloc((void**) &hb_host, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
                 cudaHostGetDevicePointer((void**) &hand_b, hb_host, 0) != cudaSuccess ||
