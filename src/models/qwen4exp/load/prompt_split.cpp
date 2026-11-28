@@ -202,6 +202,7 @@ int prompt_split(Context& context) {
     // the layers each stage reads, fixed for the run: the shared driver's cut of the cards' Stages shares over the layers
     // past the second (PeerPlacement::stage_first); card i of gpu is pstages[n - 1 - i]
     int split_stages = 0;   // the stages a read uses, the main card's included (0: no split)
+    basalt::model::StageTuner split_tuner;   // the first stage's cut, moved by what its reads show (only with the default shares and one stage)
     std::vector<int> split_cuts;   // stage k (1 .. split_stages - 1) reads [split_cuts[k - 1], split_cuts[k] or the last layer)
     if (split_want && peer.valid() && !pstages.empty() && peers.peer_placement().stage_first.size() == pstages.size() + 1) {
         bool ok = true;
@@ -213,6 +214,7 @@ int prompt_split(Context& context) {
             const std::vector<int>& first = peers.peer_placement().stage_first;
             const size_t n = first.size();
             split_cuts.assign(first.begin() + 1, first.end());
+            split_tuner = basalt::model::StageTuner((int) g.n_layers, split_cuts[0], o.gpus.given.empty() && n == 2);
             for (size_t i = 1; i < n; ++i) {
                 PromptStage& st = *pstages[n - 1 - i];
                 st.lo = first[i];
@@ -320,6 +322,7 @@ int prompt_split(Context& context) {
     context.split_part = split_part;
     context.split_layers_text = split_layers_text;
     context.split_cuts = &split_cuts;
+    context.split_tuner = &split_tuner;
     context.split_stages = &split_stages;
     return dispatch(context);
 }

@@ -71,6 +71,7 @@ int dispatch(Context& context) {
     auto& split_part = context.split_part;
     auto& split_layers_text = context.split_layers_text;
     auto& split_cuts = *context.split_cuts;
+    auto& split_tuner = *context.split_tuner;
     auto& split_stages = *context.split_stages;
 
     // Where the routed experts live, fastest tier first, and a warning when any of them is only in the file (decode
@@ -209,6 +210,7 @@ int dispatch(Context& context) {
             .split_part = split_part,
             .split_layers_text = split_layers_text,
             .split_cuts = split_cuts,
+            .split_tuner = split_tuner,
             .split_stages = split_stages,
             .tier_spill = tier_spill,
             .report_expert_tiers = report_expert_tiers,

@@ -27,8 +27,9 @@ QfnRequest::SplitPlan QfnRequest::split_plan(int64_t a0, int64_t b0, const char*
                 std::to_string(runtime_.split_chunk_max));
         return plan;
     }
-    const std::vector<int>& cuts = runtime_.split_cuts;
+    std::vector<int> cuts = runtime_.split_cuts;
     const int stages = runtime_.split_stages;
+    if (stages == 2) cuts[0] = runtime_.split_tuner.cut();   // the stage may read fewer layers than the shares gave it
     for (int k = 1; k < stages; ++k) {
         PromptStage& st = *runtime_.pstages[(size_t) (stages - 1 - k)];
         const int64_t l1 = k + 1 < stages ? cuts[(size_t) k] : runtime_.g.n_layers;
@@ -467,6 +468,16 @@ bool QfnRequest::read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool&
                       std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), ms_setup, ms_stages,
                       ms_copy, ms_draft, cards.c_str(), sm1.ms_total - sm0.ms_total,
                       (long long) (sm1.experts_streamed - sm0.experts_streamed));
+    // the read's own timings move the next read's cut: the stage's chunks and work against the whole read
+    if (run.size() == 1) {
+        const PromptStage& st = *run[0];
+        const int from = (int) st.l0;
+        if (runtime_.split_tuner.observe(from, (int) (st.sp.stats().chunks - st0[0].chunks),
+                                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                                         st.sp.stats().ms_total - st0[0].ms_total))
+            basalt::log::info("basalt serve", "prompt split: the next read's stage starts at layer %d (was %d)",
+                              runtime_.split_tuner.cut(), from);
+    }
     return true;
 }
 

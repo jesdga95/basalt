@@ -76,7 +76,10 @@ with `use gpu 0`.
 - **Prompt layers (Flash-Next, Qwen3.8-27B).** A long fresh part of a prompt is read as a pipeline over the cards while no other
   conversation decodes: the main card reads the first layers of a chunk and hands it on, a peer reads the next layers while the cards
   before it read the next chunks, and the main card reads the last chunk whole. Decode never uses the stage.
-  - Flash-Next's cuts come from the shares over layers 2 to the last. A part shorter than a chunk, a chunk under 4,096 tokens, a
+  - Flash-Next's cuts come from the shares over layers 2 to the last. With two cards and no `gpu-share`, the share's cut is the most
+    layers the stage reads: after each long read the cut moves toward the main card when the stage was the pipeline's long pole
+    (a `prompt split:` line says so), so a card slower than its memory bandwidth suggests does not hold the read back. A given
+    `gpu-share` is kept exactly. A part shorter than a chunk, a chunk under 4,096 tokens, a
     chunk short enough to be read routed-only on a slower peer, and a prompt that arrives while other slots decode stay on the main
     card.
   - A peer's weights, prompt state and buffers go into its tier's last slots for the read, so outside a prompt decode does not change.

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "basalt/core/loader.hpp"
+#include "basalt/model/stage_tuner.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "helpers.hpp"
 
@@ -143,6 +144,7 @@ struct Context {
     std::function<engine_local::SplitPart(int64_t, int64_t, int64_t)> split_part;
     std::function<std::string (int, const std::vector<int> &)> split_layers_text;
     const std::vector<int>* split_cuts = nullptr;
+    basalt::model::StageTuner* split_tuner = nullptr;
     int* split_stages = nullptr;
     int64_t* spec_pos = nullptr;
 };

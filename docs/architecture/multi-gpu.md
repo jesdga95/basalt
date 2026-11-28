@@ -82,7 +82,7 @@ given `gpu-share` is used for every use; otherwise the default depends on what i
 | --- | --- | --- |
 | split | each card's bytes: its layers' weights plus their KV and state at the context and slots; the cut is the layer boundary nearest the shares | free VRAM at start |
 | peer, experts | the experts outside the main card, dealt hottest first to the peers by share; the main card always fills first | free VRAM of the peers |
-| peer, prompt stages | the layers of a long prompt's chunk: the main card reads the first part, each stage card the next part by share | memory bandwidth (a slow card must not take a large part of a chunk's layers) |
+| peer, prompt stages | the layers of a long prompt's chunk: the main card reads the first part, each stage card the next part by share | memory bandwidth (a slow card must not take a large part of a chunk's layers); with two cards the cut then moves toward the main card by what long reads show (`model::StageTuner`) |
 | peer, the main card's hot share | only when `gpu-share` is given (Flash-Next): the hottest experts are interleaved between the main card and a peer by share | off: the main card keeps the hottest |
 | tensor | heads per card (reserved) | equal |
 
