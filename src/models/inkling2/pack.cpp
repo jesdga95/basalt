@@ -89,7 +89,8 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
     }
     // the layout the kernels are built for (basalt/models/inkling2/kernels.hpp)
     if (g.n_embd != 2304 || g.n_head != 24 || g.n_head_kv != 8 || g.head_dim != 128 || g.rel != 16 || g.extent != 1024 ||
-        g.window != g.extent || g.conv != 4 || g.n_expert > 512 || g.n_expert % 32 || g.n_used > 16 ||
+        g.window != g.extent || g.conv != 4 || g.n_expert <= 0 || g.n_expert > 512 || g.n_expert % 32 ||
+        g.n_used <= 0 || g.n_used > 16 || g.n_used > g.n_expert || g.n_ff_exp <= 0 ||
         g.loop_start <= 0 || g.loop_start >= g.loop_end || g.loop_end > g.n_layers || g.loop_start % g.block ||
         g.loop_end % g.block || g.loop_passes < 1 || g.gate_rank <= 0) {
         err = path + ": an Inkling 2 layout this engine does not run (width 2304, 24 query and 8 key/value heads of 128, "
@@ -139,10 +140,14 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
 
     p.vision = p.file.range("vision/mmproj");
     for (const auto& [name, t] : tj->members) {
+        if (!t.is_object()) {
+            err = path + ": tensor " + name + " is not an object";
+            return false;
+        }
         TensorRef r;
         r.name = name;
         r.type = (int) num_or(t.get("type_id"), 0);
-        if (const Json* sh = t.get("shape"))
+        if (const Json* sh = t.get("shape"); sh && sh->is_array())
             for (const Json& dd : sh->items) r.shape.push_back(dd.u64());
         r.bytes = (uint64_t) num_or(t.get("bytes"), 0);
         std::string section = "gguf";
@@ -152,7 +157,12 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
             err = path + ": tensor " + name + " names a missing section " + section;
             return false;
         }
-        r.offset = sec->offset + t.get("offset")->u64();
+        const Json* off = t.get("offset");
+        if (!off || off->type != Json::Type::Int || off->neg) {
+            err = path + ": tensor " + name + " has no valid offset";
+            return false;
+        }
+        r.offset = sec->offset + off->u64();
         p.tensors.emplace(name, std::move(r));
     }
 
@@ -168,7 +178,7 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
         std::istringstream ls(line);
         long long l, gu, dt;
         unsigned long long off, by;
-        if (!(ls >> l >> gu >> dt >> off >> by) || l < 0 || l >= g.n_layers || seen[(size_t) l]) {
+        if (!(ls >> l >> gu >> dt >> off >> by) || l < 0 || l >= g.n_layers || seen[(size_t) l] || by == 0) {
             err = "experts.layout: bad line '" + line + "'";
             return false;
         }

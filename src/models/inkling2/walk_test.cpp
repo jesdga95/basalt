@@ -1,9 +1,16 @@
 // src/models/inkling2/walk_test.cpp - the walk against the forward it replaces: a forward that copies each kept input into
 // a buffer of its own. Both are run over symbols (each visit's output a distinct value); every input, block and bank entry
 // a step reads must hold the value that forward reads there.
+#include "basalt/core/model_format.hpp"
+#include "models/inkling2/pack.hpp"
 #include "models/inkling2/walk.hpp"
 
+#include <chrono>
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <vector>
 
 using namespace basalt::models::inkling2;
@@ -163,6 +170,112 @@ void check_split(int cut) {
     expect(h == (cut <= 6 || cut >= 18 ? 2 : 6), "hand-offs", cut);
 }
 
+bool write_pack_file(const std::filesystem::path& path, const std::string& meta, const std::string& layout) {
+    namespace bc = basalt::core;
+    const uint64_t off_meta = bc::kSectionAlign;
+    const uint64_t off_layout = 2 * bc::kSectionAlign;
+    const uint64_t file_bytes = off_layout + layout.size();
+    std::vector<uint8_t> head((size_t) bc::kHeaderBytes, 0);
+    bc::FileHeader fh{};
+    std::memcpy(fh.magic, bc::kModelMagic, sizeof(bc::kModelMagic));
+    fh.version = bc::kModelVersion;
+    fh.n_sections = 4;
+    fh.file_bytes = file_bytes;
+    std::memcpy(head.data(), &fh, sizeof(fh));
+    auto put_sec = [&](size_t idx, const char* name, uint64_t off, uint64_t bytes) {
+        bc::SectionEntry se{};
+        const size_t n = std::strlen(name);
+        std::memcpy(se.name, name, n < sizeof(se.name) ? n : sizeof(se.name));
+        se.offset = off;
+        se.bytes = bytes;
+        std::memcpy(head.data() + sizeof(bc::FileHeader) + idx * sizeof(bc::SectionEntry), &se, sizeof(se));
+    };
+    put_sec(0, "meta", off_meta, meta.size());
+    put_sec(1, "experts.layout", off_layout, layout.size());
+    put_sec(2, "experts", off_layout, 0);
+    put_sec(3, "gguf", off_layout, 0);
+
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write(reinterpret_cast<const char*>(head.data()), (std::streamsize) head.size());
+    out.seekp((std::streamoff) off_meta);
+    out.write(meta.data(), (std::streamsize) meta.size());
+    out.seekp((std::streamoff) off_layout);
+    if (!layout.empty()) out.write(layout.data(), (std::streamsize) layout.size());
+    return (bool) out;
+}
+
+std::string make_meta(int n_expert, int n_used, int n_ff_exp, const std::string& tensors_json) {
+    return std::string("{\"arch\":\"inkling2\",\"gguf_kv\":{") +
+           "\"inkling2.block_count\":8,"
+           "\"inkling2.embedding_length\":2304,"
+           "\"inkling2.attention.head_count\":24,"
+           "\"inkling2.attention.head_count_kv\":8,"
+           "\"inkling2.attention.key_length\":128,"
+           "\"inkling2.attention.sliding_window\":1024,"
+           "\"inkling2.attention.sliding_window_pattern\":[1,1,1,0,1,1,1,0],"
+           "\"inkling2.attention.relative_length\":16,"
+           "\"inkling2.attention.relative_extent\":1024,"
+           "\"inkling2.shortconv.l_cache\":4,"
+           "\"inkling2.attn_res.block_size\":2,"
+           "\"inkling2.expert_count\":" + std::to_string(n_expert) + ","
+           "\"inkling2.expert_used_count\":" + std::to_string(n_used) + ","
+           "\"inkling2.expert_feed_forward_length\":" + std::to_string(n_ff_exp) + ","
+           "\"inkling2.loop.start\":2,"
+           "\"inkling2.loop.end\":6,"
+           "\"inkling2.loop.count\":2,"
+           "\"inkling2.loop.gate_rank\":64,"
+           "\"tokenizer.ggml.tokens\":[\"a\",\"b\"]"
+           "},\"tensors\":" + tensors_json + "}";
+}
+
+std::string make_layout(int layers, unsigned long long blob_bytes, int dup_layer = -1) {
+    std::string s = "# experts v3\n";
+    for (int l = 0; l < layers; ++l) {
+        const int id = l == dup_layer ? 0 : l;
+        s += std::to_string(id) + " 8 8 0 " + std::to_string(blob_bytes) + "\n";
+    }
+    return s;
+}
+
+void check_pack_validation() {
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const std::filesystem::path tmp =
+        std::filesystem::temp_directory_path() / ("basalt_inkling2_pack_test_" + std::to_string(stamp) + ".basalt");
+    struct Cleanup {
+        const std::filesystem::path& p;
+        ~Cleanup() {
+            std::error_code ec;
+            std::filesystem::remove(p, ec);
+        }
+    } cleanup{tmp};
+
+    const std::string good_tensors = "{\"token_embd.weight\":{\"type_id\":30,\"shape\":[2304,2],\"bytes\":9216,\"offset\":0}}";
+    const std::string good_layout = make_layout(8, 128);
+    const auto u8_path = tmp.u8string();
+    const std::string path_str(reinterpret_cast<const char*>(u8_path.data()), u8_path.size());
+    auto run = [&](const std::string& meta, const std::string& layout, bool want, const char* what) {
+        expect(write_pack_file(tmp, meta, layout), "write synthetic pack", -1);
+        Pack p;
+        std::string err;
+        const bool ok = open_pack(path_str, p, err);
+        expect(ok == want && (want ? err.empty() && p.tensors.size() == 1 && p.experts.size() == 8 : !err.empty()), what, -1);
+    };
+
+    run(make_meta(32, 4, 256, good_tensors), good_layout, true, "accepts valid minimal pack");
+    run(make_meta(0, 4, 256, good_tensors), good_layout, false, "rejects zero experts");
+    run(make_meta(-32, 4, 256, good_tensors), good_layout, false, "rejects negative experts");
+    run(make_meta(32, 0, 256, good_tensors), good_layout, false, "rejects zero used experts");
+    run(make_meta(32, -1, 256, good_tensors), good_layout, false, "rejects negative used experts");
+    run(make_meta(32, 4, 0, good_tensors), good_layout, false, "rejects zero expert ffn width");
+    run(make_meta(32, 4, 256, "{\"bad\":{\"type_id\":0,\"bytes\":16}}"), good_layout, false, "rejects tensor missing offset");
+    run(make_meta(32, 4, 256, "{\"bad\":{\"type_id\":0,\"bytes\":16,\"offset\":\"0\"}}"), good_layout, false, "rejects non-numeric tensor offset");
+    run(make_meta(32, 4, 256, "{\"bad\":{\"type_id\":0,\"bytes\":16,\"offset\":-16}}"), good_layout, false, "rejects negative tensor offset");
+    run(make_meta(32, 4, 256, "{\"bad\":42}"), good_layout, false, "rejects non-object tensor entry");
+    run(make_meta(32, 4, 256, good_tensors), make_layout(8, 0), false, "rejects zero-byte expert blob");
+    run(make_meta(32, 4, 256, good_tensors), make_layout(8, 128, 1), false, "rejects duplicate expert layer");
+}
+
 }  // namespace
 
 int main() {
@@ -200,6 +313,7 @@ int main() {
         std::string err;
         expect(!walk(g, w, err), "refuses a loop of one block", -1);
     }
+    check_pack_validation();
     if (failures) return 1;
     std::printf("inkling2 walk: ok\n");
     return 0;
